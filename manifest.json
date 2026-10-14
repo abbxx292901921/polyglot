@@ -1,0 +1,20 @@
+{
+  "name": "Polyglot",
+  "short_name": "Polyglot",
+  "description": "Private, offline-first, local roleplay chat. Your data stays on your device.",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0f1420",
+  "theme_color": "#0f1420",
+  "icons": [
+    {
+      "src": "./icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

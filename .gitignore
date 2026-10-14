@@ -1,0 +1,9 @@
+# Polyglot — never commit secrets or personal backups
+*.vault.json
+backups/
+.vault.json
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
