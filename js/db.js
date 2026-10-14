@@ -260,12 +260,12 @@ export async function exportVaultToJSON({ includeKeys = false } = {}) {
 
 export async function importVaultFromJSON(data, { merge = false } = {}) {
   if (!data || typeof data !== "object" || !data.tables) {
-    throw new Error("Not a Polyglot vault file (missing tables).");
+    throw new Error("E_VAULT_SHAPE: not a Polyglot vault file (missing tables).");
   }
   const names = ["characters", "personas", "chats", "messages", "lorebooks", "presets"];
   for (const n of names) {
     if (data.tables[n] !== undefined && !Array.isArray(data.tables[n])) {
-      throw new Error(`Vault table "${n}" is corrupt (expected array).`);
+      throw new Error(`E_VAULT_TABLE: vault table "${n}" is corrupt (expected array).`);
     }
   }
   if (!merge) {

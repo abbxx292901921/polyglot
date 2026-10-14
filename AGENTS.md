@@ -31,10 +31,21 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   Exports: openDB, list*/save*/delete* per store, setDefaultPersona,
   touchChat, exportVaultToJSON({includeKeys}), importVaultFromJSON(data,{merge}),
   seedIfEmpty(defaults).
-- `js/app.js` — UI coordinator. Owns `ui={characterId,chatId,personaId}` in
-  localStorage, drawer rendering, composer, vault export/import, SW registration.
-- (Planned) `js/prompt-engine.js`, `js/sse-streamer.js`, `js/api-client.js`,
-  `js/png-parser.js` — Phase 2/3. Keep them dependency-free modules.
+- `js/app.js` — UI coordinator. Owns `ui={characterId,chatId,personaId,presetId}` in
+  localStorage, drawer rendering, composer, streaming send path, swipe groups
+  (`swipe_group_id`/`swipe_active`) + retry/continue/impersonate/edit/delete,
+  character editor modal, card import + per-chat export/import, vault
+  export/import, diagnostics panel, SW registration.
+- `js/prompt-engine.js` — pure context pipeline: resolveMacros, estimateTokens,
+  scanLorebook, injectAtDepth, applyTokenBudget, buildMessages.
+- `js/sse-streamer.js` — SSE decoder (TextDecoder stream) + createThinkSplitter
+  for split `<think>` tags; routes reasoning_content + inline thinks to reasoning.
+- `js/api-client.js` — sanitizePayload per reasoning_strategy, resolveEndpoint
+  (proxy-aware), sendChat streaming via fetch + streamSSE.
+- `js/png-parser.js` — card ingestion: walkChunks, tEXt/zTXt/iTXt, chara/ccv3
+  (V3 wins), parsePNGCard/parseCharacterJSON/normalizeCharacter,
+  fileToAvatarDataURL (512px webp→jpeg fallback).
+- `js/diagnostics.js` — coded ring logger (200). Only app.js imports it.
 
 ## Rules for every patch
 1. No placeholders. Never `TODO`, stub functions, or omitted logic. Complete code only.
@@ -63,6 +74,6 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
 ## Roadmap
 - Phase 0 DONE: shell + SW + offline echo.
 - Phase 1 DONE: IndexedDB + library + vault.
-- Phase 2 NEXT: prompt-engine + sse-streamer + api-client (OpenAI-Compatible).
-- Phase 3: png-parser (tEXt/zTXt/iTXt + webp→jpeg fallback) + swipes/retry/
-  continue/impersonate/edit + right-drawer presets UI.
+- Phase 2 DONE: prompt-engine + sse-streamer + api-client (OpenAI-Compatible).
+- Phase 3 DONE: png-parser (tEXt/zTXt/iTXt + webp→jpeg fallback) + swipes/retry/
+  continue/impersonate/edit + character edit UI.

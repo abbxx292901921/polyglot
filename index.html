@@ -20,7 +20,7 @@
     <header class="topbar">
       <button id="btn-left" class="iconbtn" aria-label="Open library">&#9776;</button>
       <h1>Polyglot</h1>
-      <span id="ver" class="ver">v1.0.0</span>
+      <span id="ver" class="ver">v1.2.0</span>
       <div class="spacer"></div>
       <button id="btn-right" class="iconbtn" aria-label="Open settings">&#9881;</button>
     </header>
@@ -38,6 +38,7 @@
     </main>
 
     <section id="composer">
+      <button id="btn-imp" class="iconbtn" type="button" title="Write your next line as the AI (impersonate)" aria-label="Impersonate">&#127917;</button>
       <textarea id="input" rows="1" placeholder="Message…" enterkeyhint="send"></textarea>
       <button id="send" type="button" aria-label="Send">&#9650;</button>
       <button id="stop" type="button" aria-label="Stop">Stop</button>
@@ -54,10 +55,20 @@
       <section class="sec">
         <h3>Characters <button id="btn-new-char" class="mini" type="button">+ New</button></h3>
         <div id="char-list" class="list"></div>
+        <div class="vaultbtns">
+          <label class="btn secondary" for="file-card">Import card</label>
+          <input id="file-card" type="file" accept=".png,.json,.webp,image/png,application/json,image/webp" hidden />
+        </div>
+        <div id="card-status" class="status" role="status"></div>
       </section>
       <section class="sec">
         <h3>Chats <button id="btn-new-chat" class="mini" type="button">+ New</button></h3>
         <div id="chat-list" class="list"></div>
+        <div class="vaultbtns">
+          <button id="btn-export-chat" class="btn secondary" type="button">Export chat</button>
+          <label class="btn secondary" for="file-chat-import">Import chat</label>
+          <input id="file-chat-import" type="file" accept="application/json,.json" hidden />
+        </div>
       </section>
       <section class="sec">
         <h3>Vault backup</h3>
@@ -74,10 +85,108 @@
 
   <aside id="drawer-right" class="drawer right" aria-label="Settings">
     <header><h2>Presets &amp; API</h2><button class="iconbtn" data-close="drawer-right" aria-label="Close">&times;</button></header>
-    <div class="body">Model presets, samplers, and API config arrive in Phase 2.</div>
+    <div class="body">
+      <section class="sec">
+        <h3>Preset <button id="btn-new-preset" class="mini" type="button">+ New</button></h3>
+        <div id="preset-list" class="list"></div>
+      </section>
+      <section class="sec">
+        <h3>Connection</h3>
+        <label class="field">Label<input id="conn-label" type="text" autocomplete="off" /></label>
+        <label class="field">Base URL<input id="conn-url" type="url" inputmode="url" autocomplete="off" placeholder="https://api.openai.com" /></label>
+        <label class="field">API key<input id="conn-key" type="password" autocomplete="off" placeholder="sk-…" /></label>
+        <label class="field">Model<input id="conn-model" type="text" autocomplete="off" placeholder="model-id" /></label>
+        <label class="field">Reasoning strategy
+          <select id="conn-strategy">
+            <option value="none">none — strip reasoning keys</option>
+            <option value="openai_effort">openai_effort — reasoning_effort</option>
+            <option value="anthropic_budget">anthropic_budget — thinking budget</option>
+            <option value="tag_only">tag_only — client-side &lt;think&gt; only</option>
+          </select>
+        </label>
+        <label class="field">Effort (openai_effort)
+          <select id="conn-effort">
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+          </select>
+        </label>
+        <label class="field">Thinking budget (anthropic, min 1024)<input id="conn-budget" type="number" min="1024" step="256" /></label>
+        <label class="checkline"><input type="checkbox" id="conn-proxy-use" /> Use reverse proxy</label>
+        <label class="field">Proxy URL<input id="conn-proxy-url" type="url" inputmode="url" autocomplete="off" placeholder="https://proxy.example.com" /></label>
+      </section>
+      <section class="sec">
+        <h3>Samplers</h3>
+        <div class="grid2">
+          <label class="field">Temp<input id="sam-temp" type="number" step="0.05" /></label>
+          <label class="field">Top P<input id="sam-topp" type="number" step="0.05" /></label>
+          <label class="field">Top K<input id="sam-topk" type="number" step="1" /></label>
+          <label class="field">Min P<input id="sam-minp" type="number" step="0.01" /></label>
+          <label class="field">Max tokens<input id="sam-max" type="number" step="1" /></label>
+          <label class="field">Context limit<input id="sam-ctx" type="number" step="512" /></label>
+          <label class="field">Freq penalty<input id="sam-freq" type="number" step="0.05" /></label>
+          <label class="field">Presence<input id="sam-pres" type="number" step="0.05" /></label>
+        </div>
+        <label class="field">Stop sequences (one per line)<textarea id="sam-stop" rows="2"></textarea></label>
+      </section>
+      <section class="sec">
+        <h3>Prompts</h3>
+        <label class="field">System prompt<textarea id="pr-system" rows="4"></textarea></label>
+        <label class="field">Jailbreak / system follow-up<textarea id="pr-jailbreak" rows="3"></textarea></label>
+        <label class="field">Author's note (depth inject)<textarea id="pr-note" rows="2"></textarea></label>
+        <label class="field">Note depth<input id="pr-depth" type="number" min="0" step="1" /></label>
+        <label class="checkline"><input type="checkbox" id="pr-prefill-use" /> Assistant prefill</label>
+        <label class="field">Prefill text<input id="pr-prefill-text" type="text" /></label>
+      </section>
+      <div class="vaultbtns">
+        <button id="btn-save-preset" class="btn" type="button">Save preset</button>
+        <button id="btn-del-preset" class="btn secondary" type="button">Delete</button>
+      </div>
+      <div id="preset-status" class="status" role="status"></div>
+      <section class="sec">
+        <h3>Diagnostics</h3>
+        <div id="diag-log" class="diag" aria-live="polite">No events yet.</div>
+        <div class="vaultbtns">
+          <button id="btn-diag-copy" class="btn secondary" type="button">Copy report</button>
+          <button id="btn-diag-export" class="btn secondary" type="button">Export log</button>
+          <button id="btn-diag-clear" class="btn secondary" type="button">Clear</button>
+        </div>
+        <div id="diag-status" class="status" role="status"></div>
+      </section>
+    </div>
   </aside>
 
   <div id="backdrop"></div>
+
+  <div id="char-modal" class="modal" hidden>
+    <div class="sheet" role="dialog" aria-label="Character editor">
+      <header><h2 id="ch-title">Character</h2><button class="iconbtn" id="btn-ch-close" aria-label="Close">&times;</button></header>
+      <div class="mbody">
+        <div class="avrow">
+          <img id="ch-avatar" class="av" alt="Avatar preview" />
+          <label class="btn secondary" for="ch-avatar-file">Set image</label>
+          <input id="ch-avatar-file" type="file" accept="image/png,image/jpeg,image/webp" hidden />
+        </div>
+        <label class="field">Name<input id="ch-name" type="text" autocomplete="off" /></label>
+        <label class="field">Description<textarea id="ch-desc" rows="3"></textarea></label>
+        <label class="field">Personality<textarea id="ch-pers" rows="2"></textarea></label>
+        <label class="field">Scenario<textarea id="ch-scen" rows="2"></textarea></label>
+        <label class="field">First message<textarea id="ch-first" rows="2"></textarea></label>
+        <label class="field">Example messages<textarea id="ch-example" rows="3"></textarea></label>
+        <h3>Lorebook entries</h3>
+        <div id="ch-lore-list" class="list"></div>
+        <div class="grid2">
+          <label class="field">Keys (comma separated)<input id="ch-lore-keys" type="text" autocomplete="off" /></label>
+          <label class="field">Content<textarea id="ch-lore-content" rows="2"></textarea></label>
+        </div>
+        <button id="btn-ch-lore-add" class="btn secondary" type="button">Add entry</button>
+        <div class="vaultbtns">
+          <button id="btn-ch-save" class="btn" type="button">Save character</button>
+        </div>
+        <div id="char-status" class="status" role="status"></div>
+      </div>
+    </div>
+  </div>
 
   <script type="module" src="./js/app.js"></script>
 </body>
