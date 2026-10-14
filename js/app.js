@@ -1,4 +1,5 @@
 import { APP_VERSION, DEFAULT_CONNECTION, DEFAULT_SAMPLERS, DEFAULT_PROMPTS, THEMES } from "./config.js";
+import { applyRules, compileRule, cleanFlags } from "./regex-engine.js";
 import {
   openDB,
   listCharacters,
@@ -21,6 +22,9 @@ import {
   listPresets,
   savePreset,
   deletePreset,
+  listAllRegexRules,
+  saveRegexRule,
+  deleteRegexRule,
   exportVaultToJSON,
   importVaultFromJSON,
   seedIfEmpty
@@ -132,6 +136,51 @@ export function renderRich(text) {
 
 function scrollBottom() {
   $("#chat").scrollTop = $("#chat").scrollHeight;
+}
+
+// ---------- Phase 5: regex scripts ----------
+// Rules are cached in memory (refreshed at init + after every mutation).
+// Prompt rules rewrite outgoing context only — stored history is untouched.
+// Display rules rewrite raw text just before renderRich (which still escapes
+// afterwards, so the XSS guarantee is unchanged). Live stream chunks stay raw;
+// the final bubble is filtered.
+let cachedRegex = null;
+
+async function getRegexRules() {
+  if (!cachedRegex) {
+    try {
+      cachedRegex = await listAllRegexRules();
+    } catch {
+      cachedRegex = [];
+    }
+  }
+  return cachedRegex;
+}
+
+function bumpRegexCache() {
+  cachedRegex = null;
+}
+
+function renderMsg(raw, characterId = ui.characterId) {
+  try {
+    const rules = cachedRegex || [];
+    if (!rules.length) return renderRich(raw);
+    return renderRich(applyRules(raw, rules, { place: "display", characterId }).text);
+  } catch {
+    return renderRich(raw);
+  }
+}
+
+function applyPromptMessages(messages, rules, characterId) {
+  if (!rules.length) return { messages, skipped: [] };
+  let skipped = [];
+  const out = messages.map((m) => {
+    if (typeof m.content !== "string" || !m.content) return m;
+    const r = applyRules(m.content, rules, { place: "prompt", characterId });
+    if (r.skipped.length) skipped = [...new Set([...skipped, ...r.skipped])];
+    return r.text === m.content ? m : { ...m, content: r.text };
+  });
+  return { messages: out, skipped };
 }
 
 function paintShell(role, who) {
@@ -323,6 +372,7 @@ function openEditorBubble(div, msg, onSave) {
 
 async function renderCurrentChat() {
   await ensureSelection();
+  await getRegexRules();
   if (ui.chatId == null) {
     if (ui.characterId == null) {
       clearChatView("No characters yet. Tap ☰ to create or import one.");
@@ -336,7 +386,7 @@ async function renderCurrentChat() {
       if (ch?.first_mes) {
         const s = paintShell("assistant", ch.name);
         s.det.remove();
-        s.body.innerHTML = renderRich(ch.first_mes);
+        s.body.innerHTML = renderMsg(ch.first_mes);
         s.body.classList.add("msgbody");
       } else clearChatView("No messages yet. Say hello.");
       return;
@@ -356,7 +406,7 @@ async function renderCurrentChat() {
     if (ch?.first_mes) {
       const s = paintShell("assistant", chName);
       s.det.remove();
-      s.body.innerHTML = renderRich(ch.first_mes);
+      s.body.innerHTML = renderMsg(ch.first_mes);
     } else {
       const s = paintShell("assistant", "Polyglot");
       s.det.remove();
@@ -373,7 +423,7 @@ async function renderCurrentChat() {
       div.innerHTML = `<div class="who">${escapeHtml(meName)}</div>`;
       const body = document.createElement("div");
       body.className = "msgbody";
-      body.innerHTML = renderRich(it.msg.content);
+      body.innerHTML = renderMsg(it.msg.content);
       const acts = document.createElement("div");
       acts.className = "acts";
       acts.append(
@@ -415,7 +465,7 @@ async function renderCurrentChat() {
     }
     const body = document.createElement("div");
     body.className = "msgbody";
-    body.innerHTML = renderRich(active.content);
+    body.innerHTML = renderMsg(active.content);
     div.append(body);
     const acts = document.createElement("div");
     acts.className = "acts";
@@ -756,6 +806,17 @@ async function buildContext(pastRows, extraUserText = "") {
       maxTokens: preset?.samplers?.max_tokens ?? 800
     }
   });
+  // Phase 5: prompt-scoped regex scripts rewrite outgoing context only.
+  try {
+    const rx = await getRegexRules();
+    if (rx.length) {
+      const r = applyPromptMessages(built.messages, rx, ui.characterId);
+      built.messages = r.messages;
+      if (r.skipped.length) logWarn("E_REGEX_RULE", `skipped invalid pattern: ${r.skipped.join(", ")}`);
+    }
+  } catch {
+    /* regex must never break the send path */
+  }
   return { preset, ch, me, chName: ch?.name || "Polyglot", meName: me?.name || "You", built };
 }
 
@@ -783,7 +844,7 @@ async function runStream(preset, messages, shell, signal) {
     onContent: (t) => { acc += t; renderLive(); },
     onReasoning: (t) => { accThink += t; renderLive(); }
   });
-  shell.body.innerHTML = renderRich(content || acc);
+  shell.body.innerHTML = renderMsg(content || acc);
   if ((reasoning || accThink) && tg.thought) {
     shell.det.style.display = "";
     shell.tb.textContent = reasoning || accThink;
@@ -911,7 +972,7 @@ async function handleContinue() {
   const ctx = await buildContext(rows);
   const shell = paintShell("assistant", chName);
   // Seed the shell with the existing partial text.
-  shell.body.innerHTML = renderRich(last.content);
+  shell.body.innerHTML = renderMsg(last.content);
   document.body.classList.add("generating");
   aborter = new AbortController();
   try {
@@ -1026,6 +1087,7 @@ async function handleImportFile(file) {
     ui.personaId = null;
     ui.presetId = null;
     persistUI();
+    bumpRegexCache();
     await ensureSelection();
     await refreshLibrary();
     await refreshPresets();
@@ -1436,7 +1498,7 @@ function showView(name) {
   $("#chat").style.display = inChat ? "" : "none";
   $("#composer").style.display = inChat ? "" : "none";
   $("#views").style.display = inChat ? "none" : "";
-  for (const v of ["home", "chars", "detail", "presets", "books"]) {
+  for (const v of ["home", "chars", "detail", "presets", "books", "regex"]) {
     const el = $(`#view-${v}`);
     if (el) el.hidden = name !== v;
   }
@@ -1445,6 +1507,7 @@ function showView(name) {
   if (name === "detail") renderDetailView();
   if (name === "presets") renderPresetCards();
   if (name === "books") renderBooksView();
+  if (name === "regex") renderRegexView();
   if (name === "chat") {
     renderCurrentChat();
     window.setTimeout(autogrow, 0);
@@ -1801,12 +1864,227 @@ async function renderBooksView() {
   }
 }
 
+// ---------- Phase 5: regex scripts view ----------
+let edRxId = null;
+
+function setRxStatus(msg) {
+  const el = $("#rx-status");
+  if (el) el.textContent = msg;
+}
+
+async function fillRxCharSelect(selected = "global") {
+  const sel = $("#rx-char");
+  if (!sel) return;
+  const chars = await listCharacters();
+  sel.innerHTML = "";
+  const g = document.createElement("option");
+  g.value = "global";
+  g.textContent = "Global (all chats)";
+  sel.append(g);
+  for (const c of chars) {
+    const o = document.createElement("option");
+    o.value = String(c.id);
+    o.textContent = c.name;
+    sel.append(o);
+  }
+  sel.value = [...sel.options].some((o) => o.value === String(selected)) ? String(selected) : "global";
+}
+
+function openRegexForm(id = null, prefill = null) {
+  edRxId = id;
+  $("#regex-form").hidden = false;
+  if (prefill) {
+    $("#rx-name").value = prefill.name || "";
+    $("#rx-pattern").value = prefill.pattern || "";
+    $("#rx-replacement").value = prefill.replacement || "";
+    $("#rx-flags").value = prefill.flags || "g";
+    $("#rx-place").value = prefill.place || "both";
+    $("#rx-enabled").checked = prefill.enabled !== 0 && prefill.enabled !== false;
+    fillRxCharSelect(prefill.character_id == null ? "global" : prefill.character_id);
+  } else {
+    $("#rx-name").value = "";
+    $("#rx-pattern").value = "";
+    $("#rx-replacement").value = "";
+    $("#rx-flags").value = "g";
+    $("#rx-place").value = "both";
+    $("#rx-enabled").checked = true;
+    fillRxCharSelect("global");
+  }
+  setRxStatus("");
+  $("#rx-pattern").focus();
+}
+
+function closeRegexForm() {
+  $("#regex-form").hidden = true;
+  edRxId = null;
+  setRxStatus("");
+}
+
+async function saveRegexForm() {
+  const pattern = $("#rx-pattern").value;
+  const flags = cleanFlags($("#rx-flags").value || "g");
+  $("#rx-flags").value = flags;
+  if (!pattern.trim()) {
+    setRxStatus("Find pattern is empty — nothing to match.");
+    return;
+  }
+  if (!compileRule({ pattern, flags, enabled: 1 })) {
+    setRxStatus("Invalid regex — check brackets and escapes. Rule not saved.");
+    logWarn("E_REGEX_RULE", `rejected invalid pattern: ${pattern.slice(0, 80)}`);
+    refreshDiag();
+    return;
+  }
+  const charSel = $("#rx-char")?.value || "global";
+  const rec = {
+    name: $("#rx-name").value.trim() || "Untitled rule",
+    pattern,
+    replacement: $("#rx-replacement").value,
+    flags: flags || "g",
+    place: $("#rx-place").value || "both",
+    character_id: charSel === "global" ? null : Number(charSel),
+    enabled: $("#rx-enabled").checked ? 1 : 0
+  };
+  try {
+    if (edRxId == null) await saveRegexRule(rec);
+    else {
+      const all = await listAllRegexRules();
+      const prev = all.find((r) => r.id === edRxId) || {};
+      await saveRegexRule({ ...prev, ...rec, id: edRxId });
+    }
+    bumpRegexCache();
+    closeRegexForm();
+    await renderRegexView();
+    logInfo("E_REGEX_RULE", `rule saved (${rec.name})`);
+  } catch (e) {
+    logErr("E_REGEX_RULE", e.message);
+    setRxStatus(`Save failed: ${e.message}`);
+  }
+  refreshDiag();
+}
+
+async function renderRegexView() {
+  const box = $("#regex-list");
+  if (!box) return;
+  const [rules, chars] = await Promise.all([listAllRegexRules(), listCharacters()]);
+  const byChar = new Map(chars.map((c) => [c.id, c.name]));
+  box.innerHTML = "";
+  const sorted = [...rules].sort((a, b) => (a.id ?? 0) - (b.id ?? 0));
+  if (!sorted.length) {
+    box.innerHTML = `<div class="status">No rules yet. Example: find <b>Jon\\b</b> → replace <b>John</b>, both, global.</div>`;
+    return;
+  }
+  for (const r of sorted) {
+    const row = document.createElement("div");
+    row.className = "row" + (r.enabled ? "" : " disabled");
+    if (!r.enabled) row.style.opacity = "0.55";
+    const tx = document.createElement("span");
+    tx.className = "nm";
+    const t = document.createElement("div");
+    t.textContent = `${r.enabled ? "" : "⏸ "}${r.name || "Rule"}  /${r.pattern}/${r.flags}`;
+    const s = document.createElement("div");
+    s.className = "csub";
+    const scope = r.character_id == null ? "global" : (byChar.get(r.character_id) || "deleted char");
+    s.textContent = `→ ${String(r.replacement).slice(0, 40) || "(delete match)"} • ${r.place} • ${scope}`;
+    tx.append(t, s);
+    const icons = document.createElement("span");
+    icons.className = "iconrow";
+    const tg = document.createElement("button");
+    tg.textContent = r.enabled ? "⏸" : "▶";
+    tg.title = r.enabled ? "Disable rule" : "Enable rule";
+    tg.setAttribute("aria-label", "Toggle rule");
+    tg.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      await saveRegexRule({ ...r, enabled: r.enabled ? 0 : 1, id: r.id });
+      bumpRegexCache();
+      await renderRegexView();
+    });
+    const ed = document.createElement("button");
+    ed.textContent = "⋯";
+    ed.title = "Edit rule";
+    ed.setAttribute("aria-label", "Edit rule");
+    ed.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openRegexForm(r.id, r);
+    });
+    const del = document.createElement("button");
+    del.textContent = "🗑";
+    del.title = "Delete rule";
+    del.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (!window.confirm(`Delete rule "${r.name || r.pattern}"?`)) return;
+      await deleteRegexRule(r.id);
+      bumpRegexCache();
+      await renderRegexView();
+    });
+    icons.append(tg, ed, del);
+    row.append(tx, icons);
+    box.append(row);
+  }
+}
+
+async function runRegexTest() {
+  const src = $("#rx-test-in")?.value || "";
+  const place = $("#rx-test-place")?.value || "prompt";
+  const out = $("#rx-test-out");
+  if (!out) return;
+  if (!src.trim()) {
+    out.textContent = "Type something above first.";
+    return;
+  }
+  const rules = await getRegexRules();
+  const r = applyRules(src, rules, { place, characterId: ui.characterId });
+  const bits = [];
+  if (r.applied.length) bits.push(`Applied: ${r.applied.join(", ")}`);
+  else bits.push("No rule matched.");
+  if (r.skipped.length) bits.push(`Skipped invalid: ${r.skipped.join(", ")}`);
+  out.innerHTML = "";
+  const pre = document.createElement("div");
+  pre.textContent = r.text;
+  pre.style.cssText = "color:var(--ink);white-space:pre-wrap;margin-top:6px;";
+  const meta = document.createElement("div");
+  meta.textContent = bits.join(" ");
+  out.append(meta, pre);
+}
+
+async function handleRegexImportFile(file) {
+  try {
+    const data = JSON.parse(await file.text());
+    const rows = Array.isArray(data) ? data : [data];
+    let n = 0;
+    for (const r of rows) {
+      if (!r || typeof r !== "object" || !String(r.pattern || "").trim()) continue;
+      if (!compileRule({ pattern: r.pattern, flags: r.flags, enabled: 1 })) continue;
+      const { id, ...rest } = r;
+      void id;
+      const place = ["prompt", "display", "both"].includes(rest.place) ? rest.place : "both";
+      await saveRegexRule({
+        name: String(rest.name || "Imported rule"),
+        pattern: String(r.pattern),
+        replacement: String(rest.replacement ?? ""),
+        flags: cleanFlags(rest.flags) || "g",
+        place,
+        character_id: rest.character_id ?? null,
+        enabled: rest.enabled === 0 ? 0 : 1
+      });
+      n++;
+    }
+    bumpRegexCache();
+    await renderRegexView();
+    logInfo("E_REGEX_RULE", `rules imported (${n})`);
+  } catch (e) {
+    logErr("E_REGEX_RULE", e.message);
+    window.alert(`Regex import failed: ${e.message}`);
+  }
+  refreshDiag();
+}
+
 function refreshViews() {
   if (view === "home") refreshHome();
   else if (view === "chars") renderCharsView();
   else if (view === "detail") renderDetailView();
   else if (view === "presets") renderPresetCards();
   else if (view === "books") renderBooksView();
+  else if (view === "regex") renderRegexView();
 }
 
 // ---------- Phase 4: theme presets + *action*/"dialogue" colors ----------
@@ -2157,6 +2435,32 @@ async function init() {
     $(id)?.addEventListener("input", () => applyTheme("custom", readThemeInputs()));
   }
 
+  $("#btn-regex-new")?.addEventListener("click", () => openRegexForm(null));
+  $("#btn-rx-cancel")?.addEventListener("click", closeRegexForm);
+  $("#btn-rx-save")?.addEventListener("click", saveRegexForm);
+  $("#btn-rx-test")?.addEventListener("click", runRegexTest);
+  $("#btn-regex-export")?.addEventListener("click", async () => {
+    try {
+      const rules = await listAllRegexRules();
+      const blob = new Blob([JSON.stringify(rules, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `polyglot-regex-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.append(a);
+      a.click();
+      a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    } catch (e) {
+      logErr("E_REGEX_RULE", e.message);
+    }
+    refreshDiag();
+  });
+  $("#file-regex-import")?.addEventListener("change", async (e) => {
+    const f = e.target.files?.[0];
+    e.target.value = "";
+    if (f) await handleRegexImportFile(f);
+  });
+
   $("#btn-diag-copy").addEventListener("click", copyDiagReport);
   $("#btn-diag-export").addEventListener("click", () => {
     try {
@@ -2184,7 +2488,8 @@ async function init() {
   autogrow();
   trackKeyboard();
   registerSW();
-  showView(["home", "chars", "chat", "presets", "books", "detail"].includes(view) ? view : "home");
+  await getRegexRules();
+  showView(["home", "chars", "chat", "presets", "books", "detail", "regex"].includes(view) ? view : "home");
 }
 
 init();

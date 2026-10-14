@@ -18,7 +18,8 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   (`view-home/recent-grid, view-chars/chars-search/chars-sort/chars-fav-list/
   chars-list, view-detail/detail-avatar/detail-name/detail-chat-list,
   view-presets/preset-filter/preset-cards, view-books/books-char-filter/
-  book-list`), drawers, composer. Drawer IDs consumed by app.js:
+  book-list, view-regex/regex-list/regex-form/rx-pattern/rx-test-in`), drawers,
+  composer. Drawer IDs consumed by app.js:
   `ver, update-banner, reload-btn, chat, empty, input, send, stop, btn-left,
   btn-right, drawer-left, drawer-right, backdrop, persona-list, char-list,
   chat-list, btn-new-persona, btn-new-char, btn-new-chat, btn-export, chk-keys,
@@ -35,10 +36,12 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
 - `js/config.js` — `APP_VERSION`, `CACHE_NAME`, `DB_NAME/VERSION`,
   `DEFAULT_CONNECTION/SAMPLERS/PROMPTS`. Single source of truth for new presets.
 - `js/db.js` — IndexedDB wrapper. Stores: characters, personas, chats, messages
-  (compound `chat_time=[chat_id+timestamp]`), lorebooks, presets.
+  (compound `chat_time=[chat_id+timestamp]`), lorebooks, presets, regex_rules
+  (index `character_id`, null = global).
   Exports: openDB, list*/save*/delete* per store, setDefaultPersona,
   touchChat, exportVaultToJSON({includeKeys}), importVaultFromJSON(data,{merge}),
-  seedIfEmpty(defaults).
+  seedIfEmpty(defaults). DB v1→v2 upgrade only ADDS regex_rules; old vaults
+  without that table still import (table optional).
 - `js/app.js` — UI coordinator. Owns `ui={characterId,chatId,personaId,presetId}` in
   localStorage, drawer rendering, composer, streaming send path, swipe groups
   (`swipe_group_id`/`swipe_active`) + retry/continue/impersonate/edit/delete,
@@ -54,6 +57,9 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   (V3 wins), parsePNGCard/parseCharacterJSON/normalizeCharacter,
   fileToAvatarDataURL (512px webp→jpeg fallback).
 - `js/diagnostics.js` — coded ring logger (200). Only app.js imports it.
+- `js/regex-engine.js` — pure find/replace scripts: cleanFlags, compileRule,
+  applyRules(text, rules, {place, characterId}) → {text, applied, skipped}.
+  Never throws; invalid patterns land in `skipped`.
 
 ## Rules for every patch
 1. No placeholders. Never `TODO`, stub functions, or omitted logic. Complete code only.
@@ -90,3 +96,9 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   preset cards + editor tabs + Memory Books manager + THEMES
   (polyglot/agnai/amoled/light) + *action*/"dialogue" color settings + stream/
   thought/haptic toggles. Default tab Home; detail highlights Characters tab.
+- Phase 5 DONE: regex scripts — `regex_rules` store (DB v2, global/per-char,
+  prompt/display/both), pure `regex-engine.js`, prompt rewrite in buildContext
+  (history untouched), display rewrite pre-renderRich (XSS order kept), Regex
+  tab with add/edit/test-drive/import/export, `E_REGEX_RULE` diagnostics.
+  Existing data survives: v1→v2 upgrade only adds the store; SW swap never
+  touches IndexedDB/localStorage.

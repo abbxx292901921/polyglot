@@ -1,9 +1,10 @@
 import { DB_NAME, DB_VERSION } from "./config.js";
 
 /* Polyglot storage — vanilla IndexedDB, zero dependencies.
-   6 stores mirroring the SillyTavern-lite model:
+   7 stores mirroring the SillyTavern-lite model:
    characters, personas, chats, messages (compound chat_time index),
-   lorebooks, presets. All data stays on-device. */
+   lorebooks, presets, regex_rules (Phase 5 find/replace scripts).
+   All data stays on-device. */
 
 let dbp = null;
 
@@ -48,6 +49,10 @@ export function openDB() {
       if (!db.objectStoreNames.contains("presets")) {
         const s = db.createObjectStore("presets", { keyPath: "id", autoIncrement: true });
         s.createIndex("name", "name", { unique: false });
+      }
+      if (!db.objectStoreNames.contains("regex_rules")) {
+        const s = db.createObjectStore("regex_rules", { keyPath: "id", autoIncrement: true });
+        s.createIndex("character_id", "character_id", { unique: false });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -130,11 +135,13 @@ export function saveCharacter(c) {
 }
 
 export async function deleteCharacter(id) {
-  // Cascade: chats + their messages, lorebooks.
+  // Cascade: chats + their messages, lorebooks, per-character regex rules.
   const chats = await getByIndex("chats", "character_id", id);
   for (const ch of chats) await deleteChat(ch.id);
   const books = await getByIndex("lorebooks", "character_id", id);
   for (const b of books) await delRec("lorebooks", b.id);
+  const rules = await getByIndex("regex_rules", "character_id", id);
+  for (const r of rules) await delRec("regex_rules", r.id);
   await delRec("characters", id);
 }
 
@@ -236,15 +243,47 @@ export function savePreset(p) {
 
 export const deletePreset = (id) => delRec("presets", id);
 
+// ---------- Regex scripts (Phase 5) ----------
+// Rule shape: {name, pattern, replacement, flags, place:"prompt"|"display"|"both",
+//   character_id:null|id (null = global), enabled:0|1, updated_at}.
+export async function listRegexRules(characterId = null) {
+  if (characterId == null) return getAll("regex_rules");
+  const [global, scoped] = await Promise.all([
+    getByIndex("regex_rules", "character_id", null),
+    getByIndex("regex_rules", "character_id", characterId)
+  ]);
+  return [...global, ...scoped];
+}
+
+export const listAllRegexRules = () => getAll("regex_rules");
+
+export function saveRegexRule(r) {
+  return putRec("regex_rules", {
+    name: "",
+    pattern: "",
+    replacement: "",
+    flags: "g",
+    place: "both",
+    character_id: null,
+    enabled: 1,
+    updated_at: Date.now(),
+    ...r,
+    updated_at: Date.now()
+  });
+}
+
+export const deleteRegexRule = (id) => delRec("regex_rules", id);
+
 // ---------- Vault backup ----------
 export async function exportVaultToJSON({ includeKeys = false } = {}) {
-  const [characters, personas, chats, messages, lorebooks, presets] = await Promise.all([
+  const [characters, personas, chats, messages, lorebooks, presets, regex_rules] = await Promise.all([
     getAll("characters"),
     getAll("personas"),
     getAll("chats"),
     getAll("messages"),
     getAll("lorebooks"),
-    getAll("presets")
+    getAll("presets"),
+    getAll("regex_rules").catch(() => [])
   ]);
   const safePresets = presets.map((p) => {
     if (includeKeys || !p.connection) return p;
@@ -254,7 +293,7 @@ export async function exportVaultToJSON({ includeKeys = false } = {}) {
     app: "Polyglot",
     version: 1,
     exported_at: new Date().toISOString(),
-    tables: { characters, personas, chats, messages, lorebooks, presets: safePresets }
+    tables: { characters, personas, chats, messages, lorebooks, presets: safePresets, regex_rules }
   };
 }
 
@@ -262,7 +301,8 @@ export async function importVaultFromJSON(data, { merge = false } = {}) {
   if (!data || typeof data !== "object" || !data.tables) {
     throw new Error("E_VAULT_SHAPE: not a Polyglot vault file (missing tables).");
   }
-  const names = ["characters", "personas", "chats", "messages", "lorebooks", "presets"];
+  // regex_rules is optional so pre-v1.4 vaults still import cleanly.
+  const names = ["characters", "personas", "chats", "messages", "lorebooks", "presets", "regex_rules"];
   for (const n of names) {
     if (data.tables[n] !== undefined && !Array.isArray(data.tables[n])) {
       throw new Error(`E_VAULT_TABLE: vault table "${n}" is corrupt (expected array).`);

@@ -20,7 +20,7 @@
     <header class="topbar">
       <button id="btn-left" class="iconbtn" aria-label="Open library">&#9776;</button>
       <h1>Polyglot</h1>
-      <span id="ver" class="ver">v1.3.0</span>
+      <span id="ver" class="ver">v1.4.0</span>
       <div class="spacer"></div>
       <button id="btn-right" class="iconbtn" aria-label="Open settings">&#9881;</button>
     </header>
@@ -36,6 +36,7 @@
       <button data-view="chat" role="tab" type="button">Chat</button>
       <button data-view="presets" role="tab" type="button">Presets</button>
       <button data-view="books" role="tab" type="button">Books</button>
+      <button data-view="regex" role="tab" type="button">Regex</button>
     </nav>
 
     <section id="views">
@@ -112,6 +113,56 @@
             <input id="file-book-import" type="file" accept="application/json,.json" hidden />
           </div>
           <div id="book-list" class="list"></div>
+        </div>
+      </div>
+      <div id="view-regex" class="view" hidden>
+        <div class="wrap">
+          <h2>Regex Scripts</h2>
+          <div class="toolbar">
+            <button id="btn-regex-new" class="btn" type="button">+ New rule</button>
+            <label class="btn secondary" for="file-regex-import">Import</label>
+            <input id="file-regex-import" type="file" accept="application/json,.json" hidden />
+            <button id="btn-regex-export" class="btn secondary" type="button">Export</button>
+          </div>
+          <p class="status">Find/replace on prompts, display, or both — global or per-character. Stored history is never rewritten: prompt rules change what's sent, display rules change what's shown.</p>
+          <div id="regex-form" class="card wide" hidden>
+            <label class="field">Name<input id="rx-name" type="text" autocomplete="off" placeholder="Fix name spelling" /></label>
+            <div class="grid2">
+              <label class="field">Find (regex)<input id="rx-pattern" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Jon\b" /></label>
+              <label class="field">Flags (g i m s u y)<input id="rx-flags" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="g" /></label>
+            </div>
+            <label class="field">Replace ($1… groups, $$ for $)<input id="rx-replacement" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="John" /></label>
+            <div class="grid2">
+              <label class="field">Applies to
+                <select id="rx-place">
+                  <option value="both">Prompt + display</option>
+                  <option value="prompt">Prompt only</option>
+                  <option value="display">Display only</option>
+                </select>
+              </label>
+              <label class="field">Character<select id="rx-char"></select></label>
+            </div>
+            <label class="checkline"><input type="checkbox" id="rx-enabled" checked /> Enabled</label>
+            <div id="rx-status" class="status" role="status"></div>
+            <div class="vaultbtns">
+              <button id="btn-rx-save" class="btn" type="button">Save rule</button>
+              <button id="btn-rx-cancel" class="btn secondary" type="button">Cancel</button>
+            </div>
+          </div>
+          <div class="card wide">
+            <strong>Test drive</strong>
+            <label class="field">Try text<textarea id="rx-test-in" rows="2" placeholder="Type something the rules should rewrite…"></textarea></label>
+            <div class="toolbar">
+              <select id="rx-test-place" aria-label="Test path">
+                <option value="prompt">Prompt path</option>
+                <option value="display">Display path</option>
+              </select>
+              <button id="btn-rx-test" class="btn secondary" type="button">Run</button>
+            </div>
+            <div id="rx-test-out" class="status"></div>
+          </div>
+          <h3>Rules</h3>
+          <div id="regex-list" class="list"></div>
         </div>
       </div>
     </section>
