@@ -20,7 +20,7 @@
     <header class="topbar">
       <button id="btn-left" class="iconbtn" aria-label="Open library">&#9776;</button>
       <h1>Polyglot</h1>
-      <span id="ver" class="ver">v1.2.0</span>
+      <span id="ver" class="ver">v1.3.0</span>
       <div class="spacer"></div>
       <button id="btn-right" class="iconbtn" aria-label="Open settings">&#9881;</button>
     </header>
@@ -29,6 +29,92 @@
       <span>&#9889; Update detected.</span>
       <button id="reload-btn" type="button">Tap to Reload</button>
     </div>
+
+    <nav id="tabs" role="tablist" aria-label="Views">
+      <button data-view="home" role="tab" type="button">Home</button>
+      <button data-view="chars" role="tab" type="button">Characters</button>
+      <button data-view="chat" role="tab" type="button">Chat</button>
+      <button data-view="presets" role="tab" type="button">Presets</button>
+      <button data-view="books" role="tab" type="button">Books</button>
+    </nav>
+
+    <section id="views">
+      <div id="view-home" class="view" hidden>
+        <div class="wrap">
+          <h2>Recent Conversations</h2>
+          <div id="recent-grid" class="cards-grid"></div>
+          <div class="card wide">
+            <strong>Guides</strong>
+            <div class="vaultbtns">
+              <button id="btn-guide-char" class="btn secondary" type="button">New character</button>
+              <button id="btn-guide-preset" class="btn secondary" type="button">New preset</button>
+              <button id="btn-guide-book" class="btn secondary" type="button">Memory books</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div id="view-chars" class="view" hidden>
+        <div class="wrap">
+          <h2>Characters</h2>
+          <div class="toolbar">
+            <input id="chars-search" type="search" placeholder="Search by name…" autocomplete="off" />
+            <select id="chars-sort" aria-label="Sort characters">
+              <option value="modified">Last Modified</option>
+              <option value="name">Name A–Z</option>
+              <option value="favorites">Favorites first</option>
+            </select>
+            <button id="btn-chars-new" class="btn" type="button">+ New</button>
+          </div>
+          <h3>Favorites</h3>
+          <div id="chars-fav-list" class="list"></div>
+          <h3>All</h3>
+          <div id="chars-list" class="list"></div>
+        </div>
+      </div>
+      <div id="view-detail" class="view" hidden>
+        <div class="wrap">
+          <button id="detail-back" class="btn secondary" type="button">← Characters</button>
+          <div class="detail-head">
+            <img id="detail-avatar" class="av large" alt="" />
+            <div>
+              <h2 id="detail-name">Character</h2>
+              <div id="detail-sub" class="status"></div>
+            </div>
+          </div>
+          <div class="vaultbtns">
+            <button id="btn-detail-new-chat" class="btn" type="button">+ New chat</button>
+            <button id="btn-detail-edit" class="btn secondary" type="button">Edit</button>
+          </div>
+          <h3>Chats with this character</h3>
+          <div id="detail-chat-list" class="list"></div>
+        </div>
+      </div>
+      <div id="view-presets" class="view" hidden>
+        <div class="wrap">
+          <h2>Presets</h2>
+          <div class="toolbar">
+            <input id="preset-filter" type="search" placeholder="Filter…" autocomplete="off" />
+            <button id="btn-preset-new" class="btn" type="button">+ New</button>
+            <label class="btn secondary" for="file-preset-import">Import</label>
+            <input id="file-preset-import" type="file" accept="application/json,.json" hidden />
+          </div>
+          <div id="preset-cards" class="list"></div>
+          <p class="status">Tap a preset to select it and open its editor (⚙ drawer). Providers = the Connection section inside the editor.</p>
+        </div>
+      </div>
+      <div id="view-books" class="view" hidden>
+        <div class="wrap">
+          <h2>Memory — Books</h2>
+          <div class="toolbar">
+            <select id="books-char-filter" aria-label="Filter books by character"></select>
+            <button id="btn-book-new" class="btn" type="button">+ Create Book</button>
+            <label class="btn secondary" for="file-book-import">Import Book</label>
+            <input id="file-book-import" type="file" accept="application/json,.json" hidden />
+          </div>
+          <div id="book-list" class="list"></div>
+        </div>
+      </div>
+    </section>
 
     <main id="chat" aria-live="polite">
       <div class="empty" id="empty">
@@ -90,8 +176,15 @@
         <h3>Preset <button id="btn-new-preset" class="mini" type="button">+ New</button></h3>
         <div id="preset-list" class="list"></div>
       </section>
-      <section class="sec">
-        <h3>Connection</h3>
+      <div class="ptabs" role="tablist" aria-label="Preset editor tabs">
+        <button data-ptab="general" type="button" class="active">General</button>
+        <button data-ptab="prompt" type="button">Prompt</button>
+        <button data-ptab="memory" type="button">Memory</button>
+        <button data-ptab="samplers" type="button">Samplers</button>
+        <button data-ptab="toggles" type="button">Toggles</button>
+      </div>
+      <section class="sec" data-ppane="general">
+        <h3>Connection (Provider)</h3>
         <label class="field">Label<input id="conn-label" type="text" autocomplete="off" /></label>
         <label class="field">Base URL<input id="conn-url" type="url" inputmode="url" autocomplete="off" placeholder="https://api.openai.com" /></label>
         <label class="field">API key<input id="conn-key" type="password" autocomplete="off" placeholder="sk-…" /></label>
@@ -114,29 +207,63 @@
         <label class="field">Thinking budget (anthropic, min 1024)<input id="conn-budget" type="number" min="1024" step="256" /></label>
         <label class="checkline"><input type="checkbox" id="conn-proxy-use" /> Use reverse proxy</label>
         <label class="field">Proxy URL<input id="conn-proxy-url" type="url" inputmode="url" autocomplete="off" placeholder="https://proxy.example.com" /></label>
+        <div class="grid2">
+          <label class="field">Max tokens<input id="sam-max" type="number" step="1" /></label>
+          <label class="field">Context limit<input id="sam-ctx" type="number" step="512" /></label>
+        </div>
       </section>
-      <section class="sec">
+      <section class="sec" data-ppane="samplers" hidden>
         <h3>Samplers</h3>
         <div class="grid2">
           <label class="field">Temp<input id="sam-temp" type="number" step="0.05" /></label>
           <label class="field">Top P<input id="sam-topp" type="number" step="0.05" /></label>
           <label class="field">Top K<input id="sam-topk" type="number" step="1" /></label>
           <label class="field">Min P<input id="sam-minp" type="number" step="0.01" /></label>
-          <label class="field">Max tokens<input id="sam-max" type="number" step="1" /></label>
-          <label class="field">Context limit<input id="sam-ctx" type="number" step="512" /></label>
           <label class="field">Freq penalty<input id="sam-freq" type="number" step="0.05" /></label>
           <label class="field">Presence<input id="sam-pres" type="number" step="0.05" /></label>
         </div>
         <label class="field">Stop sequences (one per line)<textarea id="sam-stop" rows="2"></textarea></label>
       </section>
-      <section class="sec">
+      <section class="sec" data-ppane="prompt" hidden>
         <h3>Prompts</h3>
         <label class="field">System prompt<textarea id="pr-system" rows="4"></textarea></label>
         <label class="field">Jailbreak / system follow-up<textarea id="pr-jailbreak" rows="3"></textarea></label>
-        <label class="field">Author's note (depth inject)<textarea id="pr-note" rows="2"></textarea></label>
-        <label class="field">Note depth<input id="pr-depth" type="number" min="0" step="1" /></label>
         <label class="checkline"><input type="checkbox" id="pr-prefill-use" /> Assistant prefill</label>
         <label class="field">Prefill text<input id="pr-prefill-text" type="text" /></label>
+      </section>
+      <section class="sec" data-ppane="memory" hidden>
+        <h3>Memory</h3>
+        <label class="field">Author's note (depth inject)<textarea id="pr-note" rows="2"></textarea></label>
+        <label class="field">Note depth<input id="pr-depth" type="number" min="0" step="1" /></label>
+        <p class="status">Lorebooks live under Books. Character books auto-attach to that character's chats.</p>
+      </section>
+      <section class="sec" data-ppane="toggles" hidden>
+        <h3>Toggles</h3>
+        <label class="checkline"><input type="checkbox" id="tg-stream" checked /> Stream response as generated</label>
+        <label class="checkline"><input type="checkbox" id="tg-thought" checked /> Show Thought Trace</label>
+        <label class="checkline"><input type="checkbox" id="tg-haptic" checked /> Haptics (Android vibrate)</label>
+      </section>
+      <section class="sec">
+        <h3>Theme &amp; text colors</h3>
+        <label class="field">Theme preset
+          <select id="theme-preset">
+            <option value="polyglot">Polyglot Dark</option>
+            <option value="agnai">Agnai Brown</option>
+            <option value="amoled">AMOLED</option>
+            <option value="light">Paper Light</option>
+            <option value="custom">Custom…</option>
+          </select>
+        </label>
+        <div class="grid2">
+          <label class="field">Background<input id="th-bg" type="color" /></label>
+          <label class="field">Panel<input id="th-panel" type="color" /></label>
+          <label class="field">Text<input id="th-ink" type="color" /></label>
+          <label class="field">Accent<input id="th-accent" type="color" /></label>
+          <label class="field">*action* color<input id="th-action" type="color" /></label>
+          <label class="field">"quote" color<input id="th-dialogue" type="color" /></label>
+        </div>
+        <p class="status">Preview: *she smiles* "Hello there" and normal chat text.</p>
+        <div class="msg assistant"><div class="msgbody"><p><em class="action">*she smiles*</em> <span class="dialogue">"Hello there"</span> normal chat text</p></div></div>
       </section>
       <div class="vaultbtns">
         <button id="btn-save-preset" class="btn" type="button">Save preset</button>

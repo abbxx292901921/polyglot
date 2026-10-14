@@ -1,4 +1,4 @@
-import { APP_VERSION, DEFAULT_CONNECTION, DEFAULT_SAMPLERS, DEFAULT_PROMPTS } from "./config.js";
+import { APP_VERSION, DEFAULT_CONNECTION, DEFAULT_SAMPLERS, DEFAULT_PROMPTS, THEMES } from "./config.js";
 import {
   openDB,
   listCharacters,
@@ -17,6 +17,7 @@ import {
   deleteMessage,
   listLorebooks,
   saveLorebook,
+  deleteLorebook,
   listPresets,
   savePreset,
   deletePreset,
@@ -32,11 +33,12 @@ import {
   recent as diagRecent, clearLog, report as diagReport
 } from "./diagnostics.js";
 
-/* Polyglot Phase 3: full SillyTavern-lite.
-   Library + vault (P1), streaming presets (P2), plus: PNG/JSON card import
-   with avatar shrink + lorebook auto-unpack, swipe sibling trees, retry,
-   continue, impersonate, per-message edit/delete, character editor modal,
-   per-chat export/import, and coded diagnostics (see js/diagnostics.js).
+/* Polyglot Phase 4: Agnai-style centered views.
+   Library + vault (P1), streaming presets (P2), cards/swipes/edit (P3), plus:
+   top-tab router (Home/Characters/Chat/Presets/Books), Recent Conversations
+   grid, Characters search/sort/favorites, character-detail with subordinate
+   chats, preset cards + editor tabs (General/Prompt/Memory/Samplers/Toggles),
+   Memory Books manager, theme presets + *action*/"dialogue" color settings.
    Without a configured model, generation falls back to the offline echo so
    every path stays testable with no network. */
 
@@ -64,10 +66,44 @@ let edLore = [];
 
 export function triggerHaptic(ms = 10) {
   try {
+    if (localStorage.getItem("polyglot.haptic") === "off") return;
     if (navigator.vibrate) navigator.vibrate(ms);
   } catch {
     /* iOS Safari has no vibration API — silently ignore. */
   }
+}
+
+function timeAgo(ts) {
+  const s = Math.max(1, Math.floor((Date.now() - Number(ts || Date.now())) / 1000));
+  if (s < 60) return "just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} hour${h === 1 ? "" : "s"} ago`;
+  const d = Math.floor(h / 24);
+  if (d < 30) return `${d} day${d === 1 ? "" : "s"} ago`;
+  const mo = Math.floor(d / 30);
+  if (mo < 12) return `${mo} mo ago`;
+  return `${Math.floor(mo / 12)} yr ago`;
+}
+
+function getToggles() {
+  try {
+    const t = JSON.parse(localStorage.getItem("polyglot.toggles") || "null");
+    if (t && typeof t === "object") {
+      return {
+        stream: t.stream !== false,
+        thought: t.thought !== false,
+        haptic: t.haptic !== false
+      };
+    }
+  } catch { /* fall through to defaults */ }
+  return { stream: true, thought: true, haptic: true };
+}
+
+function saveToggles(tg) {
+  localStorage.setItem("polyglot.toggles", JSON.stringify(tg));
+  localStorage.setItem("polyglot.haptic", tg.haptic ? "on" : "off");
 }
 
 function escapeHtml(s) {
@@ -366,7 +402,7 @@ async function renderCurrentChat() {
     who.className = "who";
     who.textContent = chName;
     div.append(who);
-    if (active.reasoning_content) {
+    if (active.reasoning_content && getToggles().thought) {
       const det = document.createElement("details");
       det.className = "thought";
       const sum = document.createElement("summary");
@@ -553,6 +589,7 @@ async function refreshLibrary() {
     row.append(x);
     hl.append(row);
   }
+  refreshViews();
 }
 
 // ---------- Preset editor ----------
@@ -725,11 +762,12 @@ async function buildContext(pastRows, extraUserText = "") {
 // Streams preset.messages into a live shell. Resolves {content, reasoning}.
 async function runStream(preset, messages, shell, signal) {
   const t0 = Date.now();
+  const tg = getToggles();
   let acc = "";
   let accThink = "";
   const renderLive = () => {
-    shell.body.innerHTML = renderRich(acc);
-    if (accThink) {
+    if (tg.stream) shell.body.innerHTML = renderRich(acc);
+    if (accThink && tg.thought) {
       shell.det.style.display = "";
       shell.tb.textContent = accThink;
       const secs = ((Date.now() - t0) / 1000).toFixed(1);
@@ -745,8 +783,13 @@ async function runStream(preset, messages, shell, signal) {
     onContent: (t) => { acc += t; renderLive(); },
     onReasoning: (t) => { accThink += t; renderLive(); }
   });
+  shell.body.innerHTML = renderRich(content || acc);
+  if ((reasoning || accThink) && tg.thought) {
+    shell.det.style.display = "";
+    shell.tb.textContent = reasoning || accThink;
+  }
   shell.det.open = false;
-  renderLive();
+  scrollBottom();
   return { content: content || acc, reasoning: reasoning || accThink };
 }
 
@@ -1083,6 +1126,57 @@ async function handleImportChatFile(file) {
   refreshDiag();
 }
 
+async function handlePresetImportFile(file) {
+  try {
+    const data = JSON.parse(await file.text());
+    const rows = Array.isArray(data) ? data : [data];
+    let lastId = null;
+    for (const p of rows) {
+      if (!p || typeof p !== "object") continue;
+      const { id, ...rest } = p;
+      void id;
+      lastId = await savePreset({
+        name: String(rest.name || rest.connection?.label || "Imported preset"),
+        connection: { ...DEFAULT_CONNECTION, ...(rest.connection || {}) },
+        samplers: { ...DEFAULT_SAMPLERS, ...(rest.samplers || {}) },
+        prompts: { ...DEFAULT_PROMPTS, ...(rest.prompts || {}) }
+      });
+    }
+    if (lastId != null) {
+      ui.presetId = lastId;
+      persistUI();
+    }
+    await refreshPresets();
+    logInfo("E_UI_IMPORT", `preset imported (${rows.length})`);
+  } catch (e) {
+    logErr("E_UI_IMPORT", e.message);
+    window.alert(`Preset import failed: ${e.message}`);
+  }
+  refreshDiag();
+}
+
+async function handleBookImportFile(file) {
+  try {
+    const data = JSON.parse(await file.text());
+    const rows = Array.isArray(data) ? data : (data.entries ? [data] : (data.books || []));
+    if (!rows.length) throw new Error("E_UI_IMPORT: not a Polyglot lorebook file.");
+    for (const b of rows) {
+      const selVal = $("#books-char-filter")?.value;
+      await saveLorebook({
+        character_id: (selVal && selVal !== "all" ? Number(selVal) : null) ?? (b.character_id ?? null),
+        name: String(b.name || "Imported book"),
+        entries: Array.isArray(b.entries) ? b.entries : []
+      });
+    }
+    await renderBooksView();
+    logInfo("E_UI_IMPORT", `book imported (${rows.length})`);
+  } catch (e) {
+    logErr("E_UI_IMPORT", e.message);
+    window.alert(`Book import failed: ${e.message}`);
+  }
+  refreshDiag();
+}
+
 // ---------- Character editor + card import ----------
 function setCardStatus(msg) {
   $("#card-status").textContent = msg;
@@ -1329,6 +1423,455 @@ async function copyDiagReport() {
   refreshDiag();
 }
 
+// ---------- Phase 4: top-tab router + centered views ----------
+let view = localStorage.getItem("polyglot.view") || "home";
+let detailCharId = Number(localStorage.getItem("polyglot.detailChar")) || null;
+
+function showView(name) {
+  view = name;
+  localStorage.setItem("polyglot.view", name);
+  document.querySelectorAll("#tabs button").forEach((b) =>
+    b.classList.toggle("active", b.dataset.view === name || (name === "detail" && b.dataset.view === "chars")));
+  const inChat = name === "chat";
+  $("#chat").style.display = inChat ? "" : "none";
+  $("#composer").style.display = inChat ? "" : "none";
+  $("#views").style.display = inChat ? "none" : "";
+  for (const v of ["home", "chars", "detail", "presets", "books"]) {
+    const el = $(`#view-${v}`);
+    if (el) el.hidden = name !== v;
+  }
+  if (name === "home") refreshHome();
+  if (name === "chars") renderCharsView();
+  if (name === "detail") renderDetailView();
+  if (name === "presets") renderPresetCards();
+  if (name === "books") renderBooksView();
+  if (name === "chat") {
+    renderCurrentChat();
+    window.setTimeout(autogrow, 0);
+  }
+}
+
+async function openChat(chatId, characterId) {
+  ui.characterId = characterId;
+  ui.chatId = chatId;
+  persistUI();
+  await ensureSelection();
+  await refreshLibrary();
+  await renderCurrentChat();
+  showView("chat");
+  closeDrawers();
+}
+
+async function openDetail(charId) {
+  detailCharId = charId;
+  localStorage.setItem("polyglot.detailChar", String(charId));
+  ui.characterId = charId;
+  persistUI();
+  showView("detail");
+}
+
+function avatarImg(src, cls = "av") {
+  const img = document.createElement("img");
+  img.className = cls;
+  img.alt = "";
+  if (src) img.src = src;
+  else img.style.visibility = "hidden";
+  return img;
+}
+
+async function refreshHome() {
+  const grid = $("#recent-grid");
+  if (!grid) return;
+  grid.innerHTML = "";
+  const [chats, chars] = await Promise.all([listChats(), listCharacters()]);
+  const byChar = new Map(chars.map((c) => [c.id, c]));
+  const sorted = [...chats].sort((a, b) => b.updated_at - a.updated_at).slice(0, 8);
+  if (!sorted.length) {
+    grid.innerHTML = `<div class="card wide">No conversations yet. Create a character, then start chatting — everything stays on-device.</div>`;
+    return;
+  }
+  for (const h of sorted) {
+    const ch = byChar.get(h.character_id);
+    const card = document.createElement("div");
+    card.className = "card";
+    card.setAttribute("role", "button");
+    card.tabIndex = 0;
+    const row = document.createElement("div");
+    row.className = "crow";
+    row.append(avatarImg(ch?.avatar));
+    const tx = document.createElement("div");
+    tx.style.minWidth = "0";
+    const t = document.createElement("div");
+    t.className = "ctitle";
+    t.textContent = h.title || ch?.name || `Chat ${h.id}`;
+    const s = document.createElement("div");
+    s.className = "csub";
+    s.textContent = `${ch?.name || "Chat"} • ${timeAgo(h.updated_at)}`;
+    tx.append(t, s);
+    const go = document.createElement("span");
+    go.className = "go";
+    go.textContent = "→";
+    row.append(tx, go);
+    card.append(row);
+    const go2 = () => openChat(h.id, h.character_id);
+    card.addEventListener("click", go2);
+    card.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        go2();
+      }
+    });
+    grid.append(card);
+  }
+}
+
+async function renderCharsView() {
+  const q = ($("#chars-search")?.value || "").trim().toLowerCase();
+  const sort = $("#chars-sort")?.value || "modified";
+  const chars = await listCharacters();
+  let list = chars.filter((c) =>
+    !q || (c.name || "").toLowerCase().includes(q) ||
+    (c.description || "").toLowerCase().includes(q));
+  const byMod = (a, b) => (b.updated_at || b.created_at || 0) - (a.updated_at || a.created_at || 0);
+  if (sort === "name") list.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  else if (sort === "favorites") list.sort((a, b) => (b.favorite || 0) - (a.favorite || 0) || byMod(a, b));
+  else list.sort(byMod);
+  const favs = list.filter((c) => c.favorite);
+  const rest = list;
+  const paint = (box, rows, showFavState) => {
+    box.innerHTML = "";
+    if (!rows.length) {
+      box.innerHTML = `<div class="status">None.</div>`;
+      return;
+    }
+    for (const c of rows) {
+      const row = document.createElement("div");
+      row.className = "row" + (c.id === ui.characterId ? " active" : "");
+      row.append(avatarImg(c.avatar));
+      const nm = document.createElement("span");
+      nm.className = "nm";
+      nm.style.cursor = "pointer";
+      nm.textContent = c.name + (showFavState && c.favorite ? " ★" : "");
+      nm.title = c.description ? c.description.slice(0, 120) : "Open";
+      nm.addEventListener("click", () => openDetail(c.id));
+      row.append(nm);
+      const icons = document.createElement("span");
+      icons.className = "iconrow";
+      const fav = document.createElement("button");
+      fav.textContent = c.favorite ? "★" : "☆";
+      fav.title = "Toggle favorite";
+      fav.setAttribute("aria-label", "Toggle favorite");
+      fav.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        await saveCharacter({ ...c, favorite: c.favorite ? 0 : 1, id: c.id });
+        await refreshLibrary();
+        await renderCharsView();
+        await refreshHome();
+      });
+      const ed = document.createElement("button");
+      ed.textContent = "⋯";
+      ed.title = "Edit character";
+      ed.setAttribute("aria-label", "Edit character");
+      ed.addEventListener("click", (e) => {
+        e.stopPropagation();
+        openCharEditor(c.id);
+      });
+      icons.append(fav, ed);
+      row.append(icons);
+      box.append(row);
+    }
+  };
+  paint($("#chars-fav-list"), favs, false);
+  paint($("#chars-list"), rest, true);
+}
+
+async function renderDetailView() {
+  const chars = await listCharacters();
+  const c = chars.find((x) => x.id === detailCharId) || chars.find((x) => x.id === ui.characterId);
+  if (!c) {
+    $("#detail-name").textContent = "No character yet";
+    $("#detail-sub").textContent = "Create one to start.";
+    $("#detail-chat-list").innerHTML = "";
+    return;
+  }
+  detailCharId = c.id;
+  localStorage.setItem("polyglot.detailChar", String(c.id));
+  const av = $("#detail-avatar");
+  if (c.avatar) {
+    av.src = c.avatar;
+    av.style.visibility = "";
+  } else {
+    av.removeAttribute("src");
+    av.style.visibility = "hidden";
+  }
+  $("#detail-name").textContent = c.name;
+  $("#detail-sub").textContent = (c.description || "").slice(0, 140);
+  const chats = await listChats(c.id);
+  const box = $("#detail-chat-list");
+  box.innerHTML = "";
+  const sorted = [...chats].sort((a, b) => b.updated_at - a.updated_at);
+  if (!sorted.length) box.innerHTML = `<div class="status">No chats yet — start one above.</div>`;
+  for (const h of sorted) {
+    const row = document.createElement("div");
+    row.className = "row" + (h.id === ui.chatId ? " active" : "");
+    row.append(avatarImg(c.avatar));
+    const tx = document.createElement("span");
+    tx.className = "nm";
+    tx.style.cursor = "pointer";
+    const t = document.createElement("div");
+    t.textContent = h.title || `Chat ${h.id}`;
+    const s = document.createElement("div");
+    s.className = "csub";
+    s.textContent = timeAgo(h.updated_at);
+    tx.append(t, s);
+    tx.addEventListener("click", () => openChat(h.id, c.id));
+    const del = document.createElement("button");
+    del.className = "x";
+    del.textContent = "🗑";
+    del.setAttribute("aria-label", "Delete chat");
+    del.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (!window.confirm("Delete this chat and its messages?")) return;
+      await deleteChat(h.id);
+      if (ui.chatId === h.id) ui.chatId = null;
+      persistUI();
+      await ensureSelection();
+      await refreshLibrary();
+      await renderDetailView();
+      await refreshHome();
+    });
+    row.append(tx, del);
+    box.append(row);
+  }
+}
+
+async function renderPresetCards() {
+  const box = $("#preset-cards");
+  if (!box) return;
+  const f = ($("#preset-filter")?.value || "").trim().toLowerCase();
+  const presets = await listPresets();
+  box.innerHTML = "";
+  const rows = presets.filter((p) =>
+    !f || (p.name || "").toLowerCase().includes(f) ||
+    (p.connection?.model || "").toLowerCase().includes(f));
+  if (!rows.length) {
+    box.innerHTML = `<div class="status">No presets match.</div>`;
+    return;
+  }
+  for (const p of rows) {
+    const row = document.createElement("div");
+    row.className = "row" + (p.id === ui.presetId ? " active" : "");
+    const tx = document.createElement("span");
+    tx.className = "nm";
+    tx.style.cursor = "pointer";
+    const t = document.createElement("div");
+    t.textContent = p.name || "Preset";
+    const s = document.createElement("div");
+    s.className = "csub";
+    s.textContent = `${p.connection?.reasoning_strategy || "none"} | ${p.connection?.model || "no model"}`;
+    tx.append(t, s);
+    tx.addEventListener("click", async () => {
+      ui.presetId = p.id;
+      persistUI();
+      const fresh = await listPresets();
+      fillPresetForm(fresh.find((x) => x.id === p.id) || p);
+      await refreshPresets();
+      await renderPresetCards();
+      openDrawer("drawer-right");
+    });
+    const icons = document.createElement("span");
+    icons.className = "iconrow";
+    const exp = document.createElement("button");
+    exp.textContent = "⤓";
+    exp.title = "Export preset JSON";
+    exp.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const blob = new Blob([JSON.stringify(p, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `polyglot-preset-${(p.name || p.id).toString().replace(/[^\w-]+/g, "_")}.json`;
+      document.body.append(a);
+      a.click();
+      a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    });
+    const dup = document.createElement("button");
+    dup.textContent = "⧉";
+    dup.title = "Duplicate preset";
+    dup.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const { id, ...rest } = p;
+      void id;
+      const nid = await savePreset({ ...rest, name: `${p.name || "Preset"} copy` });
+      ui.presetId = nid;
+      persistUI();
+      await refreshPresets();
+      await renderPresetCards();
+    });
+    const del = document.createElement("button");
+    del.textContent = "🗑";
+    del.title = "Delete preset";
+    del.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (presets.length <= 1) {
+        window.alert("Keep at least one preset.");
+        return;
+      }
+      if (!window.confirm(`Delete preset "${p.name}"?`)) return;
+      await deletePreset(p.id);
+      if (ui.presetId === p.id) ui.presetId = null;
+      persistUI();
+      await ensureSelection();
+      await refreshPresets();
+      await renderPresetCards();
+    });
+    icons.append(exp, dup, del);
+    row.append(tx, icons);
+    box.append(row);
+  }
+}
+
+async function renderBooksView() {
+  const sel = $("#books-char-filter");
+  const box = $("#book-list");
+  if (!sel || !box) return;
+  const chars = await listCharacters();
+  const cur = sel.value || "all";
+  sel.innerHTML = "";
+  const all = document.createElement("option");
+  all.value = "all";
+  all.textContent = "All characters";
+  sel.append(all);
+  for (const c of chars) {
+    const o = document.createElement("option");
+    o.value = String(c.id);
+    o.textContent = c.name;
+    sel.append(o);
+  }
+  sel.value = [...sel.options].some((o) => o.value === cur) ? cur : "all";
+  const filter = sel.value;
+  const books = filter === "all"
+    ? await listLorebooks()
+    : await listLorebooks(Number(filter));
+  const byChar = new Map(chars.map((c) => [c.id, c.name]));
+  box.innerHTML = "";
+  if (!books.length) {
+    box.innerHTML = `<div class="status">No memory books yet. Character card imports auto-create them.</div>`;
+    return;
+  }
+  for (const b of books) {
+    const row = document.createElement("div");
+    row.className = "row";
+    const tx = document.createElement("span");
+    tx.className = "nm";
+    const t = document.createElement("div");
+    t.textContent = b.name || "Book";
+    const s = document.createElement("div");
+    s.className = "csub";
+    s.textContent = `${byChar.get(b.character_id) || "Shared"} • ${(b.entries || []).length} entries`;
+    tx.append(t, s);
+    const icons = document.createElement("span");
+    icons.className = "iconrow";
+    const exp = document.createElement("button");
+    exp.textContent = "⤓";
+    exp.title = "Export book JSON";
+    exp.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const blob = new Blob([JSON.stringify(b, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `polyglot-book-${(b.name || b.id).toString().replace(/[^\w-]+/g, "_")}.json`;
+      document.body.append(a);
+      a.click();
+      a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    });
+    const del = document.createElement("button");
+    del.textContent = "🗑";
+    del.title = "Delete book";
+    del.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (!window.confirm(`Delete book "${b.name || b.id}"?`)) return;
+      await deleteLorebook(b.id);
+      await renderBooksView();
+    });
+    icons.append(exp, del);
+    row.append(tx, icons);
+    box.append(row);
+  }
+}
+
+function refreshViews() {
+  if (view === "home") refreshHome();
+  else if (view === "chars") renderCharsView();
+  else if (view === "detail") renderDetailView();
+  else if (view === "presets") renderPresetCards();
+  else if (view === "books") renderBooksView();
+}
+
+// ---------- Phase 4: theme presets + *action*/"dialogue" colors ----------
+function currentThemeVars() {
+  try {
+    return JSON.parse(localStorage.getItem("polyglot.themeVars") || "null") || null;
+  } catch {
+    return null;
+  }
+}
+
+function applyTheme(name, vars = null) {
+  const base = THEMES[name] || (name === "custom" ? THEMES.polyglot : THEMES.polyglot);
+  const v = vars || base;
+  const root = document.documentElement;
+  root.style.setProperty("--bg", v.bg);
+  root.style.setProperty("--bg2", v.bg2);
+  root.style.setProperty("--panel", v.panel);
+  root.style.setProperty("--ink", v.ink);
+  root.style.setProperty("--muted", v.muted);
+  root.style.setProperty("--line", v.line);
+  root.style.setProperty("--accent", v.accent);
+  root.style.setProperty("--action", v.action);
+  root.style.setProperty("--dialogue", v.dialogue);
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute("content", v.bg);
+  localStorage.setItem("polyglot.theme", name);
+  localStorage.setItem("polyglot.themeVars", JSON.stringify(v));
+  const sel = $("#theme-preset");
+  if (sel && sel.value !== name) sel.value = name;
+  const map = {
+    "#th-bg": v.bg, "#th-panel": v.panel, "#th-ink": v.ink,
+    "#th-accent": v.accent, "#th-action": v.action, "#th-dialogue": v.dialogue
+  };
+  for (const [id, val] of Object.entries(map)) {
+    const el = $(id);
+    if (el && /^#[0-9a-fA-F]{6}$/.test(val || "")) el.value = val;
+  }
+}
+
+function initTheme() {
+  const name = localStorage.getItem("polyglot.theme") || "polyglot";
+  const vars = currentThemeVars();
+  if (name === "custom" && vars) applyTheme("custom", vars);
+  else applyTheme(THEMES[name] ? name : "polyglot", vars);
+}
+
+function readThemeInputs() {
+  const pick = (id, fb) => {
+    const el = $(id);
+    return el && /^#[0-9a-fA-F]{6}$/.test(el.value) ? el.value : fb;
+  };
+  const cur = currentThemeVars() || THEMES.polyglot;
+  return {
+    ...cur,
+    bg: pick("#th-bg", cur.bg),
+    panel: pick("#th-panel", cur.panel),
+    ink: pick("#th-ink", cur.ink),
+    accent: pick("#th-accent", cur.accent),
+    action: pick("#th-action", cur.action),
+    dialogue: pick("#th-dialogue", cur.dialogue),
+    bg2: cur.bg2, muted: cur.muted, line: cur.line
+  };
+}
+
 async function init() {
   $("#ver").textContent = APP_VERSION;
   window.__polyglot_version = APP_VERSION;
@@ -1466,6 +2009,7 @@ async function init() {
     ui.presetId = id;
     persistUI();
     await refreshPresets();
+    await renderPresetCards();
   });
   $("#btn-save-preset").addEventListener("click", async () => {
     try {
@@ -1478,6 +2022,7 @@ async function init() {
         persistUI();
       }
       await refreshPresets();
+      await renderPresetCards();
       setPresetStatus("Saved.");
     } catch (e) {
       logErr("E_UI_SEND", e.message);
@@ -1499,8 +2044,118 @@ async function init() {
     persistUI();
     await ensureSelection();
     await refreshPresets();
+    await renderPresetCards();
     setPresetStatus("Deleted.");
   });
+
+  // ---------- Phase 4 wiring: tabs, views, ptabs, toggles, theme ----------
+  initTheme();
+  const tg0 = getToggles();
+  if ($("#tg-stream")) $("#tg-stream").checked = tg0.stream;
+  if ($("#tg-thought")) $("#tg-thought").checked = tg0.thought;
+  if ($("#tg-haptic")) $("#tg-haptic").checked = tg0.haptic;
+  localStorage.setItem("polyglot.haptic", tg0.haptic ? "on" : "off");
+
+  document.querySelectorAll("#tabs button").forEach((b) =>
+    b.addEventListener("click", () => {
+      triggerHaptic(10);
+      showView(b.dataset.view);
+    })
+  );
+  document.querySelectorAll("[data-ptab]").forEach((b) =>
+    b.addEventListener("click", () => {
+      document.querySelectorAll("[data-ptab]").forEach((x) =>
+        x.classList.toggle("active", x === b));
+      document.querySelectorAll("[data-ppane]").forEach((p) => {
+        p.hidden = p.dataset.ppane !== b.dataset.ptab;
+      });
+    })
+  );
+
+  const newChatFor = async (charId) => {
+    ui.characterId = charId;
+    persistUI();
+    await ensureSelection();
+    const id = await saveChat({
+      character_id: charId,
+      persona_id: ui.personaId,
+      title: `Chat ${new Date().toLocaleString()}`
+    });
+    ui.chatId = id;
+    persistUI();
+    await refreshLibrary();
+    await renderCurrentChat();
+    showView("chat");
+  };
+
+  $("#btn-chars-new")?.addEventListener("click", () => openCharEditor(null));
+  $("#btn-guide-char")?.addEventListener("click", () => openCharEditor(null));
+  $("#btn-guide-preset")?.addEventListener("click", () => showView("presets"));
+  $("#btn-guide-book")?.addEventListener("click", () => showView("books"));
+  $("#btn-preset-new")?.addEventListener("click", async () => {
+    const name = window.prompt("Preset name:", "Preset 2");
+    if (!name) return;
+    const id = await savePreset({
+      name: name.trim(),
+      connection: { ...DEFAULT_CONNECTION, label: name.trim() },
+      samplers: { ...DEFAULT_SAMPLERS },
+      prompts: { ...DEFAULT_PROMPTS }
+    });
+    ui.presetId = id;
+    persistUI();
+    await refreshPresets();
+    await renderPresetCards();
+  });
+  $("#chars-search")?.addEventListener("input", () => renderCharsView());
+  $("#chars-sort")?.addEventListener("change", () => renderCharsView());
+  $("#preset-filter")?.addEventListener("input", () => renderPresetCards());
+  $("#books-char-filter")?.addEventListener("change", () => renderBooksView());
+  $("#file-preset-import")?.addEventListener("change", async (e) => {
+    const f = e.target.files?.[0];
+    e.target.value = "";
+    if (f) await handlePresetImportFile(f);
+  });
+  $("#btn-book-new")?.addEventListener("click", async () => {
+    const name = window.prompt("Book name:", "My lorebook");
+    if (!name) return;
+    const sel = $("#books-char-filter")?.value;
+    await saveLorebook({
+      character_id: sel && sel !== "all" ? Number(sel) : null,
+      name: name.trim(),
+      entries: []
+    });
+    await renderBooksView();
+  });
+  $("#file-book-import")?.addEventListener("change", async (e) => {
+    const f = e.target.files?.[0];
+    e.target.value = "";
+    if (f) await handleBookImportFile(f);
+  });
+  $("#detail-back")?.addEventListener("click", () => showView("chars"));
+  $("#btn-detail-new-chat")?.addEventListener("click", async () => {
+    if (detailCharId != null) await newChatFor(detailCharId);
+  });
+  $("#btn-detail-edit")?.addEventListener("click", () => {
+    if (detailCharId != null) openCharEditor(detailCharId);
+  });
+  for (const [id, key] of [["#tg-stream", "stream"], ["#tg-thought", "thought"], ["#tg-haptic", "haptic"]]) {
+    $(id)?.addEventListener("change", async (e) => {
+      const tg = { ...getToggles(), [key]: e.target.checked };
+      saveToggles(tg);
+      if (key === "thought") await renderCurrentChat();
+    });
+  }
+  $("#theme-preset")?.addEventListener("change", (e) => {
+    const name = e.target.value;
+    if (name === "custom") {
+      applyTheme("custom", readThemeInputs());
+      return;
+    }
+    applyTheme(name);
+  });
+  for (const id of ["#th-bg", "#th-panel", "#th-ink", "#th-accent", "#th-action", "#th-dialogue"]) {
+    $(id)?.addEventListener("input", () => applyTheme("custom", readThemeInputs()));
+  }
 
   $("#btn-diag-copy").addEventListener("click", copyDiagReport);
   $("#btn-diag-export").addEventListener("click", () => {
@@ -1529,6 +2184,7 @@ async function init() {
   autogrow();
   trackKeyboard();
   registerSW();
+  showView(["home", "chars", "chat", "presets", "books", "detail"].includes(view) ? view : "home");
 }
 
 init();

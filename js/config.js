@@ -1,8 +1,8 @@
 // Polyglot — single source of truth for version + defaults.
 // Phase 2/3 modules import from here so a preset change is one edit.
 
-export const APP_VERSION = "v1.2.0";
-export const CACHE_NAME = "polyglot-v1.2.0";
+export const APP_VERSION = "v1.3.0";
+export const CACHE_NAME = "polyglot-v1.3.0";
 export const DB_NAME = "PolyglotDB";
 export const DB_VERSION = 1;
 
@@ -37,4 +37,33 @@ export const DEFAULT_PROMPTS = {
   authors_note_depth: 2,
   prefill_enabled: false,
   prefill_text: "*"
+};
+
+// Phase 4: theme presets. Applied as CSS vars on :root via app.js applyTheme().
+// action = *asterisk* thought/action color, dialogue = "quoted" speech color.
+export const THEMES = {
+  polyglot: {
+    label: "Polyglot Dark",
+    bg: "#0f1420", bg2: "#151c2e", panel: "#1a2338",
+    ink: "#e8ecf4", muted: "#9aa6c2", line: "#2a3654",
+    accent: "#7c9bff", action: "#9aa6c2", dialogue: "#ffa14d"
+  },
+  agnai: {
+    label: "Agnai Brown",
+    bg: "#241a18", bg2: "#342622", panel: "#43302b",
+    ink: "#f5ece6", muted: "#c9a89c", line: "#5a4038",
+    accent: "#e8a25e", action: "#a89a93", dialogue: "#ff9c41"
+  },
+  amoled: {
+    label: "AMOLED",
+    bg: "#000000", bg2: "#0a0a0c", panel: "#141418",
+    ink: "#f2f2f5", muted: "#9a9aa5", line: "#26262e",
+    accent: "#8ab4ff", action: "#9a9aa5", dialogue: "#ffb020"
+  },
+  light: {
+    label: "Paper Light",
+    bg: "#f5f2ec", bg2: "#ffffff", panel: "#ffffff",
+    ink: "#1c1a17", muted: "#6b6259", line: "#ddd5c8",
+    accent: "#3b5bff", action: "#6b6259", dialogue: "#c25e00"
+  }
 };

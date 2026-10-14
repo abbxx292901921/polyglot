@@ -14,13 +14,21 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
 - PWA: `manifest.json` + `sw.js` (versioned cache, network-first navigations).
 
 ## File map
-- `index.html` — shell, viewport meta, drawers, composer. IDs consumed by app.js:
+- `index.html` — shell, viewport meta, top-tab `#tabs` + `#views`
+  (`view-home/recent-grid, view-chars/chars-search/chars-sort/chars-fav-list/
+  chars-list, view-detail/detail-avatar/detail-name/detail-chat-list,
+  view-presets/preset-filter/preset-cards, view-books/books-char-filter/
+  book-list`), drawers, composer. Drawer IDs consumed by app.js:
   `ver, update-banner, reload-btn, chat, empty, input, send, stop, btn-left,
   btn-right, drawer-left, drawer-right, backdrop, persona-list, char-list,
   chat-list, btn-new-persona, btn-new-char, btn-new-chat, btn-export, chk-keys,
-  file-import, vault-status`.
-- `style.css` — CSS vars, 100dvh layout, safe-area, drawers, bubbles
-  (`.action` muted italic, `.dialogue` bright), Phase 1 `.row/.list/.sec` UI.
+  file-import, vault-status, preset-list + editor tabs [data-ptab/ppane]
+  (conn-*, sam-*, pr-*, tg-stream/tg-thought/tg-haptic), theme-preset,
+  th-bg/panel/ink/accent/action/dialogue`.
+- `style.css` — CSS vars (`--action` = `*asterisk*` color, `--dialogue` =
+  `"quote"` color), 100dvh layout, safe-area, drawers, bubbles
+  (`.action` muted italic, `.dialogue` bright), Phase 1 `.row/.list/.sec` UI,
+  Phase 4 `#tabs/.wrap/.cards-grid/.card/.toolbar/.detail-head/.ptabs/.iconrow`.
 - `manifest.json` — name Polyglot, relative `./` start_url/scope (Pages subpath!).
 - `sw.js` — `CACHE` const + `ASSETS` list. Never cache API (cross-origin or
   `/chat|completions|messages|v1/`). Navigations network-first.
@@ -77,3 +85,8 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
 - Phase 2 DONE: prompt-engine + sse-streamer + api-client (OpenAI-Compatible).
 - Phase 3 DONE: png-parser (tEXt/zTXt/iTXt + webp→jpeg fallback) + swipes/retry/
   continue/impersonate/edit + character edit UI.
+- Phase 4 DONE: top-tab router (Home/Characters/Chat/Presets/Books) + Recent grid
+  + Characters search/sort/favorites + character-detail subordinate chats +
+  preset cards + editor tabs + Memory Books manager + THEMES
+  (polyglot/agnai/amoled/light) + *action*/"dialogue" color settings + stream/
+  thought/haptic toggles. Default tab Home; detail highlights Characters tab.
