@@ -42,7 +42,7 @@ import {
    top-tab router (Home/Characters/Chat/Presets/Books), Recent Conversations
    grid, Characters search/sort/favorites, character-detail with subordinate
    chats, preset cards + editor tabs (General/Prompt/Memory/Samplers/Toggles),
-   Memory Books manager, theme presets + *action*/"dialogue" color settings.
+   Memory Books manager, theme presets + *action* and "dialogue" colors.
    Without a configured model, generation falls back to the offline echo so
    every path stays testable with no network. */
 
@@ -2087,7 +2087,7 @@ function refreshViews() {
   else if (view === "regex") renderRegexView();
 }
 
-// ---------- Phase 4: theme presets + *action*/"dialogue" colors ----------
+// ---------- Phase 4: theme presets + *action* and "dialogue" colors ----------
 function currentThemeVars() {
   try {
     return JSON.parse(localStorage.getItem("polyglot.themeVars") || "null") || null;
@@ -2150,9 +2150,26 @@ function readThemeInputs() {
   };
 }
 
+// Boot errors must never brick the shell: report them to the diagnostics log
+// instead of aborting init before the UI is wired. (A module-level SyntaxError
+// once bricked v1.3.0 completely — see header comment rule: no "*/" inside
+// block comments. This reporter is the second line of defense.)
+function surfaceBootErrors() {
+  const show = (msg) => {
+    try {
+      logErr("E_UI_SEND", `boot: ${msg}`);
+      refreshDiag();
+    } catch { /* the reporter itself must never throw */ }
+  };
+  window.addEventListener("error", (e) => show((e && e.message) || "unknown error"));
+  window.addEventListener("unhandledrejection", (e) =>
+    show((e && e.reason && e.reason.message) || String((e && e.reason) || "unknown rejection")));
+}
+
 async function init() {
   $("#ver").textContent = APP_VERSION;
   window.__polyglot_version = APP_VERSION;
+  surfaceBootErrors();
   try {
     await openDB();
   } catch (e) {
@@ -2161,6 +2178,8 @@ async function init() {
     logErr("E_DB_OPEN", e.message);
     return;
   }
+  let bootError = null;
+  try {
   await seedIfEmpty({
     preset: {
       name: "Default",
@@ -2175,6 +2194,12 @@ async function init() {
   await renderCurrentChat();
   refreshDiag();
   logInfo("E_UI_SEND", `ready ${APP_VERSION}`);
+  } catch (e) {
+    // Data load failed, but the shell must stay usable: fall through to the
+    // wiring below so every button works, then surface the failure visibly.
+    bootError = e;
+    logErr("E_UI_SEND", `boot: ${e && e.message ? e.message : e}`);
+  }
 
   $("#btn-left").addEventListener("click", () => openDrawer("drawer-left"));
   $("#btn-right").addEventListener("click", () => openDrawer("drawer-right"));
@@ -2490,6 +2515,12 @@ async function init() {
   registerSW();
   await getRegexRules();
   showView(["home", "chars", "chat", "presets", "books", "detail", "regex"].includes(view) ? view : "home");
+  if (bootError) {
+    const msg = bootError && bootError.message ? bootError.message : String(bootError);
+    const ch = document.getElementById("chat");
+    if (ch) ch.innerHTML = `<div class="empty">Boot incomplete — ${escapeHtml(msg)}<small>Buttons still work. Check settings → Diagnostics, or reload.</small></div>`;
+    refreshDiag();
+  }
 }
 
 init();

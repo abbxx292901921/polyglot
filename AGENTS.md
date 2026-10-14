@@ -75,11 +75,19 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
    offset. `navigator.vibrate` is Android-only — always try/catch.
 8. Keep it light: no new dependencies without explicit user approval. Prefer
    ~50 lines of vanilla over a library.
-9. Verify: `node --check` every touched JS file. Serve with
+9. Verify: module-goal parse of every touched JS file — bare
+   `node --check file.js` in a dir WITHOUT `"type":"module"` does NOT reliably
+   parse ES modules (v1.3.0 shipped a fatal `*/`-inside-block-comment SyntaxError
+   that bare --check passed; every button dead, static shell). Stage copies with
+   a `{"type":"module"}` package.json and `--check` them, or execute the real
+   `init()` in node with DOM/IDB stubs. Serve with
    `python3 -m http.server 8000`, reload + send + reload to prove persistence.
+10. Never put the two-character sequence `*/` inside a `/* */` block comment
+    (e.g. writing `*action*/"dialogue"` in prose) — it ends the comment early
+    and the rest parses as code, bricking the whole module. Reword or use `//`.
 
 ## Test checklist (run before calling a phase done)
-- `node --check js/*.js sw.js` clean.
+- Module-goal parse of `sw.js` + every `js/*.js` clean (see rule 9/10).
 - Fresh load → send → reload → message persists; new chat/persona/character CRUD works.
 - Export vault with keys OFF → JSON has `"api_key": ""`. Import replaces data.
 - Airplane mode (after first load): shell + history open, send works locally.
@@ -101,4 +109,11 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   (history untouched), display rewrite pre-renderRich (XSS order kept), Regex
   tab with add/edit/test-drive/import/export, `E_REGEX_RULE` diagnostics.
   Existing data survives: v1→v2 upgrade only adds the store; SW swap never
-  touches IndexedDB/localStorage.
+   touches IndexedDB/localStorage.
+- v1.4.1 HOTFIX: v1.3.0/1.4.0 never ran — header `/* */` comment in `app.js`
+  contained a literal `*/` (`*action*/`), a module-killing SyntaxError bare
+  `node --check` passed. Static shell, all buttons dead. Fixed the comment,
+  wrapped init data-load in try/catch (wiring always runs, failure surfaces in
+  #chat + diag log), global error/unhandledrejection reporter, `onblocked`
+  rejection in `openDB`. Verified by executing `init()` in node with DOM/IDB
+  stubs (INIT_OK, 0 rejections).

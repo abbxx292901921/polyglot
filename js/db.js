@@ -57,6 +57,9 @@ export function openDB() {
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
+    // Without this, a version upgrade blocked by another open tab stalls
+    // every await forever and the app looks dead with no error. Reject loudly.
+    req.onblocked = () => reject(new Error("E_DB_OPEN: database blocked — close other Polyglot tabs, then reload."));
   });
   return dbp;
 }
