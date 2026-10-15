@@ -1,9 +1,10 @@
 import { DB_NAME, DB_VERSION } from "./config.js";
 
 /* Polyglot storage — vanilla IndexedDB, zero dependencies.
-   7 stores mirroring the SillyTavern-lite model:
+   8 stores mirroring the SillyTavern-lite model:
    characters, personas, chats, messages (compound chat_time index),
-   lorebooks, presets, regex_rules (Phase 5 find/replace scripts).
+   lorebooks, presets (model presets), providers (connections),
+   regex_rules (Phase 5 find/replace scripts).
    All data stays on-device. */
 
 let dbp = null;
@@ -48,6 +49,10 @@ export function openDB() {
       }
       if (!db.objectStoreNames.contains("presets")) {
         const s = db.createObjectStore("presets", { keyPath: "id", autoIncrement: true });
+        s.createIndex("name", "name", { unique: false });
+      }
+      if (!db.objectStoreNames.contains("providers")) {
+        const s = db.createObjectStore("providers", { keyPath: "id", autoIncrement: true });
         s.createIndex("name", "name", { unique: false });
       }
       if (!db.objectStoreNames.contains("regex_rules")) {
@@ -237,7 +242,7 @@ export function saveLorebook(b) {
 
 export const deleteLorebook = (id) => delRec("lorebooks", id);
 
-// ---------- Presets ----------
+// ---------- Presets (model presets: model + reasoning + samplers + prompts) ----------
 export const listPresets = () => getAll("presets");
 
 export function savePreset(p) {
@@ -245,6 +250,16 @@ export function savePreset(p) {
 }
 
 export const deletePreset = (id) => delRec("presets", id);
+
+// ---------- Providers (connections: base_url + key + proxy, no sampling) ----------
+// Shape: {name, base_url, api_key, use_proxy:0|1|bool, proxy_url, updated_at}.
+export const listProviders = () => getAll("providers");
+
+export function saveProvider(p) {
+  return putRec("providers", { updated_at: Date.now(), ...p });
+}
+
+export const deleteProvider = (id) => delRec("providers", id);
 
 // ---------- Regex scripts (Phase 5) ----------
 // Rule shape: {name, pattern, replacement, flags, place:"prompt"|"display"|"both",
@@ -279,24 +294,29 @@ export const deleteRegexRule = (id) => delRec("regex_rules", id);
 
 // ---------- Vault backup ----------
 export async function exportVaultToJSON({ includeKeys = false } = {}) {
-  const [characters, personas, chats, messages, lorebooks, presets, regex_rules] = await Promise.all([
+  const [characters, personas, chats, messages, lorebooks, presets, providers, regex_rules] = await Promise.all([
     getAll("characters"),
     getAll("personas"),
     getAll("chats"),
     getAll("messages"),
     getAll("lorebooks"),
     getAll("presets"),
+    getAll("providers").catch(() => []),
     getAll("regex_rules").catch(() => [])
   ]);
   const safePresets = presets.map((p) => {
     if (includeKeys || !p.connection) return p;
     return { ...p, connection: { ...p.connection, api_key: "" } };
   });
+  const safeProviders = providers.map((p) => {
+    if (includeKeys) return p;
+    return { ...p, api_key: "" };
+  });
   return {
     app: "Polyglot",
-    version: 1,
+    version: 2,
     exported_at: new Date().toISOString(),
-    tables: { characters, personas, chats, messages, lorebooks, presets: safePresets, regex_rules }
+    tables: { characters, personas, chats, messages, lorebooks, presets: safePresets, providers: safeProviders, regex_rules }
   };
 }
 
@@ -304,8 +324,8 @@ export async function importVaultFromJSON(data, { merge = false } = {}) {
   if (!data || typeof data !== "object" || !data.tables) {
     throw new Error("E_VAULT_SHAPE: not a Polyglot vault file (missing tables).");
   }
-  // regex_rules is optional so pre-v1.4 vaults still import cleanly.
-  const names = ["characters", "personas", "chats", "messages", "lorebooks", "presets", "regex_rules"];
+  // regex_rules + providers are optional so pre-v1.5 vaults still import cleanly.
+  const names = ["characters", "personas", "chats", "messages", "lorebooks", "presets", "providers", "regex_rules"];
   for (const n of names) {
     if (data.tables[n] !== undefined && !Array.isArray(data.tables[n])) {
       throw new Error(`E_VAULT_TABLE: vault table "${n}" is corrupt (expected array).`);
@@ -322,13 +342,17 @@ export async function importVaultFromJSON(data, { merge = false } = {}) {
 }
 
 export async function seedIfEmpty(defaults) {
-  const [personas, presets, characters] = await Promise.all([
+  const [personas, presets, providers, characters] = await Promise.all([
     getAll("personas"),
     getAll("presets"),
+    getAll("providers").catch(() => []),
     getAll("characters")
   ]);
   if (!personas.length) {
     await savePersona({ name: "You", description: "", is_default: 1 });
+  }
+  if (!providers.length && defaults?.provider) {
+    await saveProvider(defaults.provider);
   }
   if (!presets.length && defaults?.preset) {
     await savePreset(defaults.preset);

@@ -20,7 +20,7 @@
     <header class="topbar">
       <button id="btn-left" class="iconbtn" aria-label="Open library">&#9776;</button>
       <h1>Polyglot</h1>
-      <span id="ver" class="ver">v1.4.1</span>
+      <span id="ver" class="ver">v1.5.0</span>
       <div class="spacer"></div>
       <button id="btn-right" class="iconbtn" aria-label="Open settings">&#9881;</button>
     </header>
@@ -93,6 +93,13 @@
       <div id="view-presets" class="view" hidden>
         <div class="wrap">
           <h2>Presets</h2>
+          <p id="preset-combo" class="status" role="status"></p>
+          <h3>Providers (connections)</h3>
+          <div class="toolbar">
+            <button id="btn-provider-new" class="btn" type="button">+ New provider</button>
+          </div>
+          <div id="provider-cards" class="list"></div>
+          <h3>Model presets (mix &amp; match)</h3>
           <div class="toolbar">
             <input id="preset-filter" type="search" placeholder="Filter…" autocomplete="off" />
             <button id="btn-preset-new" class="btn" type="button">+ New</button>
@@ -100,7 +107,7 @@
             <input id="file-preset-import" type="file" accept="application/json,.json" hidden />
           </div>
           <div id="preset-cards" class="list"></div>
-          <p class="status">Tap a preset to select it and open its editor (⚙ drawer). Providers = the Connection section inside the editor.</p>
+          <p class="status">Pick one provider + one model preset — chats use the combination. Tap a card to select it and open its editor (⚙ drawer).</p>
         </div>
       </div>
       <div id="view-books" class="view" hidden>
@@ -224,7 +231,33 @@
     <header><h2>Presets &amp; API</h2><button class="iconbtn" data-close="drawer-right" aria-label="Close">&times;</button></header>
     <div class="body">
       <section class="sec">
-        <h3>Preset <button id="btn-new-preset" class="mini" type="button">+ New</button></h3>
+        <h3>Active combo</h3>
+        <div id="active-combo" class="status" role="status"></div>
+      </section>
+      <section class="sec">
+        <h3>Provider (connection) <button id="btn-new-provider" class="mini" type="button">+ New</button></h3>
+        <div id="provider-list" class="list"></div>
+        <label class="field">Name<input id="prov-name" type="text" autocomplete="off" placeholder="Nvidia NIM" /></label>
+        <label class="field">Base URL<input id="prov-url" type="url" inputmode="url" autocomplete="off" placeholder="https://integrate.api.nvidia.com/v1" /></label>
+        <label class="field">API key<input id="prov-key" type="password" autocomplete="off" placeholder="nvapi-…" /></label>
+        <label class="checkline"><input type="checkbox" id="prov-proxy-use" /> Use reverse proxy</label>
+        <label class="field">Proxy URL<input id="prov-proxy-url" type="url" inputmode="url" autocomplete="off" placeholder="https://proxy.example.com" /></label>
+        <label class="field">Available models
+          <select id="prov-models" aria-label="Available models"></select>
+        </label>
+        <div class="vaultbtns">
+          <button id="btn-fetch-models" class="btn secondary" type="button">Fetch models</button>
+          <button id="btn-use-model" class="btn secondary" type="button">Use in preset</button>
+          <button id="btn-test-conn" class="btn secondary" type="button">Test</button>
+        </div>
+        <div class="vaultbtns">
+          <button id="btn-save-provider" class="btn" type="button">Save provider</button>
+          <button id="btn-del-provider" class="btn secondary" type="button">Delete</button>
+        </div>
+        <div id="provider-status" class="status" role="status"></div>
+      </section>
+      <section class="sec">
+        <h3>Model preset <button id="btn-new-preset" class="mini" type="button">+ New</button></h3>
         <div id="preset-list" class="list"></div>
       </section>
       <div class="ptabs" role="tablist" aria-label="Preset editor tabs">
@@ -235,11 +268,10 @@
         <button data-ptab="toggles" type="button">Toggles</button>
       </div>
       <section class="sec" data-ppane="general">
-        <h3>Connection (Provider)</h3>
-        <label class="field">Label<input id="conn-label" type="text" autocomplete="off" /></label>
-        <label class="field">Base URL<input id="conn-url" type="url" inputmode="url" autocomplete="off" placeholder="https://api.openai.com" /></label>
-        <label class="field">API key<input id="conn-key" type="password" autocomplete="off" placeholder="sk-…" /></label>
-        <label class="field">Model<input id="conn-model" type="text" autocomplete="off" placeholder="model-id" /></label>
+        <h3>Model preset</h3>
+        <label class="field">Preset name<input id="conn-label" type="text" autocomplete="off" /></label>
+        <label class="field">Model<input id="conn-model" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="model-id — Fetch models from the provider above" list="model-choices" /></label>
+        <datalist id="model-choices"></datalist>
         <label class="field">Reasoning strategy
           <select id="conn-strategy">
             <option value="none">none — strip reasoning keys</option>
@@ -256,8 +288,6 @@
           </select>
         </label>
         <label class="field">Thinking budget (anthropic, min 1024)<input id="conn-budget" type="number" min="1024" step="256" /></label>
-        <label class="checkline"><input type="checkbox" id="conn-proxy-use" /> Use reverse proxy</label>
-        <label class="field">Proxy URL<input id="conn-proxy-url" type="url" inputmode="url" autocomplete="off" placeholder="https://proxy.example.com" /></label>
         <div class="grid2">
           <label class="field">Max tokens<input id="sam-max" type="number" step="1" /></label>
           <label class="field">Context limit<input id="sam-ctx" type="number" step="512" /></label>
@@ -362,6 +392,29 @@
           <button id="btn-ch-save" class="btn" type="button">Save character</button>
         </div>
         <div id="char-status" class="status" role="status"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="book-modal" class="modal" hidden>
+    <div class="sheet" role="dialog" aria-label="Memory book editor">
+      <header><h2 id="bk-title">Memory book</h2><button class="iconbtn" id="btn-bk-close" aria-label="Close">&times;</button></header>
+      <div class="mbody">
+        <label class="field">Book name<input id="bk-name" type="text" autocomplete="off" /></label>
+        <label class="field">Linked character<select id="bk-char"></select></label>
+        <h3>Entries</h3>
+        <div id="bk-entry-list" class="list"></div>
+        <div class="grid2">
+          <label class="field">Keys (comma separated)<input id="bk-keys" type="text" autocomplete="off" /></label>
+          <label class="field">Content<textarea id="bk-content" rows="2"></textarea></label>
+        </div>
+        <div class="vaultbtns">
+          <button id="btn-bk-entry-add" class="btn secondary" type="button">Add entry</button>
+        </div>
+        <div class="vaultbtns">
+          <button id="btn-bk-save" class="btn" type="button">Save book</button>
+        </div>
+        <div id="book-status" class="status" role="status"></div>
       </div>
     </div>
   </div>

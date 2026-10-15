@@ -1,4 +1,4 @@
-import { APP_VERSION, DEFAULT_CONNECTION, DEFAULT_SAMPLERS, DEFAULT_PROMPTS, THEMES } from "./config.js";
+import { APP_VERSION, DEFAULT_CONNECTION, DEFAULT_PROVIDER, DEFAULT_SAMPLERS, DEFAULT_PROMPTS, THEMES } from "./config.js";
 import { applyRules, compileRule, cleanFlags } from "./regex-engine.js";
 import {
   openDB,
@@ -22,6 +22,9 @@ import {
   listPresets,
   savePreset,
   deletePreset,
+  listProviders,
+  saveProvider,
+  deleteProvider,
   listAllRegexRules,
   saveRegexRule,
   deleteRegexRule,
@@ -30,7 +33,7 @@ import {
   seedIfEmpty
 } from "./db.js";
 import { buildMessages, estimateTokens } from "./prompt-engine.js";
-import { sendChat } from "./api-client.js";
+import { sendChat, fetchModels } from "./api-client.js";
 import { parsePNGCard, parseCharacterJSON, normalizeCharacter, fileToAvatarDataURL } from "./png-parser.js";
 import {
   err as logErr, warn as logWarn, info as logInfo,
@@ -51,10 +54,11 @@ const ui = {
   characterId: Number(localStorage.getItem("polyglot.characterId")) || null,
   chatId: Number(localStorage.getItem("polyglot.chatId")) || null,
   personaId: Number(localStorage.getItem("polyglot.personaId")) || null,
-  presetId: Number(localStorage.getItem("polyglot.presetId")) || null
+  presetId: Number(localStorage.getItem("polyglot.presetId")) || null,
+  providerId: Number(localStorage.getItem("polyglot.providerId")) || null
 };
 function persistUI() {
-  for (const k of ["characterId", "chatId", "personaId", "presetId"]) {
+  for (const k of ["characterId", "chatId", "personaId", "presetId", "providerId"]) {
     if (ui[k] == null) localStorage.removeItem(`polyglot.${k}`);
     else localStorage.setItem(`polyglot.${k}`, String(ui[k]));
   }
@@ -221,10 +225,11 @@ function clearChatView(emptyText = "No messages yet. Say hello.") {
 }
 
 async function ensureSelection() {
-  const [chars, personas, presets, chats] = await Promise.all([
+  const [chars, personas, presets, providers, chats] = await Promise.all([
     listCharacters(),
     listPersonas(),
     listPresets(),
+    listProviders().catch(() => []),
     ui.characterId != null ? listChats(ui.characterId) : listChats()
   ]);
   if (personas.length && !personas.some((p) => p.id === ui.personaId)) {
@@ -235,6 +240,9 @@ async function ensureSelection() {
   }
   if (presets.length && !presets.some((p) => p.id === ui.presetId)) {
     ui.presetId = presets[0].id;
+  }
+  if (providers.length && !providers.some((p) => p.id === ui.providerId)) {
+    ui.providerId = providers[0].id;
   }
   if (ui.characterId != null) {
     const mine = chats.filter((c) => c.character_id === ui.characterId);
@@ -279,6 +287,80 @@ async function ensureChat() {
 async function getActivePreset() {
   const presets = await listPresets();
   return presets.find((p) => p.id === ui.presetId) || presets[0] || null;
+}
+
+async function getActiveProvider() {
+  try {
+    const providers = await listProviders();
+    return providers.find((p) => p.id === ui.providerId) || providers[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+function presetModel(p) {
+  if (!p) return "";
+  if (typeof p.model === "string" && p.model.trim()) return p.model.trim();
+  if (typeof p.connection?.model === "string") return p.connection.model.trim();
+  return "";
+}
+
+function presetReasoning(p) {
+  const c = p?.connection || {};
+  return {
+    strategy: p?.reasoning_strategy || c.reasoning_strategy || "none",
+    effort: p?.reasoning_effort || c.reasoning_effort || "medium",
+    budget: p?.thinking_budget ?? c.thinking_budget ?? 2048
+  };
+}
+
+// v1.4 presets embedded connection.*. v1.5 splits providers out so any
+// provider mixes with any model preset. Migrate once, idempotently.
+async function migrateLegacyPresetsIfNeeded() {
+  const [presets, providers] = await Promise.all([
+    listPresets(),
+    listProviders().catch(() => [])
+  ]);
+  const legacy = presets.filter((p) => p?.connection && (p.connection.base_url || p.connection.api_key || p.connection.proxy_url || p.connection.use_proxy));
+  if (!legacy.length) return;
+  const byKey = new Map(providers.map((p) => [`${p.base_url || ""}‖${p.proxy_url || ""}`, p]));
+  let activeProviderId = ui.providerId;
+  for (const p of legacy) {
+    const c = p.connection;
+    const key = `${c.base_url || ""}‖${c.proxy_url || ""}`;
+    let prov = byKey.get(key);
+    if (!prov) {
+      const pid = await saveProvider({
+        name: c.label || p.name || "Migrated provider",
+        base_url: c.base_url || DEFAULT_PROVIDER.base_url,
+        api_key: c.api_key || "",
+        use_proxy: c.use_proxy ? 1 : 0,
+        proxy_url: c.proxy_url || ""
+      });
+      const fresh = await listProviders();
+      prov = fresh.find((x) => x.id === pid);
+      byKey.set(key, prov);
+    }
+    if (p.id === ui.presetId && activeProviderId == null) activeProviderId = prov.id;
+    await savePreset({
+      ...p,
+      id: p.id,
+      model: typeof p.model === "string" && p.model ? p.model : (c.model || ""),
+      reasoning_strategy: p.reasoning_strategy || c.reasoning_strategy || "none",
+      reasoning_effort: p.reasoning_effort || c.reasoning_effort || "medium",
+      thinking_budget: p.thinking_budget ?? c.thinking_budget ?? 2048,
+      connection: undefined,
+      updated_at: Date.now()
+    });
+  }
+  if (activeProviderId == null) {
+    const all = await listProviders();
+    if (all.length) activeProviderId = all[0].id;
+  }
+  if (activeProviderId != null) {
+    ui.providerId = activeProviderId;
+    persistUI();
+  }
 }
 
 // ---------- Message tree (swipe groups) ----------
@@ -347,6 +429,23 @@ async function setActiveSibling(chatId, groupId, msgId) {
     }
   }
   await renderCurrentChat();
+}
+
+async function copyText(text) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(String(text ?? ""));
+      return;
+    }
+    const ta = document.createElement("textarea");
+    ta.value = String(text ?? "");
+    document.body.append(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+  } catch (e) {
+    logWarn("E_UI_SEND", `copy failed: ${e?.message || e}`);
+  }
 }
 
 function openEditorBubble(div, msg, onSave) {
@@ -427,12 +526,16 @@ async function renderCurrentChat() {
       const acts = document.createElement("div");
       acts.className = "acts";
       acts.append(
+        actionButton("↻ Retry", "Regenerate the reply after this message", () => handleRetryFromUser(it.msg)),
         actionButton("✎ Edit", "Edit message", () =>
           openEditorBubble(div, it.msg, async (v) => {
             await saveMessage({ ...it.msg, content: v });
             await renderCurrentChat();
           })),
-        actionButton("🗑", "Delete message", async () => {
+        actionButton("⧉ Copy", "Copy message text", async () => {
+          await copyText(it.msg.content);
+        }),
+        actionButton("🗑 Delete", "Delete message", async () => {
           if (!window.confirm("Delete this message?")) return;
           await deleteMessage(it.msg.id);
           await renderCurrentChat();
@@ -487,13 +590,16 @@ async function renderCurrentChat() {
       attachSwipe(div, () => prev.click(), () => next.click());
     }
     acts.append(
-      actionButton("↻", "Regenerate (new variant)", () => handleRetry(it)),
-      actionButton("✎ Edit", "Edit message", () =>
+      actionButton("↻ Regenerate", "Regenerate (new variant)", () => handleRetry(it)),
+      actionButton("✎ Edit", "Edit AI message", () =>
         openEditorBubble(div, active, async (v) => {
-          await saveMessage({ ...active, content: v });
+          await saveMessage({ ...active, content: v, updated_at: Date.now() });
           await renderCurrentChat();
         })),
-      actionButton("🗑", "Delete message", async () => {
+      actionButton("⧉ Copy", "Copy message text", async () => {
+        await copyText(active.content);
+      }),
+      actionButton("🗑 Delete", "Delete message", async () => {
         if (!window.confirm("Delete this message?")) return;
         await deleteMessage(active.id);
         await renderCurrentChat();
@@ -642,26 +748,25 @@ async function refreshLibrary() {
   refreshViews();
 }
 
-// ---------- Preset editor ----------
+// ---------- Providers + model presets (v1.5 split, mix-and-match) ----------
 function setPresetStatus(msg) {
-  $("#preset-status").textContent = msg;
+  const el = $("#preset-status");
+  if (el) el.textContent = msg;
+}
+
+function setProviderStatus(msg) {
+  const el = $("#provider-status");
+  if (el) el.textContent = msg;
 }
 
 function readPresetForm() {
   const stops = $("#sam-stop").value.split("\n").map((s) => s.trim()).filter((s) => s.length);
   return {
     name: $("#conn-label").value.trim() || "Preset",
-    connection: {
-      label: $("#conn-label").value.trim() || "Preset",
-      base_url: $("#conn-url").value.trim(),
-      api_key: $("#conn-key").value,
-      model: $("#conn-model").value.trim(),
-      reasoning_strategy: $("#conn-strategy").value,
-      reasoning_effort: $("#conn-effort").value,
-      thinking_budget: Number($("#conn-budget").value) || 2048,
-      use_proxy: $("#conn-proxy-use").checked,
-      proxy_url: $("#conn-proxy-url").value.trim()
-    },
+    model: $("#conn-model").value.trim(),
+    reasoning_strategy: $("#conn-strategy").value || "none",
+    reasoning_effort: $("#conn-effort").value || "medium",
+    thinking_budget: Number($("#conn-budget").value) || 2048,
     samplers: {
       temperature: Number($("#sam-temp").value),
       top_p: Number($("#sam-topp").value),
@@ -685,18 +790,15 @@ function readPresetForm() {
 }
 
 function fillPresetForm(preset) {
-  const c = preset.connection || {};
+  if (!preset) return;
   const s = preset.samplers || {};
   const p = preset.prompts || {};
-  $("#conn-label").value = preset.name || c.label || "";
-  $("#conn-url").value = c.base_url || "";
-  $("#conn-key").value = c.api_key || "";
-  $("#conn-model").value = c.model || "";
-  $("#conn-strategy").value = c.reasoning_strategy || "none";
-  $("#conn-effort").value = c.reasoning_effort || "medium";
-  $("#conn-budget").value = c.thinking_budget ?? 2048;
-  $("#conn-proxy-use").checked = !!c.use_proxy;
-  $("#conn-proxy-url").value = c.proxy_url || "";
+  const r = presetReasoning(preset);
+  $("#conn-label").value = preset.name || "";
+  $("#conn-model").value = presetModel(preset);
+  $("#conn-strategy").value = r.strategy || "none";
+  $("#conn-effort").value = r.effort || "medium";
+  $("#conn-budget").value = r.budget ?? 2048;
   $("#sam-temp").value = s.temperature ?? 0.9;
   $("#sam-topp").value = s.top_p ?? 1.0;
   $("#sam-topk").value = s.top_k ?? 0;
@@ -714,6 +816,54 @@ function fillPresetForm(preset) {
   $("#pr-prefill-text").value = p.prefill_text || "";
 }
 
+function readProviderForm() {
+  return {
+    name: $("#prov-name").value.trim() || "Provider",
+    base_url: $("#prov-url").value.trim(),
+    api_key: $("#prov-key").value,
+    use_proxy: $("#prov-proxy-use").checked ? 1 : 0,
+    proxy_url: $("#prov-proxy-url").value.trim()
+  };
+}
+
+function fillProviderForm(prov) {
+  if (!prov) return;
+  $("#prov-name").value = prov.name || "";
+  $("#prov-url").value = prov.base_url || "";
+  $("#prov-key").value = prov.api_key || "";
+  $("#prov-proxy-use").checked = !!prov.use_proxy;
+  $("#prov-proxy-url").value = prov.proxy_url || "";
+}
+
+function refreshModelDatalist(models) {
+  const dl = $("#model-choices");
+  if (!dl) return;
+  dl.innerHTML = "";
+  for (const m of models || []) {
+    const o = document.createElement("option");
+    o.value = m;
+    dl.append(o);
+  }
+  const sel = $("#prov-models");
+  if (sel) {
+    const cur = sel.value;
+    sel.innerHTML = "";
+    const hint = document.createElement("option");
+    hint.value = "";
+    hint.textContent = (models && models.length) ? `${models.length} models — pick one, then Use in preset` : "Fetch models to list them here";
+    sel.append(hint);
+    for (const m of models || []) {
+      const o = document.createElement("option");
+      o.value = m;
+      o.textContent = m;
+      sel.append(o);
+    }
+    if (cur && models && models.includes(cur)) sel.value = cur;
+  }
+}
+
+let cachedModels = [];
+
 async function refreshPresets() {
   const presets = await listPresets();
   if (!presets.some((p) => p.id === ui.presetId) && presets.length) {
@@ -721,29 +871,126 @@ async function refreshPresets() {
     persistUI();
   }
   const box = $("#preset-list");
-  box.innerHTML = "";
-  for (const p of presets) {
-    const row = document.createElement("div");
-    row.className = "row" + (p.id === ui.presetId ? " active" : "");
-    const nm = document.createElement("span");
-    nm.className = "nm";
-    nm.textContent = p.name || "Preset";
-    nm.style.cursor = "pointer";
-    nm.addEventListener("click", async () => {
-      const cur = await getActivePreset();
-      if (cur && cur.id === ui.presetId) await savePreset({ ...cur, ...readPresetForm(), id: cur.id });
-      ui.presetId = p.id;
-      persistUI();
-      const fresh = await listPresets();
-      fillPresetForm(fresh.find((x) => x.id === p.id) || p);
-      await refreshPresets();
-      setPresetStatus("");
-    });
-    row.append(nm);
-    box.append(row);
+  if (box) {
+    box.innerHTML = "";
+    for (const p of presets) {
+      const row = document.createElement("div");
+      row.className = "row" + (p.id === ui.presetId ? " active" : "");
+      const nm = document.createElement("span");
+      nm.className = "nm";
+      nm.textContent = `${p.name || "Preset"} — ${presetModel(p) || "no model"}`;
+      nm.style.cursor = "pointer";
+      nm.title = "Tap to select this model preset";
+      nm.addEventListener("click", async () => {
+        const cur = await getActivePreset();
+        if (cur && cur.id === ui.presetId) await savePreset({ ...cur, ...readPresetForm(), id: cur.id });
+        ui.presetId = p.id;
+        persistUI();
+        const fresh = await listPresets();
+        fillPresetForm(fresh.find((x) => x.id === p.id) || p);
+        await refreshPresets();
+        updateComboLabels();
+        setPresetStatus("");
+      });
+      row.append(nm);
+      box.append(row);
+    }
   }
   const active = presets.find((p) => p.id === ui.presetId) || presets[0];
   if (active) fillPresetForm(active);
+  updateComboLabels();
+}
+
+async function refreshProviders() {
+  let providers = [];
+  try {
+    providers = await listProviders();
+  } catch {
+    providers = [];
+  }
+  if (!providers.some((p) => p.id === ui.providerId) && providers.length) {
+    ui.providerId = providers[0].id;
+    persistUI();
+  }
+  const box = $("#provider-list");
+  if (box) {
+    box.innerHTML = "";
+    for (const p of providers) {
+      const row = document.createElement("div");
+      row.className = "row" + (p.id === ui.providerId ? " active" : "");
+      const nm = document.createElement("span");
+      nm.className = "nm";
+      nm.textContent = p.name || "Provider";
+      nm.style.cursor = "pointer";
+      nm.title = (p.base_url || "") + " — tap to select this provider";
+      nm.addEventListener("click", async () => {
+        const cur = await getActiveProvider();
+        if (cur && cur.id === ui.providerId) {
+          try {
+            await saveProvider({ ...cur, ...readProviderForm(), id: cur.id });
+          } catch { /* keep selection moving */ }
+        }
+        ui.providerId = p.id;
+        persistUI();
+        const fresh = await listProviders();
+        fillProviderForm(fresh.find((x) => x.id === p.id) || p);
+        cachedModels = [];
+        refreshModelDatalist([]);
+        await refreshProviders();
+        updateComboLabels();
+        setProviderStatus("");
+      });
+      row.append(nm);
+      box.append(row);
+    }
+  }
+  const active = providers.find((p) => p.id === ui.providerId) || providers[0];
+  if (active) fillProviderForm(active);
+  updateComboLabels();
+}
+
+function updateComboLabels() {
+  const label = async () => {
+    const [prov, pre] = await Promise.all([getActiveProvider(), getActivePreset()]);
+    const txt = `Using: ${prov?.name || "no provider"} → ${pre?.name || "no preset"} (${presetModel(pre) || "no model"})`;
+    const a = $("#active-combo");
+    if (a) a.textContent = txt;
+    const b = $("#preset-combo");
+    if (b) b.textContent = txt;
+  };
+  label();
+}
+
+async function handleFetchModels() {
+  const form = readProviderForm();
+  setProviderStatus("Fetching models…");
+  try {
+    const models = await fetchModels(form);
+    cachedModels = models;
+    refreshModelDatalist(models);
+    setProviderStatus(models.length ? `Found ${models.length} models.` : "No models returned — check the base URL.");
+    logInfo("E_PROVIDER", `models fetched (${models.length})`);
+  } catch (e) {
+    logErr("E_PROVIDER", e.message);
+    setProviderStatus(`Fetch failed: ${e.message}`);
+  }
+  refreshDiag();
+}
+
+async function handleTestConnection() {
+  const form = readProviderForm();
+  setProviderStatus("Testing…");
+  try {
+    const models = await fetchModels(form);
+    cachedModels = models;
+    refreshModelDatalist(models);
+    setProviderStatus(models.length ? `OK — ${models.length} models reachable.` : "OK — reachable, but /models was empty.");
+    logInfo("E_PROVIDER", "connection test ok");
+  } catch (e) {
+    logErr("E_PROVIDER", e.message);
+    setProviderStatus(`Test failed: ${e.message}`);
+  }
+  refreshDiag();
 }
 
 // ---------- Diagnostics panel ----------
@@ -763,10 +1010,11 @@ function diagNote(msg) {
 
 // ---------- Context + generation core ----------
 async function buildContext(pastRows, extraUserText = "") {
-  const [chars, personas, preset] = await Promise.all([
+  const [chars, personas, preset, provider] = await Promise.all([
     listCharacters(),
     listPersonas(),
-    getActivePreset()
+    getActivePreset(),
+    getActiveProvider()
   ]);
   const ch = chars.find((c) => c.id === ui.characterId);
   const me = personas.find((p) => p.id === ui.personaId);
@@ -817,11 +1065,11 @@ async function buildContext(pastRows, extraUserText = "") {
   } catch {
     /* regex must never break the send path */
   }
-  return { preset, ch, me, chName: ch?.name || "Polyglot", meName: me?.name || "You", built };
+  return { preset, provider, ch, me, chName: ch?.name || "Polyglot", meName: me?.name || "You", built };
 }
 
-// Streams preset.messages into a live shell. Resolves {content, reasoning}.
-async function runStream(preset, messages, shell, signal) {
+// Streams provider+preset messages into a live shell. Resolves {content, reasoning}.
+async function runStream(preset, provider, messages, shell, signal) {
   const t0 = Date.now();
   const tg = getToggles();
   let acc = "";
@@ -837,8 +1085,10 @@ async function runStream(preset, messages, shell, signal) {
     scrollBottom();
   };
   const { content, reasoning } = await sendChat({
-    connection: preset.connection,
-    samplers: preset.samplers,
+    provider: provider || undefined,
+    preset,
+    connection: preset?.connection,
+    samplers: preset?.samplers,
     messages,
     signal,
     onContent: (t) => { acc += t; renderLive(); },
@@ -867,8 +1117,8 @@ async function touchChatById(chatId, titleHint = "") {
 
 // Fresh assistant reply for history rows (+ optional trailing user text already saved).
 async function generateAssistant(chatId, pastRows, { groupId = null, titleHint = "" } = {}) {
-  const { preset, chName, built } = await buildContext(pastRows);
-  if (!preset?.connection?.model) {
+  const { preset, provider, chName, built } = await buildContext(pastRows);
+  if (!presetModel(preset)) {
     const lastUser = [...pastRows].reverse().find((m) => m.role === "user");
     const reply = offlineEcho(lastUser?.content || "", chName);
     const id = await saveMessage({
@@ -886,7 +1136,7 @@ async function generateAssistant(chatId, pastRows, { groupId = null, titleHint =
   document.body.classList.add("generating");
   aborter = new AbortController();
   try {
-    const { content, reasoning } = await runStream(preset, built.messages, shell, aborter.signal);
+    const { content, reasoning } = await runStream(preset, provider, built.messages, shell, aborter.signal);
     if (!content && !reasoning) throw new Error("E_UI_SEND: empty reply from provider.");
     const gid = groupId || `g${Date.now()}`;
     const id = await saveMessage({
@@ -949,6 +1199,17 @@ async function handleRetry(item) {
   await generateAssistant(chatId, history, { groupId });
 }
 
+async function handleRetryFromUser(userMsg) {
+  if (generating() || !userMsg) return;
+  triggerHaptic(10);
+  const chatId = ui.chatId;
+  if (chatId == null) return;
+  const rows = await listMessages(chatId);
+  const pos = rows.findIndex((m) => m.id === userMsg.id);
+  const history = pos === -1 ? rows : rows.slice(0, pos + 1);
+  await generateAssistant(chatId, history, {});
+}
+
 async function handleContinue() {
   if (generating()) return;
   const chatId = await ensureChat();
@@ -961,8 +1222,8 @@ async function handleContinue() {
     return;
   }
   // Append to the last assistant message.
-  const { preset, chName } = await buildContext(rows.slice(0, -1));
-  if (!preset?.connection?.model) {
+  const { preset, provider, chName } = await buildContext(rows.slice(0, -1));
+  if (!presetModel(preset)) {
     const more = " *(nods along, offline echo continues.)*";
     await saveMessage({ ...last, content: last.content + more });
     await renderCurrentChat();
@@ -976,7 +1237,7 @@ async function handleContinue() {
   document.body.classList.add("generating");
   aborter = new AbortController();
   try {
-    const { content, reasoning } = await runStream(preset, ctx.built.messages, shell, aborter.signal);
+    const { content, reasoning } = await runStream(preset, provider, ctx.built.messages, shell, aborter.signal);
     await saveMessage({
       ...last,
       content: last.content + (content || ""),
@@ -1006,9 +1267,9 @@ async function handleImpersonate() {
   if (generating()) return;
   const chatId = await ensureChat();
   const rows = await listMessages(chatId);
-  const { preset, meName } = await buildContext(rows);
+  const { preset, provider, meName } = await buildContext(rows);
   triggerHaptic(10);
-  if (!preset?.connection?.model) {
+  if (!presetModel(preset)) {
     const text = "*leans forward, offline echo as you.* \"No model set — open ⚙ and add a preset.\"";
     await saveMessage({ chat_id: chatId, role: "user", content: text, timestamp: Date.now() });
     await touchChatById(chatId);
@@ -1026,7 +1287,7 @@ async function handleImpersonate() {
   document.body.classList.add("generating");
   aborter = new AbortController();
   try {
-    const { content } = await runStream(preset, ctx.built.messages, shell, aborter.signal);
+    const { content } = await runStream(preset, provider, ctx.built.messages, shell, aborter.signal);
     if (!content) throw new Error("E_UI_SEND: empty impersonation from provider.");
     await saveMessage({ chat_id: chatId, role: "user", content, timestamp: Date.now() });
     await touchChatById(chatId);
@@ -1086,11 +1347,14 @@ async function handleImportFile(file) {
     ui.chatId = null;
     ui.personaId = null;
     ui.presetId = null;
+    ui.providerId = null;
     persistUI();
     bumpRegexCache();
     await ensureSelection();
     await refreshLibrary();
     await refreshPresets();
+    await refreshProviders();
+    updateComboLabels();
     await renderCurrentChat();
     setVaultStatus("Import complete.");
     logInfo("E_UI_IMPORT", "vault import complete");
@@ -1197,18 +1461,39 @@ async function handlePresetImportFile(file) {
       if (!p || typeof p !== "object") continue;
       const { id, ...rest } = p;
       void id;
+      // Accept v1.5 model presets and legacy v1.4 presets with connection.*.
+      const legacy = rest.connection || {};
       lastId = await savePreset({
-        name: String(rest.name || rest.connection?.label || "Imported preset"),
-        connection: { ...DEFAULT_CONNECTION, ...(rest.connection || {}) },
+        name: String(rest.name || legacy.label || "Imported preset"),
+        model: String(rest.model ?? legacy.model ?? ""),
+        reasoning_strategy: rest.reasoning_strategy || legacy.reasoning_strategy || "none",
+        reasoning_effort: rest.reasoning_effort || legacy.reasoning_effort || "medium",
+        thinking_budget: rest.thinking_budget ?? legacy.thinking_budget ?? 2048,
         samplers: { ...DEFAULT_SAMPLERS, ...(rest.samplers || {}) },
         prompts: { ...DEFAULT_PROMPTS, ...(rest.prompts || {}) }
       });
+      // If the file still carries a provider, import it too (once per base_url).
+      if (legacy.base_url) {
+        const existing = await listProviders();
+        const hit = existing.some((x) => (x.base_url || "") === legacy.base_url && (x.proxy_url || "") === (legacy.proxy_url || ""));
+        if (!hit) {
+          await saveProvider({
+            name: String(legacy.label || rest.name || "Imported provider"),
+            base_url: legacy.base_url,
+            api_key: legacy.api_key || "",
+            use_proxy: legacy.use_proxy ? 1 : 0,
+            proxy_url: legacy.proxy_url || ""
+          });
+        }
+      }
     }
     if (lastId != null) {
       ui.presetId = lastId;
       persistUI();
     }
     await refreshPresets();
+    await refreshProviders();
+    updateComboLabels();
     logInfo("E_UI_IMPORT", `preset imported (${rows.length})`);
   } catch (e) {
     logErr("E_UI_IMPORT", e.message);
@@ -1505,7 +1790,7 @@ function showView(name) {
   if (name === "home") refreshHome();
   if (name === "chars") renderCharsView();
   if (name === "detail") renderDetailView();
-  if (name === "presets") renderPresetCards();
+  if (name === "presets") { renderPresetCards(); renderProviderCards(); }
   if (name === "books") renderBooksView();
   if (name === "regex") renderRegexView();
   if (name === "chat") {
@@ -1710,88 +1995,154 @@ async function renderDetailView() {
 
 async function renderPresetCards() {
   const box = $("#preset-cards");
+  if (box) {
+    const f = ($("#preset-filter")?.value || "").trim().toLowerCase();
+    const presets = await listPresets();
+    box.innerHTML = "";
+    const rows = presets.filter((p) =>
+      !f || (p.name || "").toLowerCase().includes(f) ||
+      presetModel(p).toLowerCase().includes(f));
+    if (!rows.length) {
+      box.innerHTML = `<div class="status">No presets match.</div>`;
+    } else {
+      for (const p of rows) {
+        const row = document.createElement("div");
+        row.className = "row" + (p.id === ui.presetId ? " active" : "");
+        const tx = document.createElement("span");
+        tx.className = "nm";
+        tx.style.cursor = "pointer";
+        const t = document.createElement("div");
+        t.textContent = p.name || "Preset";
+        const s = document.createElement("div");
+        s.className = "csub";
+        const r = presetReasoning(p);
+        s.textContent = `${r.strategy || "none"} | ${presetModel(p) || "no model"}`;
+        tx.append(t, s);
+        tx.addEventListener("click", async () => {
+          ui.presetId = p.id;
+          persistUI();
+          const fresh = await listPresets();
+          fillPresetForm(fresh.find((x) => x.id === p.id) || p);
+          await refreshPresets();
+          await renderPresetCards();
+          openDrawer("drawer-right");
+        });
+        const icons = document.createElement("span");
+        icons.className = "iconrow";
+        const exp = document.createElement("button");
+        exp.textContent = "⤓";
+        exp.title = "Export preset JSON";
+        exp.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          const blob = new Blob([JSON.stringify(p, null, 2)], { type: "application/json" });
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = `polyglot-preset-${(p.name || p.id).toString().replace(/[^\w-]+/g, "_")}.json`;
+          document.body.append(a);
+          a.click();
+          a.remove();
+          window.setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+        });
+        const dup = document.createElement("button");
+        dup.textContent = "⧉";
+        dup.title = "Duplicate preset";
+        dup.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          const { id, ...rest } = p;
+          void id;
+          const nid = await savePreset({ ...rest, name: `${p.name || "Preset"} copy` });
+          ui.presetId = nid;
+          persistUI();
+          await refreshPresets();
+          await renderPresetCards();
+        });
+        const del = document.createElement("button");
+        del.textContent = "🗑";
+        del.title = "Delete preset";
+        del.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          if (presets.length <= 1) {
+            window.alert("Keep at least one preset.");
+            return;
+          }
+          if (!window.confirm(`Delete preset "${p.name}"?`)) return;
+          await deletePreset(p.id);
+          if (ui.presetId === p.id) ui.presetId = null;
+          persistUI();
+          await ensureSelection();
+          await refreshPresets();
+          await renderPresetCards();
+        });
+        icons.append(exp, dup, del);
+        row.append(tx, icons);
+        box.append(row);
+      }
+    }
+  }
+  updateComboLabels();
+}
+
+async function renderProviderCards() {
+  const box = $("#provider-cards");
   if (!box) return;
-  const f = ($("#preset-filter")?.value || "").trim().toLowerCase();
-  const presets = await listPresets();
+  let providers = [];
+  try {
+    providers = await listProviders();
+  } catch {
+    providers = [];
+  }
   box.innerHTML = "";
-  const rows = presets.filter((p) =>
-    !f || (p.name || "").toLowerCase().includes(f) ||
-    (p.connection?.model || "").toLowerCase().includes(f));
-  if (!rows.length) {
-    box.innerHTML = `<div class="status">No presets match.</div>`;
+  if (!providers.length) {
+    box.innerHTML = `<div class="status">No providers yet — add your Nvidia NIM endpoint above.</div>`;
     return;
   }
-  for (const p of rows) {
+  for (const p of providers) {
     const row = document.createElement("div");
-    row.className = "row" + (p.id === ui.presetId ? " active" : "");
+    row.className = "row" + (p.id === ui.providerId ? " active" : "");
     const tx = document.createElement("span");
     tx.className = "nm";
     tx.style.cursor = "pointer";
     const t = document.createElement("div");
-    t.textContent = p.name || "Preset";
+    t.textContent = p.name || "Provider";
     const s = document.createElement("div");
     s.className = "csub";
-    s.textContent = `${p.connection?.reasoning_strategy || "none"} | ${p.connection?.model || "no model"}`;
+    s.textContent = p.base_url || "no URL";
     tx.append(t, s);
     tx.addEventListener("click", async () => {
-      ui.presetId = p.id;
+      ui.providerId = p.id;
       persistUI();
-      const fresh = await listPresets();
-      fillPresetForm(fresh.find((x) => x.id === p.id) || p);
-      await refreshPresets();
-      await renderPresetCards();
+      const fresh = await listProviders();
+      fillProviderForm(fresh.find((x) => x.id === p.id) || p);
+      cachedModels = [];
+      refreshModelDatalist([]);
+      await refreshProviders();
+      await renderProviderCards();
       openDrawer("drawer-right");
     });
     const icons = document.createElement("span");
     icons.className = "iconrow";
-    const exp = document.createElement("button");
-    exp.textContent = "⤓";
-    exp.title = "Export preset JSON";
-    exp.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      const blob = new Blob([JSON.stringify(p, null, 2)], { type: "application/json" });
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = `polyglot-preset-${(p.name || p.id).toString().replace(/[^\w-]+/g, "_")}.json`;
-      document.body.append(a);
-      a.click();
-      a.remove();
-      window.setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-    });
-    const dup = document.createElement("button");
-    dup.textContent = "⧉";
-    dup.title = "Duplicate preset";
-    dup.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      const { id, ...rest } = p;
-      void id;
-      const nid = await savePreset({ ...rest, name: `${p.name || "Preset"} copy` });
-      ui.presetId = nid;
-      persistUI();
-      await refreshPresets();
-      await renderPresetCards();
-    });
     const del = document.createElement("button");
     del.textContent = "🗑";
-    del.title = "Delete preset";
+    del.title = "Delete provider";
     del.addEventListener("click", async (e) => {
       e.stopPropagation();
-      if (presets.length <= 1) {
-        window.alert("Keep at least one preset.");
+      if (providers.length <= 1) {
+        window.alert("Keep at least one provider.");
         return;
       }
-      if (!window.confirm(`Delete preset "${p.name}"?`)) return;
-      await deletePreset(p.id);
-      if (ui.presetId === p.id) ui.presetId = null;
+      if (!window.confirm(`Delete provider "${p.name}"?`)) return;
+      await deleteProvider(p.id);
+      if (ui.providerId === p.id) ui.providerId = null;
       persistUI();
       await ensureSelection();
-      await refreshPresets();
-      await renderPresetCards();
+      await refreshProviders();
+      await renderProviderCards();
     });
-    icons.append(exp, dup, del);
+    icons.append(del);
     row.append(tx, icons);
     box.append(row);
   }
+  updateComboLabels();
 }
 
 async function renderBooksView() {
@@ -1858,10 +2209,164 @@ async function renderBooksView() {
       await deleteLorebook(b.id);
       await renderBooksView();
     });
-    icons.append(exp, del);
+    const ed = document.createElement("button");
+    ed.textContent = "⋯";
+    ed.title = "Edit book (rename, entries)";
+    ed.setAttribute("aria-label", "Edit book");
+    ed.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openBookEditor(b.id);
+    });
+    tx.style.cursor = "pointer";
+    tx.title = "Tap to edit";
+    tx.addEventListener("click", () => openBookEditor(b.id));
+    icons.append(ed, exp, del);
     row.append(tx, icons);
     box.append(row);
   }
+}
+
+// ---------- Memory book editor (rename + entries CRUD) ----------
+let edBookId = null;
+let edBookEntries = [];
+
+function setBookStatus(msg) {
+  const el = $("#book-status");
+  if (el) el.textContent = msg;
+}
+
+async function fillBookCharSelect(selected = "shared") {
+  const sel = $("#bk-char");
+  if (!sel) return;
+  const chars = await listCharacters();
+  sel.innerHTML = "";
+  const g = document.createElement("option");
+  g.value = "shared";
+  g.textContent = "Shared (all chats)";
+  sel.append(g);
+  for (const c of chars) {
+    const o = document.createElement("option");
+    o.value = String(c.id);
+    o.textContent = c.name;
+    sel.append(o);
+  }
+  sel.value = [...sel.options].some((o) => o.value === String(selected)) ? String(selected) : "shared";
+}
+
+function renderBookEntries() {
+  const box = $("#bk-entry-list");
+  if (!box) return;
+  box.innerHTML = "";
+  if (!edBookEntries.length) {
+    box.innerHTML = `<div class="status">No entries yet — add keys + content below.</div>`;
+    return;
+  }
+  edBookEntries.forEach((e, i) => {
+    const row = document.createElement("div");
+    row.className = "row";
+    const nm = document.createElement("span");
+    nm.className = "nm";
+    nm.textContent = `${(e.keys || []).join(", ")} — ${String(e.content || "").slice(0, 70)}${e.enabled === false ? " (off)" : ""}`;
+    const icons = document.createElement("span");
+    icons.className = "iconrow";
+    const tg = document.createElement("button");
+    tg.textContent = e.enabled === false ? "▶" : "⏸";
+    tg.title = "Toggle entry";
+    tg.addEventListener("click", () => {
+      edBookEntries[i] = { ...e, enabled: e.enabled === false ? true : false };
+      renderBookEntries();
+    });
+    const ed = document.createElement("button");
+    ed.textContent = "⋯";
+    ed.title = "Load into editor below";
+    ed.addEventListener("click", () => {
+      $("#bk-keys").value = (e.keys || []).join(", ");
+      $("#bk-content").value = e.content || "";
+      edBookEntries.splice(i, 1);
+      renderBookEntries();
+    });
+    const x = document.createElement("button");
+    x.textContent = "×";
+    x.setAttribute("aria-label", "Delete entry");
+    x.addEventListener("click", () => {
+      edBookEntries.splice(i, 1);
+      renderBookEntries();
+    });
+    icons.append(tg, ed, x);
+    row.append(nm, icons);
+    box.append(row);
+  });
+}
+
+async function openBookEditor(bookId = null) {
+  edBookId = bookId;
+  edBookEntries = [];
+  const modal = $("#book-modal");
+  if (!modal) return;
+  if (bookId == null) {
+    $("#bk-title").textContent = "New memory book";
+    $("#bk-name").value = "";
+    await fillBookCharSelect("shared");
+    $("#bk-keys").value = "";
+    $("#bk-content").value = "";
+    setBookStatus("");
+  } else {
+    const books = await listLorebooks();
+    const b = books.find((x) => x.id === bookId);
+    if (!b) return;
+    $("#bk-title").textContent = "Edit memory book";
+    $("#bk-name").value = b.name || "";
+    await fillBookCharSelect(b.character_id == null ? "shared" : b.character_id);
+    edBookEntries = (b.entries || []).map((e, i) => ({
+      keys: Array.isArray(e.keys) ? e.keys : (Array.isArray(e.keywords) ? e.keywords : []),
+      content: e.content || "",
+      enabled: e.enabled !== false,
+      insertion_order: e.insertion_order ?? i
+    }));
+    $("#bk-keys").value = "";
+    $("#bk-content").value = "";
+    setBookStatus(`${edBookEntries.length} entries loaded.`);
+  }
+  renderBookEntries();
+  modal.hidden = false;
+}
+
+function closeBookEditor() {
+  const modal = $("#book-modal");
+  if (modal) modal.hidden = true;
+  edBookId = null;
+  setBookStatus("");
+}
+
+async function saveBookEditor() {
+  try {
+    const name = $("#bk-name").value.trim() || "Untitled book";
+    const charSel = $("#bk-char")?.value || "shared";
+    const rec = {
+      name,
+      character_id: charSel === "shared" ? null : Number(charSel),
+      entries: edBookEntries.map((e, i) => ({
+        keys: Array.isArray(e.keys) ? e.keys : [],
+        content: String(e.content || ""),
+        enabled: e.enabled !== false,
+        insertion_order: e.insertion_order ?? i
+      }))
+    };
+    if (edBookId == null) {
+      await saveLorebook(rec);
+    } else {
+      const books = await listLorebooks();
+      const prev = books.find((x) => x.id === edBookId) || {};
+      await saveLorebook({ ...prev, ...rec, id: edBookId });
+    }
+    closeBookEditor();
+    await renderBooksView();
+    logInfo("E_UI_IMPORT", `book saved (${name})`);
+  } catch (e) {
+    logErr("E_UI_IMPORT", e.message);
+    setBookStatus(`Save failed: ${e.message}`);
+  }
+  refreshDiag();
 }
 
 // ---------- Phase 5: regex scripts view ----------
@@ -2082,7 +2587,7 @@ function refreshViews() {
   if (view === "home") refreshHome();
   else if (view === "chars") renderCharsView();
   else if (view === "detail") renderDetailView();
-  else if (view === "presets") renderPresetCards();
+  else if (view === "presets") { renderPresetCards(); renderProviderCards(); }
   else if (view === "books") renderBooksView();
   else if (view === "regex") renderRegexView();
 }
@@ -2183,14 +2688,20 @@ async function init() {
   await seedIfEmpty({
     preset: {
       name: "Default",
-      connection: { ...DEFAULT_CONNECTION },
+      model: "nvidia/llama-3.1-nemotron-70b-instruct",
+      reasoning_strategy: "none",
+      reasoning_effort: "medium",
+      thinking_budget: 2048,
       samplers: { ...DEFAULT_SAMPLERS },
       prompts: { ...DEFAULT_PROMPTS }
-    }
+    },
+    provider: { ...DEFAULT_PROVIDER }
   });
+  await migrateLegacyPresetsIfNeeded();
   await ensureSelection();
   await refreshLibrary();
   await refreshPresets();
+  await refreshProviders();
   await renderCurrentChat();
   refreshDiag();
   logInfo("E_UI_SEND", `ready ${APP_VERSION}`);
@@ -2211,6 +2722,7 @@ async function init() {
     if (e.key === "Escape") {
       closeDrawers();
       closeCharEditor();
+      closeBookEditor();
     }
   });
   $("#send").addEventListener("click", handleSend);
@@ -2305,7 +2817,10 @@ async function init() {
     if (!name) return;
     const id = await savePreset({
       name: name.trim(),
-      connection: { ...DEFAULT_CONNECTION, label: name.trim() },
+      model: "nvidia/llama-3.1-nemotron-70b-instruct",
+      reasoning_strategy: "none",
+      reasoning_effort: "medium",
+      thinking_budget: 2048,
       samplers: { ...DEFAULT_SAMPLERS },
       prompts: { ...DEFAULT_PROMPTS }
     });
@@ -2349,6 +2864,112 @@ async function init() {
     await refreshPresets();
     await renderPresetCards();
     setPresetStatus("Deleted.");
+  });
+
+  // ---------- v1.5 wiring: providers (connection) + model presets ----------
+  $("#btn-provider-new")?.addEventListener("click", async () => {
+    const name = window.prompt("Provider name:", "Nvidia NIM");
+    if (!name) return;
+    const id = await saveProvider({ ...DEFAULT_PROVIDER, name: name.trim() });
+    ui.providerId = id;
+    persistUI();
+    await refreshProviders();
+    await renderProviderCards();
+  });
+  $("#btn-new-provider")?.addEventListener("click", async () => {
+    const name = window.prompt("Provider name:", "Nvidia NIM");
+    if (!name) return;
+    const id = await saveProvider({ ...DEFAULT_PROVIDER, name: name.trim() });
+    ui.providerId = id;
+    persistUI();
+    await refreshProviders();
+    await renderProviderCards();
+  });
+  $("#btn-fetch-models")?.addEventListener("click", handleFetchModels);
+  $("#btn-test-conn")?.addEventListener("click", handleTestConnection);
+  $("#btn-use-model")?.addEventListener("click", async () => {
+    const pick = $("#prov-models")?.value || "";
+    if (!pick) {
+      setProviderStatus("Fetch models first, then pick one.");
+      return;
+    }
+    const box = $("#conn-model");
+    if (box) box.value = pick;
+    try {
+      const active = await getActivePreset();
+      if (active) {
+        await savePreset({ ...active, model: pick, id: active.id, updated_at: Date.now() });
+        await refreshPresets();
+      }
+    } catch (e) {
+      logErr("E_PROVIDER", e.message);
+    }
+    updateComboLabels();
+    setProviderStatus(`Model set: ${pick}`);
+    refreshDiag();
+  });
+  $("#prov-models")?.addEventListener("change", (e) => {
+    const v = e.target.value || "";
+    if (v && $("#conn-model")) $("#conn-model").value = v;
+  });
+  $("#btn-save-provider")?.addEventListener("click", async () => {
+    try {
+      const active = await getActiveProvider();
+      const form = readProviderForm();
+      if (active) await saveProvider({ ...active, ...form, id: active.id, updated_at: Date.now() });
+      else {
+        const id = await saveProvider(form);
+        ui.providerId = id;
+        persistUI();
+      }
+      await refreshProviders();
+      await renderProviderCards();
+      setProviderStatus("Saved.");
+    } catch (e) {
+      logErr("E_PROVIDER", e.message);
+      setProviderStatus(`Save failed: ${e.message}`);
+    }
+    refreshDiag();
+  });
+  $("#btn-del-provider")?.addEventListener("click", async () => {
+    const providers = await listProviders();
+    if (providers.length <= 1) {
+      setProviderStatus("Keep at least one provider.");
+      return;
+    }
+    const active = await getActiveProvider();
+    if (!active) return;
+    if (!window.confirm(`Delete provider "${active.name}"?`)) return;
+    await deleteProvider(active.id);
+    ui.providerId = null;
+    persistUI();
+    await ensureSelection();
+    await refreshProviders();
+    await renderProviderCards();
+    cachedModels = [];
+    refreshModelDatalist([]);
+    setProviderStatus("Deleted.");
+  });
+
+  // ---------- v1.5 wiring: memory book editor ----------
+  $("#btn-book-new")?.addEventListener("click", () => openBookEditor(null));
+  $("#btn-bk-close")?.addEventListener("click", closeBookEditor);
+  $("#btn-bk-save")?.addEventListener("click", saveBookEditor);
+  $("#btn-bk-entry-add")?.addEventListener("click", () => {
+    const keys = $("#bk-keys").value.split(",").map((s) => s.trim()).filter((s) => s.length);
+    const content = $("#bk-content").value.trim();
+    if (!keys.length || !content) {
+      setBookStatus("Entry needs keys + content.");
+      return;
+    }
+    edBookEntries.push({ keys, content, enabled: true, insertion_order: edBookEntries.length });
+    $("#bk-keys").value = "";
+    $("#bk-content").value = "";
+    renderBookEntries();
+    setBookStatus(`${edBookEntries.length} entries.`);
+  });
+  $("#book-modal")?.addEventListener("click", (e) => {
+    if (e.target && e.target.id === "book-modal") closeBookEditor();
   });
 
   // ---------- Phase 4 wiring: tabs, views, ptabs, toggles, theme ----------
@@ -2400,7 +3021,10 @@ async function init() {
     if (!name) return;
     const id = await savePreset({
       name: name.trim(),
-      connection: { ...DEFAULT_CONNECTION, label: name.trim() },
+      model: "nvidia/llama-3.1-nemotron-70b-instruct",
+      reasoning_strategy: "none",
+      reasoning_effort: "medium",
+      thinking_budget: 2048,
       samplers: { ...DEFAULT_SAMPLERS },
       prompts: { ...DEFAULT_PROMPTS }
     });
@@ -2417,17 +3041,6 @@ async function init() {
     const f = e.target.files?.[0];
     e.target.value = "";
     if (f) await handlePresetImportFile(f);
-  });
-  $("#btn-book-new")?.addEventListener("click", async () => {
-    const name = window.prompt("Book name:", "My lorebook");
-    if (!name) return;
-    const sel = $("#books-char-filter")?.value;
-    await saveLorebook({
-      character_id: sel && sel !== "all" ? Number(sel) : null,
-      name: name.trim(),
-      entries: []
-    });
-    await renderBooksView();
   });
   $("#file-book-import")?.addEventListener("change", async (e) => {
     const f = e.target.files?.[0];
