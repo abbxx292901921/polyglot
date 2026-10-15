@@ -1527,6 +1527,10 @@ async function handleBookImportFile(file) {
 // ---------- Character editor + card import ----------
 function setCardStatus(msg) {
   $("#card-status").textContent = msg;
+  // The drawer status is invisible when importing from the Characters tab or
+  // the character editor modal, so mirror it there too.
+  const cs = $("#char-status");
+  if (cs) cs.textContent = msg;
 }
 
 function setCharStatus(msg) {
