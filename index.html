@@ -20,7 +20,7 @@
     <header class="topbar">
       <button id="btn-left" class="iconbtn" aria-label="Open library">&#9776;</button>
       <h1>Polyglot</h1>
-      <span id="ver" class="ver">v1.5.3</span>
+      <span id="ver" class="ver">v1.6.0</span>
       <div class="spacer"></div>
       <button id="btn-right" class="iconbtn" aria-label="Open settings">&#9881;</button>
     </header>
@@ -37,6 +37,8 @@
       <button data-view="presets" role="tab" type="button">Presets</button>
       <button data-view="books" role="tab" type="button">Books</button>
       <button data-view="regex" role="tab" type="button">Regex</button>
+      <button data-view="stages" role="tab" type="button">Stages</button>
+      <button data-view="forge" role="tab" type="button">Forge</button>
     </nav>
 
     <section id="views">
@@ -171,6 +173,33 @@
           </div>
           <h3>Rules</h3>
           <div id="regex-list" class="list"></div>
+        </div>
+      </div>
+      <div id="view-stages" class="view" hidden>
+        <div class="wrap">
+          <h2>Stages</h2>
+          <p id="stage-chat-label" class="status" role="status"></p>
+          <p class="status">Per-chat roleplay tools: Director brackets, world holder (/set, /party, /inv), deterministic /roll, chess-lite (say play chess, move A2 to A4). Toggles apply to the open chat, else global defaults.</p>
+          <div class="toolbar">
+            <button id="btn-stage-export" class="btn secondary" type="button">Export</button>
+          </div>
+          <div id="stage-list" class="list"></div>
+          <h3>Live preview</h3>
+          <div id="stage-preview"></div>
+        </div>
+      </div>
+      <div id="view-forge" class="view" hidden>
+        <div class="wrap">
+          <h2>Forge — Supervisor</h2>
+          <p class="status">Draft characters, polish them, write scenarios, attach stages. The model only proposes — you approve every change.</p>
+          <label class="field">Request<textarea id="forge-input" rows="3" placeholder="Create a gruff dwarven barkeep with a secret… / Polish Rin / Write a tavern ambush scenario / Add chess to this chat"></textarea></label>
+          <div class="vaultbtns">
+            <button id="btn-forge-run" class="btn" type="button">Run supervisor</button>
+            <button id="btn-forge-draft" class="btn secondary" type="button">Offline draft</button>
+            <button id="btn-forge-polish" class="btn secondary" type="button">Polish current</button>
+          </div>
+          <h3>Proposals</h3>
+          <div id="forge-results"></div>
         </div>
       </div>
     </section>
@@ -400,6 +429,33 @@
         </div>
         <div id="char-status" class="status" role="status"></div>
       </div>
+    </div>
+  </div>
+
+  <div id="persona-modal" class="modal" hidden>
+    <div class="sheet" role="dialog" aria-label="Edit persona">
+      <header><h2 id="persona-title">Persona</h2><button class="iconbtn" id="btn-persona-close" aria-label="Close">&times;</button></header>
+      <div class="mbody">
+        <label class="field">Name<input id="pe-name" type="text" autocomplete="off" /></label>
+        <label class="field">Description — who you are (sent to the AI with every prompt)<textarea id="pe-desc" rows="4"></textarea></label>
+        <div id="persona-status" class="status" role="status"></div>
+        <button id="btn-persona-save" class="btn" type="button">Save persona</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="graph-modal" class="modal" hidden>
+    <div class="sheet graph-sheet" role="dialog" aria-label="Chat graph">
+      <header><h2>Chat Graph</h2><button class="iconbtn" id="btn-graph-close" aria-label="Close">&times;</button></header>
+      <div class="graph-hint">Tap a node to load that path. Drag to pan, pinch or scroll to zoom.</div>
+      <div id="graph-preview" class="graph-preview" hidden></div>
+      <div id="graph-view" class="graph-view" tabindex="0" aria-label="Message tree"></div>
+      <footer class="graph-bar">
+        <button id="btn-graph-collapse" class="btn secondary" type="button">Collapse</button>
+        <button id="btn-graph-reset" class="btn secondary" type="button">Reset</button>
+        <button id="btn-graph-rotate" class="btn secondary" type="button">Rotate</button>
+        <button id="btn-graph-fork" class="btn secondary" type="button">Fork</button>
+      </footer>
     </div>
   </div>
 

@@ -204,8 +204,9 @@ export function treeLayout(rows) {
   return { nodes, maxDepth: nodes.reduce((a, n) => Math.max(a, n.depth), 0) };
 }
 
-// Full pipeline: macros → lorebook → depth inject → budget → prefill.
+// Full pipeline: macros → lorebook → stages → depth inject → budget → prefill.
 // history: [{role, content}] oldest→newest (already macro-safe raw text).
+// stageBlocks: prebuilt system strings from stages.js buildStageBlocks (already safe).
 export function buildMessages({
   system = "",
   jailbreak = "",
@@ -213,6 +214,7 @@ export function buildMessages({
   authorsNoteDepth = 2,
   loreEntries = [],
   activeLore = null,
+  stageBlocks = [],
   recentText = "",
   history = [],
   prefill = null,
@@ -228,6 +230,9 @@ export function buildMessages({
   for (const e of lore) {
     const c = resolveMacros(e.content || "", macroCtx);
     if (c) msgs.push({ role: "system", content: `[Lorebook: ${(e.keys || []).join(", ")}]\n${c}` });
+  }
+  for (const b of (Array.isArray(stageBlocks) ? stageBlocks : [])) {
+    if (typeof b === "string" && b.trim()) msgs.push({ role: "system", content: b.slice(0, 4000) });
   }
   if (jb) msgs.push({ role: "system", content: jb });
   for (const h of history) msgs.push({ role: h.role, content: h.content });

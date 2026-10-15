@@ -31,7 +31,10 @@ export const CODES = {
   E_UI_SEND: "Send-path failure; the message before the code names the cause.",
   E_UI_IMPORT: "File import failed; reason follows the code.",
   E_UI_EXPORT: "Backup export failed; reason follows the code.",
-  E_REGEX_RULE: "Regex script saved/applied/skipped; invalid patterns are rejected or skipped, never fatal."
+  E_REGEX_RULE: "Regex script saved/applied/skipped; invalid patterns are rejected or skipped, never fatal.",
+  E_STAGE_STATE: "Stage state load/save/dice/chess/world event; never fatal to send.",
+  E_STAGE_RULE: "Stage def saved/applied/skipped; invalid config rejected, never fatal.",
+  E_SUPERVISOR: "Supervisor router action proposed/applied/rejected; schema errors are rejected, never fatal."
 };
 
 export function log(level, code, msg) {

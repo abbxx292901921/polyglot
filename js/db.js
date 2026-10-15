@@ -1,11 +1,9 @@
 import { DB_NAME, DB_VERSION } from "./config.js";
 
-/* Polyglot storage — vanilla IndexedDB, zero dependencies.
-   8 stores mirroring the SillyTavern-lite model:
-   characters, personas, chats, messages (compound chat_time index),
-   lorebooks, presets (model presets), providers (connections),
-   regex_rules (Phase 5 find/replace scripts).
-   All data stays on-device. */
+// Polyglot storage — vanilla IndexedDB, zero dependencies.
+// 10 stores: characters, personas, chats, messages (compound chat_time),
+// lorebooks, presets, providers, regex_rules, stages (Phase 6 defs),
+// chat_stage_state (Phase 6 per-chat state). All data stays on-device.
 
 let dbp = null;
 
@@ -58,6 +56,15 @@ export function openDB() {
       if (!db.objectStoreNames.contains("regex_rules")) {
         const s = db.createObjectStore("regex_rules", { keyPath: "id", autoIncrement: true });
         s.createIndex("character_id", "character_id", { unique: false });
+      }
+      if (!db.objectStoreNames.contains("stages")) {
+        const s = db.createObjectStore("stages", { keyPath: "id", autoIncrement: true });
+        s.createIndex("key", "key", { unique: true });
+      }
+      if (!db.objectStoreNames.contains("chat_stage_state")) {
+        const s = db.createObjectStore("chat_stage_state", { keyPath: "id", autoIncrement: true });
+        s.createIndex("chat_id", "chat_id", { unique: false });
+        s.createIndex("chat_stage", ["chat_id", "stage_key"], { unique: true });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -208,6 +215,12 @@ export async function deleteChat(id) {
     tx.onabort = () => reject(tx.error);
   });
   await delRec("chats", id);
+  try {
+    const states = await getByIndex("chat_stage_state", "chat_id", id);
+    for (const s of states) await delRec("chat_stage_state", s.id);
+  } catch {
+    // Pre-v4 DBs have no stage state table yet.
+  }
 }
 
 // ---------- Messages ----------
@@ -295,9 +308,91 @@ export function saveRegexRule(r) {
 
 export const deleteRegexRule = (id) => delRec("regex_rules", id);
 
+// ---------- Stages (Phase 6) ----------
+// stages: global defs {key, name, enabled:0|1, config:{...}}.
+// chat_stage_state: per-chat {chat_id, stage_key, state:{...}, settings:{...}}.
+export async function listStages() {
+  try {
+    return await getAll("stages");
+  } catch {
+    return [];
+  }
+}
+
+export function saveStage(s) {
+  return putRec("stages", {
+    key: "",
+    name: "",
+    enabled: 1,
+    config: {},
+    updated_at: Date.now(),
+    ...s,
+    updated_at: Date.now()
+  });
+}
+
+export const deleteStage = (id) => delRec("stages", id);
+
+export async function getStageState(chatId, stageKey) {
+  try {
+    const db = await openDB();
+    const tx = db.transaction("chat_stage_state", "readonly");
+    const idx = tx.objectStore("chat_stage_state").index("chat_stage");
+    const row = await reqToPromise(idx.get([chatId, stageKey]));
+    return row || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveStageState(chatId, stageKey, state, settings) {
+  const prev = await getStageState(chatId, stageKey);
+  const rec = {
+    chat_id: chatId,
+    stage_key: stageKey,
+    state: state ?? {},
+    settings: settings ?? (prev?.settings || {}),
+    updated_at: Date.now()
+  };
+  if (prev?.id != null) rec.id = prev.id;
+  return putRec("chat_stage_state", rec);
+}
+
+export async function listStageStates(chatId) {
+  try {
+    if (chatId == null) return await getAll("chat_stage_state");
+    return await getByIndex("chat_stage_state", "chat_id", chatId);
+  } catch {
+    return [];
+  }
+}
+
+export async function seedStagesIfEmpty() {
+  let rows = [];
+  try {
+    rows = await getAll("stages");
+  } catch {
+    return;
+  }
+  if (rows.length) return;
+  const defs = [
+    { key: "director", name: "Director", enabled: 1, config: {} },
+    { key: "world", name: "World State", enabled: 1, config: {} },
+    { key: "dice", name: "Dice", enabled: 1, config: {} },
+    { key: "chess", name: "Chess", enabled: 0, config: { difficulty: 2, board_scale: "M" } }
+  ];
+  for (const d of defs) {
+    try {
+      await putRec("stages", { ...d, updated_at: Date.now() });
+    } catch {
+      // Ignore per-row failures so boot never bricks on stages.
+    }
+  }
+}
+
 // ---------- Vault backup ----------
 export async function exportVaultToJSON({ includeKeys = false } = {}) {
-  const [characters, personas, chats, messages, lorebooks, presets, providers, regex_rules] = await Promise.all([
+  const [characters, personas, chats, messages, lorebooks, presets, providers, regex_rules, stages, chat_stage_state] = await Promise.all([
     getAll("characters"),
     getAll("personas"),
     getAll("chats"),
@@ -305,7 +400,9 @@ export async function exportVaultToJSON({ includeKeys = false } = {}) {
     getAll("lorebooks"),
     getAll("presets"),
     getAll("providers").catch(() => []),
-    getAll("regex_rules").catch(() => [])
+    getAll("regex_rules").catch(() => []),
+    getAll("stages").catch(() => []),
+    getAll("chat_stage_state").catch(() => [])
   ]);
   const safePresets = presets.map((p) => {
     if (includeKeys || !p.connection) return p;
@@ -317,9 +414,9 @@ export async function exportVaultToJSON({ includeKeys = false } = {}) {
   });
   return {
     app: "Polyglot",
-    version: 2,
+    version: 3,
     exported_at: new Date().toISOString(),
-    tables: { characters, personas, chats, messages, lorebooks, presets: safePresets, providers: safeProviders, regex_rules }
+    tables: { characters, personas, chats, messages, lorebooks, presets: safePresets, providers: safeProviders, regex_rules, stages, chat_stage_state }
   };
 }
 
@@ -327,8 +424,8 @@ export async function importVaultFromJSON(data, { merge = false } = {}) {
   if (!data || typeof data !== "object" || !data.tables) {
     throw new Error("E_VAULT_SHAPE: not a Polyglot vault file (missing tables).");
   }
-  // regex_rules + providers are optional so pre-v1.5 vaults still import cleanly.
-  const names = ["characters", "personas", "chats", "messages", "lorebooks", "presets", "providers", "regex_rules"];
+  // regex_rules + providers + stages are optional so older vaults still import.
+  const names = ["characters", "personas", "chats", "messages", "lorebooks", "presets", "providers", "regex_rules", "stages", "chat_stage_state"];
   for (const n of names) {
     if (data.tables[n] !== undefined && !Array.isArray(data.tables[n])) {
       throw new Error(`E_VAULT_TABLE: vault table "${n}" is corrupt (expected array).`);

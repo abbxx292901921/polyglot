@@ -92,8 +92,12 @@ body {
 .msg p:last-child { margin-bottom: 0; }
 .msg .action { color: var(--action); font-style: italic; }
 .msg .dialogue { color: var(--dialogue); font-weight: 600; }
+.msg .choice { color: var(--dialogue); font-weight: 700; }
 .msg strong { font-weight: 700; }
 .msg em { font-style: italic; }
+.msg code { background: rgba(0,0,0,0.3); padding: 1px 5px; border-radius: 4px; font-family: ui-monospace, monospace; font-size: 0.9em; }
+.msg a { color: var(--accent); text-decoration: underline; }
+.msg del { opacity: 0.6; }
 
 /* Composer — docked above keyboard */
 #composer {
@@ -288,7 +292,40 @@ details.thought .thought-body { padding: 6px 10px 10px; font-size: 13px; color: 
   #tabs { justify-content: center; }
 }
 
-/* Branch bar: off-branch banner + tap-to-jump tree graph. */
+/* Full-screen chat graph modal. */
+.graph-sheet { width: min(96vw, 900px); height: 88vh; height: 88dvh; }
+.graph-hint { padding: 8px 12px 0; font-size: 13px; color: var(--muted); }
+.graph-preview { margin: 8px 12px 0; font-size: 13px; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; max-height: 64px; overflow: hidden; }
+.graph-preview .who { font-size: 12px; color: var(--muted); margin-bottom: 2px; }
+.graph-view { flex: 1; min-height: 0; overflow: hidden; touch-action: none; cursor: grab; margin-top: 8px; border-top: 1px solid var(--line); }
+.graph-view:active { cursor: grabbing; }
+.graph-view svg { display: block; width: 100%; height: 100%; }
+.graph-bar { display: flex; gap: 8px; padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); border-top: 1px solid var(--line); overflow-x: auto; }
+.graph-bar .btn { flex: 1; white-space: nowrap; padding: 8px 6px; }
+.gn-edge { stroke: var(--line); stroke-width: 2; }
+.gn-edge.on { stroke: var(--accent); }
+.gn-dot { stroke-width: 2; cursor: pointer; }
+.gn-dot.gn-user { fill: var(--accent); stroke: var(--accent); }
+.gn-dot.gn-asst { fill: var(--dialogue); stroke: var(--dialogue); }
+.gn-dot.dim { fill: transparent; }
+.gn-dot.gn-user.dim, .gn-dot.gn-asst.dim { stroke: var(--muted); }
+.gn-dot.leaf { stroke: var(--ink); stroke-width: 3.5; }
+.gn-dot.sel { stroke: var(--ink); stroke-width: 3.5; }
+.gn-run { cursor: pointer; }
+.gn-run rect { fill: var(--panel); stroke: var(--muted); stroke-width: 2; }
+.gn-run.on rect { stroke: var(--accent); }
+.gn-run text { fill: var(--muted); font-size: 12px; text-anchor: middle; }
+.gn-run.on text { fill: var(--accent); }
+
+/* Slim graph entry row above the transcript. */
+.graph-open-row { display: flex; justify-content: flex-end; padding: 6px 12px 0; }
+@media (min-width: 760px) {
+  .graph-open-row { max-width: 720px; margin: 0 auto; width: 100%; }
+}
+.graph-open-row button { background: transparent; color: var(--muted); border: 1px solid var(--line); border-radius: 8px; font-size: 12px; padding: 3px 9px; cursor: pointer; }
+.graph-open-row button:hover { color: var(--ink); border-color: var(--accent); }
+
+/* Branch bar: off-branch banner above the transcript. */
 #branchbar[hidden] { display: none; }
 #branchbar { padding: 6px 12px 0; font-size: 13px; color: var(--muted); }
 @media (min-width: 760px) {
@@ -297,14 +334,6 @@ details.thought .thought-body { padding: 6px 10px 10px; font-size: 13px; color: 
 .branch-banner { display: flex; align-items: center; gap: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; margin-bottom: 6px; }
 .branch-banner button { background: transparent; color: var(--muted); border: 1px solid var(--line); border-radius: 8px; font-size: 12px; padding: 3px 9px; cursor: pointer; margin-left: auto; }
 .branch-banner button:hover { color: var(--ink); border-color: var(--accent); }
-details.branch-tree { border: 1px solid var(--line); border-radius: 10px; margin-bottom: 6px; }
-details.branch-tree summary { cursor: pointer; padding: 6px 10px; font-size: 13px; color: var(--muted); }
-.branch-scroll { max-height: 180px; overflow: auto; padding: 4px 6px 8px; }
-.bn-edge { stroke: var(--line); stroke-width: 1.5; }
-.bn-edge.on { stroke: var(--accent); }
-.bn-dot { fill: transparent; stroke: var(--muted); stroke-width: 1.5; }
-.bn-dot.on { fill: var(--accent); stroke: var(--accent); }
-.bn-dot.leaf { stroke: var(--ink); stroke-width: 2.5; }
 
 /* Starter picker options. */
 .starter-opt { display: flex; flex-direction: column; gap: 4px; width: 100%; text-align: left; background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; font-size: 14px; cursor: pointer; }
@@ -316,3 +345,8 @@ details.branch-tree summary { cursor: pointer; padding: 6px 10px; font-size: 13p
 .altrow .nm { font-size: 12px; color: var(--muted); }
 .altrow textarea { grid-column: 1; background: var(--bg2); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font: inherit; font-size: 14px; }
 .altrow .x { grid-column: 2; grid-row: 1 / span 2; align-self: start; background: transparent; border: 0; color: var(--muted); font-size: 16px; cursor: pointer; padding: 2px 6px; }
+
+/* Phase 6: stages + forge. */
+.board-pre { background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; overflow-x: auto; font-size: 13px; line-height: 1.4; }
+.stage-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.stage-chips .chip { font-size: 12px; border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; color: var(--muted); background: var(--panel); }

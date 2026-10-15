@@ -1,10 +1,10 @@
 // Polyglot — single source of truth for version + defaults.
 // Phase 2/3 modules import from here so a preset change is one edit.
-export const APP_VERSION = "v1.5.3";
+export const APP_VERSION = "v1.6.0";
 
-export const CACHE_NAME = "polyglot-v1.5.3";
+export const CACHE_NAME = "polyglot-v1.6.0";
 export const DB_NAME = "PolyglotDB";
-export const DB_VERSION = 3;
+export const DB_VERSION = 4;
 
 export const DEFAULT_PROVIDER = {
   name: "Default",

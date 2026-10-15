@@ -1,5 +1,7 @@
 import { APP_VERSION, DEFAULT_CONNECTION, DEFAULT_PROVIDER, DEFAULT_SAMPLERS, DEFAULT_PROMPTS, THEMES } from "./config.js";
 import { applyRules, compileRule, cleanFlags } from "./regex-engine.js";
+import { STAGE_KEYS, STAGE_META, normalizeToggles, defaultStageToggles, parseDirector, directorBlocks, parseDice, diceBlocks, defaultWorldState, normalizeWorld, applyWorldCommand, formatWorldSheet, worldBlocks, defaultChessState, normalizeChess, parseChessTriggers, chessBlocks, renderBoardText, startChessGame, playChessTurn, forfeitChess, buildStageBlocks } from "./stages.js";
+import { SUPERVISOR_ACTIONS, parseSupervisorReply, validateAction, normalizeAction, describeAction, buildSupervisorPrompt, localDraftCharacter, localPolishCharacter } from "./supervisor.js";
 import {
   openDB,
   listCharacters,
@@ -28,6 +30,12 @@ import {
   listAllRegexRules,
   saveRegexRule,
   deleteRegexRule,
+  listStages,
+  saveStage,
+  getStageState,
+  saveStageState,
+  listStageStates,
+  seedStagesIfEmpty,
   exportVaultToJSON,
   importVaultFromJSON,
   seedIfEmpty
@@ -73,8 +81,10 @@ let edAvatar = null;
 let edLore = [];
 let edAlts = [];
 let edExtra = {};
-// Branch graph panel: null = auto (opens once a real fork exists).
-let graphOpen = null;
+// Persona editor draft state (modal). Null id = new persona.
+let edPersonaId = null;
+// Full-screen chat graph state. Null = modal closed.
+let graphState = null;
 
 export function triggerHaptic(ms = 10) {
   try {
@@ -128,15 +138,32 @@ function escapeHtml(s) {
 }
 
 // Escape first (XSS-safe even for hostile card text), then light markdown:
-// **bold**, *action* (muted italic), "dialogue" (bright). Paragraphs preserved.
+// **bold**, *action* (muted italic), "dialogue" (bright), `code`, [[choices]],
+// [links](url), bare URLs, <font color="..."> passthrough. Paragraphs preserved.
 export function renderRich(text) {
   const paras = escapeHtml(text).split(/\n{2,}/);
   return paras
     .map((p) => {
+      const codes = [];
       let h = p.replace(/\n/g, "<br>");
+      h = h.replace(/`([^`\n]+)`/g, (_, code) => {
+        codes.push(code);
+        return `\u0000${codes.length - 1}\u0000`;
+      });
       h = h.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
       h = h.replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em class="action">*$2*</em>');
+      h = h.replace(/(^|[\s(])_([^_\n]+)_(?![a-zA-Z0-9_])/g, "$1<em>$2</em>");
+      h = h.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+      h = h.replace(/\[\[([^\[\]]+)\]\]/g, '<span class="choice">[[$1]]</span>');
+      h = h.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+      h = h.replace(/(^|[\s(])((?:https?:\/\/)[^\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
       h = h.replace(/&quot;([^&\n]+)&quot;/g, '<span class="dialogue">&quot;$1&quot;</span>');
+      h = h.replace(/&lt;font\s+color=(?:&quot;([^&]*)&quot;|&#39;([^&]*)&#39;)&gt;/gi, (m, dq, sq) => {
+        const c = dq !== undefined ? dq : sq;
+        return `<font color="${c}">`;
+      });
+      h = h.replace(/&lt;\/font&gt;/gi, "</font>");
+      h = h.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${codes[i]}</code>`);
       return `<p>${h}</p>`;
     })
     .join("");
@@ -490,7 +517,7 @@ function clearBranchbar() {
   bar.hidden = true;
 }
 
-// Slim bar above the transcript: off-branch banner + tap-to-jump tree.
+// Slim bar above the transcript: off-branch banner + graph entry button.
 function renderBranchbar(rows, chain, pathIds, { leafId, latestId, hidden }) {
   const bar = $("#branchbar");
   if (!bar) return;
@@ -499,87 +526,389 @@ function renderBranchbar(rows, chain, pathIds, { leafId, latestId, hidden }) {
     bar.hidden = true;
     return;
   }
-  const offBranch = leafId !== latestId;
-  if (!offBranch && !hidden) {
-    bar.hidden = true;
-    return;
-  }
   bar.hidden = false;
-  const banner = document.createElement("div");
-  banner.className = "branch-banner";
-  const info = document.createElement("span");
-  info.textContent = offBranch
-    ? `On a branch — ${hidden} later message${hidden === 1 ? "" : "s"} on other branches hidden.`
-    : `${hidden} message${hidden === 1 ? "" : "s"} on other branches.`;
-  banner.append(info);
-  if (offBranch) {
-    banner.append(actionButton("Latest ▶", "Jump to the newest message", () =>
-      setActiveLeaf(ui.chatId, latestId)));
+  const offBranch = leafId !== latestId;
+  if (offBranch || hidden) {
+    const banner = document.createElement("div");
+    banner.className = "branch-banner";
+    const info = document.createElement("span");
+    info.textContent = offBranch
+      ? `On a branch — ${hidden} later message${hidden === 1 ? "" : "s"} on other branches hidden.`
+      : `${hidden} message${hidden === 1 ? "" : "s"} on other branches.`;
+    banner.append(info);
+    if (offBranch) {
+      banner.append(actionButton("Latest ▶", "Jump to the newest message", () =>
+        setActiveLeaf(ui.chatId, latestId)));
+    }
+    bar.append(banner);
   }
-  bar.append(banner);
-  renderBranchGraph(bar, rows, pathIds, leafId);
+  const grow = document.createElement("div");
+  grow.className = "graph-open-row";
+  const gb = document.createElement("button");
+  gb.type = "button";
+  gb.textContent = `⑂ Graph (${rows.length})`;
+  gb.title = "Open the full chat graph";
+  gb.addEventListener("click", openGraph);
+  grow.append(gb);
+  bar.append(grow);
 }
 
-function renderBranchGraph(bar, rows, pathIds, leafId) {
-  const { nodes, maxDepth } = treeLayout(rows);
-  if (nodes.length < 2) return;
+// Collapse straight message runs into pills so long linear chats stay
+// readable: [{ids, role, count}]. Fork nodes always stand alone.
+function collapseRuns(rows) {
   const kids = childrenMap(rows);
-  let forks = 0;
-  for (const [, k] of kids) if (k.length > 1) forks++;
-  const det = document.createElement("details");
-  det.className = "branch-tree";
-  det.open = graphOpen ?? forks > 0;
-  det.addEventListener("toggle", () => { graphOpen = det.open; });
-  const sum = document.createElement("summary");
-  sum.textContent = `⑂ Tree: ${nodes.length} message${nodes.length === 1 ? "" : "s"}${forks ? `, ${forks} fork${forks === 1 ? "" : "s"}` : ""} — tap a dot to jump`;
-  det.append(sum);
-  const NS = "http://www.w3.org/2000/svg";
-  const rowH = 16;
-  const colW = 20;
-  const pad = 10;
-  const maxLane = nodes.reduce((a, n) => Math.max(a, n.lane), 0);
-  const svg = document.createElementNS(NS, "svg");
-  svg.setAttribute("width", String(pad * 2 + maxDepth * colW + 8));
-  svg.setAttribute("height", String(pad * 2 + maxLane * rowH + 8));
-  svg.setAttribute("role", "img");
   const pmap = parentMap(rows);
-  const byId = new Map(rows.map((m) => [m.id, m]));
-  const X = (d) => pad + 4 + d * colW;
-  const Y = (l) => pad + 4 + l * rowH;
-  for (const n of nodes) {
-    const p = pmap.get(n.id);
-    if (p != null) {
-      const pn = nodes.find((x) => x.id === p);
-      if (pn) {
-        const ln = document.createElementNS(NS, "line");
-        ln.setAttribute("x1", X(pn.depth));
-        ln.setAttribute("y1", Y(pn.lane));
-        ln.setAttribute("x2", X(n.depth));
-        ln.setAttribute("y2", Y(n.lane));
-        ln.setAttribute("class", "bn-edge" + (pathIds.has(n.id) && pathIds.has(p) ? " on" : ""));
-        svg.append(ln);
-      }
+  const orderedKids = (id) => [...(kids.get(id) || [])]
+    .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0) || a.id - b.id);
+  const roots = rows
+    .filter((m) => pmap.get(m.id) == null)
+    .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0) || a.id - b.id);
+  const runs = [];
+  const consumed = new Set();
+  const queue = [...(roots.length ? roots : [...rows].sort((a, b) => a.id - b.id).slice(0, 1))];
+  const seen = new Set(queue.map((m) => m.id));
+  while (queue.length) {
+    const m = queue.shift();
+    for (const k of orderedKids(m.id)) {
+      if (!seen.has(k.id)) { seen.add(k.id); queue.push(k); }
+    }
+    if (consumed.has(m.id)) continue;
+    const p = pmap.get(m.id);
+    // A run starts at roots and at children of forks. Anything else was
+    // already consumed by the run above it.
+    if (p != null && orderedKids(p).length === 1) continue;
+    const run = [m];
+    consumed.add(m.id);
+    let cur = m;
+    for (;;) {
+      const ck = orderedKids(cur.id);
+      if (ck.length !== 1) break;
+      const nxt = ck[0];
+      run.push(nxt);
+      consumed.add(nxt.id);
+      cur = nxt;
+      if ((kids.get(nxt.id) || []).length !== 1) break;
+    }
+    runs.push(run);
+  }
+  // Orphan rows unreachable from any root (should not happen — parentMap
+  // falls back to time order) still get rendered rather than dropped.
+  for (const m of rows) {
+    if (!consumed.has(m.id)) runs.push([m]);
+  }
+  return runs.map((ids) => ({ ids: ids.map((m) => m.id), role: ids[0].role, count: ids.length }));
+}
+
+function openGraph() {
+  if (ui.chatId == null) return;
+  graphState = {
+    collapsed: true, horizontal: false, selectedId: null,
+    k: 1, px: 0, py: 0, bbox: null, items: [], needsFit: true
+  };
+  $("#graph-modal").hidden = false;
+  renderGraph().catch((e) => logErr("E_UI_GRAPH", e.message));
+}
+
+function closeGraph() {
+  $("#graph-modal").hidden = true;
+  graphState = null;
+}
+
+function graphFit() {
+  const st = graphState;
+  const view = $("#graph-view");
+  if (!st || !view) return;
+  const w = view.clientWidth || 300;
+  const h = view.clientHeight || 300;
+  const b = st.bbox;
+  if (!b || b.w <= 0 || b.h <= 0) {
+    st.k = 1; st.px = w / 2; st.py = h / 2;
+    return;
+  }
+  st.k = Math.max(0.2, Math.min(w / (b.w + 60), h / (b.h + 60), 1.6));
+  st.px = (w - b.w * st.k) / 2 - b.x * st.k;
+  st.py = (h - b.h * st.k) / 2 - b.y * st.k;
+}
+
+function graphApplyTransform() {
+  const st = graphState;
+  const g = $("#graph-g");
+  if (!st || !g) return;
+  g.setAttribute("transform", `translate(${st.px},${st.py}) scale(${st.k})`);
+}
+
+function graphShowPreview(msgId) {
+  const st = graphState;
+  const prev = $("#graph-preview");
+  if (!st || !prev) return;
+  const m = st.byId.get(msgId);
+  if (!m) {
+    prev.hidden = true;
+    prev.innerHTML = "";
+    return;
+  }
+  prev.hidden = false;
+  prev.innerHTML = "";
+  const who = document.createElement("div");
+  who.className = "who";
+  who.textContent = m.role === "user" ? "You" : (st.chName || "AI");
+  prev.append(who);
+  const body = document.createElement("div");
+  body.textContent = String(m.content || "").replace(/\s+/g, " ").slice(0, 160);
+  prev.append(body);
+}
+
+async function renderGraph() {
+  const st = graphState;
+  if (!st || ui.chatId == null) return;
+  const { rows, chain, pathIds, leafId } = await getChatChain(ui.chatId);
+  const chars = await listCharacters();
+  const ch = chars.find((c) => c.id === ui.characterId);
+  st.chName = ch?.name || "AI";
+  st.byId = new Map(rows.map((m) => [m.id, m]));
+  st.pathIds = pathIds;
+  st.leafId = leafId;
+  if (st.selectedId != null && !st.byId.has(st.selectedId)) st.selectedId = null;
+  const { nodes } = treeLayout(rows);
+  const pos = new Map(nodes.map((n) => [n.id, n]));
+  const DX = 46;
+  const DY = 42;
+  const items = [];
+  const runs = st.collapsed ? collapseRuns(rows) : rows.map((m) => ({ ids: [m.id], role: m.role, count: 1 }));
+  for (const run of runs) {
+    const first = pos.get(run.ids[0]);
+    const last = pos.get(run.ids[run.ids.length - 1]);
+    if (!first || !last) continue;
+    // Pill sits at the run's midpoint so edges stay attached.
+    const d = (first.depth + last.depth) / 2;
+    const l = (first.lane + last.lane) / 2;
+    items.push({
+      ...run,
+      x: st.horizontal ? d * DX : l * DX,
+      y: st.horizontal ? l * DY : d * DY
+    });
+  }
+  // Edges link run endpoints: parent run -> child run via the actual
+  // parent pointer of the child's first message.
+  const pmap = parentMap(rows);
+  const runOf = new Map();
+  for (const it of items) for (const id of it.ids) runOf.set(id, it);
+  const edges = [];
+  const seenEdge = new Set();
+  for (const it of items) {
+    const firstId = it.ids[0];
+    const p = pmap.get(firstId);
+    if (p == null) continue;
+    const pit = runOf.get(p);
+    if (!pit || pit === it) continue;
+    const key = `${pit.ids[pit.ids.length - 1]}>${firstId}`;
+    if (seenEdge.has(key)) continue;
+    seenEdge.add(key);
+    edges.push({ a: pit, b: it, on: pathIds.has(firstId) && pathIds.has(p) });
+  }
+  let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+  for (const it of items) {
+    minx = Math.min(minx, it.x); miny = Math.min(miny, it.y);
+    maxx = Math.max(maxx, it.x); maxy = Math.max(maxy, it.y);
+  }
+  if (!items.length) {
+    st.bbox = null;
+  } else {
+    st.bbox = { x: minx, y: miny, w: Math.max(1, maxx - minx), h: Math.max(1, maxy - miny) };
+  }
+  st.items = items;
+  if (st.bbox == null || st.needsFit) {
+    st.needsFit = false;
+    graphFit();
+  }
+
+  const NS = "http://www.w3.org/2000/svg";
+  const view = $("#graph-view");
+  view.innerHTML = "";
+  const svg = document.createElementNS(NS, "svg");
+  const g = document.createElementNS(NS, "g");
+  g.id = "graph-g";
+  for (const e of edges) {
+    const ln = document.createElementNS(NS, "line");
+    ln.setAttribute("x1", e.a.x); ln.setAttribute("y1", e.a.y);
+    ln.setAttribute("x2", e.b.x); ln.setAttribute("y2", e.b.y);
+    ln.setAttribute("class", "gn-edge" + (e.on ? " on" : ""));
+    g.append(ln);
+  }
+  for (const it of items) {
+    const lastId = it.ids[it.ids.length - 1];
+    if (it.count > 1) {
+      const grp = document.createElementNS(NS, "g");
+      grp.setAttribute("class", "gn-run" + (it.ids.some((id) => pathIds.has(id)) ? " on" : ""));
+      grp.dataset.mid = String(lastId);
+      const r = document.createElementNS(NS, "rect");
+      r.setAttribute("x", it.x - 19); r.setAttribute("y", it.y - 12);
+      r.setAttribute("width", "38"); r.setAttribute("height", "24");
+      r.setAttribute("rx", "12");
+      const t = document.createElementNS(NS, "text");
+      t.setAttribute("x", it.x); t.setAttribute("y", it.y + 4);
+      t.textContent = `×${it.count}`;
+      const tip = document.createElementNS(NS, "title");
+      tip.textContent = `${it.count} messages — tap to load through here`;
+      grp.append(r, t, tip);
+      g.append(grp);
+    } else {
+      const c = document.createElementNS(NS, "circle");
+      c.setAttribute("cx", it.x); c.setAttribute("cy", it.y);
+      c.setAttribute("r", lastId === leafId ? "10" : "8");
+      c.dataset.mid = String(lastId);
+      const m = st.byId.get(lastId);
+      c.setAttribute("class", "gn-dot gn-" + (it.role === "user" ? "user" : "asst")
+        + (pathIds.has(lastId) ? "" : " dim")
+        + (lastId === leafId ? " leaf" : "")
+        + (lastId === st.selectedId ? " sel" : ""));
+      const tip = document.createElementNS(NS, "title");
+      tip.textContent = `${it.role === "user" ? "You" : st.chName}: ${String(m?.content || "").replace(/\s+/g, " ").slice(0, 80)}`;
+      c.append(tip);
+      g.append(c);
+      // Fat transparent hit area for thumbs.
+      const hit = document.createElementNS(NS, "circle");
+      hit.setAttribute("cx", it.x); hit.setAttribute("cy", it.y);
+      hit.setAttribute("r", "22");
+      hit.setAttribute("fill", "transparent");
+      hit.dataset.mid = String(lastId);
+      g.append(hit);
     }
   }
-  for (const n of nodes) {
-    const m = byId.get(n.id);
-    const c = document.createElementNS(NS, "circle");
-    c.setAttribute("cx", X(n.depth));
-    c.setAttribute("cy", Y(n.lane));
-    c.setAttribute("r", n.id === leafId ? "5.5" : "4");
-    c.setAttribute("class", `bn-dot bn-${n.role === "user" ? "user" : "asst"}${pathIds.has(n.id) ? " on" : ""}${n.id === leafId ? " leaf" : ""}`);
-    c.style.cursor = "pointer";
-    const tip = document.createElementNS(NS, "title");
-    tip.textContent = `${n.role === "user" ? "You" : "AI"}: ${String(m?.content || "").replace(/\s+/g, " ").slice(0, 80)}`;
-    c.append(tip);
-    c.addEventListener("click", () => setActiveLeaf(ui.chatId, n.id));
-    svg.append(c);
+  svg.append(g);
+  view.append(svg);
+  graphApplyTransform();
+  graphShowPreview(st.selectedId ?? leafId);
+  graphWireGestures(view);
+  const cb = $("#btn-graph-collapse");
+  if (cb) cb.textContent = st.collapsed ? "Expand" : "Collapse";
+}
+
+// Pan (drag), pinch-zoom, wheel-zoom, and tap-to-load on nodes. Wired once
+// per modal element; always acts on the live graphState (the modal can be
+// closed and reopened, which replaces the state object).
+function graphWireGestures(view) {
+  if (!graphState || view.dataset.wired === "1") return;
+  view.dataset.wired = "1";
+  const pts = new Map();
+  let pinchD = 0;
+  let moved = 0;
+  const midOf = (e) => {
+    const t = e.target;
+    return t && t.dataset && t.dataset.mid ? Number(t.dataset.mid) : null;
+  };
+  view.addEventListener("pointerdown", (e) => {
+    view.setPointerCapture?.(e.pointerId);
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    moved = 0;
+    if (pts.size === 2) {
+      const [a, b] = [...pts.values()];
+      pinchD = Math.hypot(a.x - b.x, a.y - b.y);
+    }
+  });
+  view.addEventListener("pointermove", (e) => {
+    const st = graphState;
+    if (!st || !pts.has(e.pointerId)) return;
+    const prev = pts.get(e.pointerId);
+    const dx = e.clientX - prev.x;
+    const dy = e.clientY - prev.y;
+    moved += Math.abs(dx) + Math.abs(dy);
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pts.size === 2) {
+      const [a, b] = [...pts.values()];
+      const d = Math.hypot(a.x - b.x, a.y - b.y);
+      if (pinchD > 0 && d > 0) {
+        const rect = view.getBoundingClientRect();
+        const mx = (a.x + b.x) / 2 - rect.left;
+        const my = (a.y + b.y) / 2 - rect.top;
+        const k2 = Math.max(0.2, Math.min(4, st.k * d / pinchD));
+        st.px = mx - (mx - st.px) * (k2 / st.k);
+        st.py = my - (my - st.py) * (k2 / st.k);
+        st.k = k2;
+        graphApplyTransform();
+      }
+      pinchD = d;
+      return;
+    }
+    if (pts.size === 1) {
+      st.px += dx;
+      st.py += dy;
+      graphApplyTransform();
+    }
+  });
+  const up = async (e) => {
+    const st = graphState;
+    const wasTap = moved < 10 && pts.size <= 1;
+    const mid = midOf(e);
+    pts.delete(e.pointerId);
+    if (pts.size < 2) pinchD = 0;
+    if (st && wasTap && mid != null && ui.chatId != null) {
+      st.selectedId = mid;
+      try {
+        await setActiveLeaf(ui.chatId, mid);
+      } catch (err) {
+        logErr("E_UI_GRAPH", err.message);
+      }
+      if (graphState === st) await renderGraph();
+    }
+  };
+  view.addEventListener("pointerup", up);
+  view.addEventListener("pointercancel", (e) => { pts.delete(e.pointerId); pinchD = 0; });
+  view.addEventListener("wheel", (e) => {
+    const st = graphState;
+    if (!st) return;
+    e.preventDefault();
+    const rect = view.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const k2 = Math.max(0.2, Math.min(4, st.k * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
+    st.px = mx - (mx - st.px) * (k2 / st.k);
+    st.py = my - (my - st.py) * (k2 / st.k);
+    st.k = k2;
+    graphApplyTransform();
+  }, { passive: false });
+}
+
+// Fork the selected (or current) node into a brand-new chat carrying that
+// path's history, then open it.
+async function forkChatFromGraph() {
+  const st = graphState;
+  if (!st || ui.chatId == null) return;
+  const target = st.selectedId ?? st.leafId;
+  if (target == null) return;
+  const { rows } = await getChatChain(ui.chatId);
+  const path = activeChain(rows, target);
+  if (!path.length) return;
+  const id = await saveChat({
+    character_id: ui.characterId,
+    persona_id: ui.personaId,
+    title: `Fork ${new Date().toLocaleString()}`
+  });
+  let parent = null;
+  for (const m of path) {
+    parent = await saveMessage({
+      chat_id: id,
+      role: m.role,
+      content: m.content,
+      reasoning_content: m.reasoning_content || "",
+      swipe_group_id: m.swipe_group_id || null,
+      swipe_active: m.swipe_active || null,
+      parent_id: parent,
+      timestamp: m.timestamp || Date.now()
+    });
   }
-  const wrap = document.createElement("div");
-  wrap.className = "branch-scroll";
-  wrap.append(svg);
-  det.append(wrap);
-  bar.append(det);
+  await saveChat({
+    id,
+    character_id: ui.characterId,
+    persona_id: ui.personaId,
+    active_leaf_id: parent,
+    title: `Fork ${new Date().toLocaleString()}`
+  });
+  ui.chatId = id;
+  persistUI();
+  await refreshLibrary();
+  closeGraph();
+  await renderCurrentChat();
 }
 
 function actionButton(label, title, fn) {
@@ -830,7 +1159,7 @@ async function refreshLibrary() {
     const nm = document.createElement("span");
     nm.className = "nm";
     nm.textContent = `${p.name}${p.is_default ? " ★" : ""}`;
-    nm.title = "Tap to switch";
+    nm.title = p.description?.trim() ? p.description.trim() : "Tap to switch";
     nm.style.cursor = "pointer";
     nm.addEventListener("click", async () => {
       ui.personaId = p.id;
@@ -840,6 +1169,12 @@ async function refreshLibrary() {
       await renderCurrentChat();
     });
     row.append(nm);
+    const ed = document.createElement("button");
+    ed.className = "x";
+    ed.textContent = "✎";
+    ed.setAttribute("aria-label", `Edit ${p.name}`);
+    ed.addEventListener("click", () => openPersonaEditor(p.id));
+    row.append(ed);
     if (personas.length > 1) {
       const x = document.createElement("button");
       x.className = "x";
@@ -1242,14 +1577,48 @@ async function buildContext(pastRows, extraUserText = "") {
   if (ch?.scenario?.trim()) charSecs.push(`Scenario: ${ch.scenario.trim()}`);
   if (ch?.mes_example?.trim()) charSecs.push(`Example dialogue:\n${ch.mes_example.trim()}`);
   const charHead = charSecs.join("\n\n");
-  const sysBase = [preset?.prompts?.system || "", ch?.system_prompt?.trim() || "", charHead]
+  const meHead = me?.description?.trim()
+    ? `User persona (${(me.name || "You").trim()}): ${me.description.trim()}`
+    : "";
+  const sysBase = [preset?.prompts?.system || "", meHead, ch?.system_prompt?.trim() || "", charHead]
     .filter((s) => s && s.trim()).join("\n\n");
+  // Phase 6: stage blocks (director/world/dice/chess) as system messages after lore.
+  let stageBlocks = [];
+  try {
+    if (ui.chatId != null) {
+      const [defs, states] = await Promise.all([listStages().catch(() => []), listStageStates(ui.chatId).catch(() => [])]);
+      const toggles = defaultStageToggles();
+      for (const d of (defs || [])) {
+        if (d && d.key && toggles[d.key] !== undefined) toggles[d.key] = d.enabled ? 1 : 0;
+      }
+      try {
+        const all = await listChats();
+        const cur = all.find((c) => c.id === ui.chatId);
+        if (cur && cur.stages && typeof cur.stages === "object") {
+          const nt = normalizeToggles(cur.stages);
+          for (const k of STAGE_KEYS) toggles[k] = nt[k];
+        }
+      } catch {
+        // Per-chat override is optional; globals stand.
+      }
+      const stateMap = {};
+      for (const s of (states || [])) {
+        if (s && s.stage_key) stateMap[s.stage_key] = s.state || {};
+      }
+      stageBlocks = buildStageBlocks({ toggles, states: stateMap, lastUserText: extraUserText || recent || "" });
+    }
+  } catch (e) {
+    try { logWarn("E_STAGE_STATE", "stage inject skipped: " + (e?.message || e)); } catch { /* noop */ }
+    stageBlocks = [];
+  }
   const built = buildMessages({
     system: sysBase,
     jailbreak: preset?.prompts?.jailbreak || "",
     authorsNote: preset?.prompts?.authors_note || "",
     authorsNoteDepth: preset?.prompts?.authors_note_depth ?? 2,
     loreEntries: flatLore,
+    activeLore: null,
+    stageBlocks,
     recentText: recent,
     history,
     prefill: preset?.prompts?.prefill_enabled ? preset.prompts.prefill_text || "*" : null,
@@ -1320,6 +1689,82 @@ async function touchChatById(chatId, titleHint = "") {
   await touchChat(chat);
 }
 
+// Phase 6: deterministic stage pre-pass on the fresh user text. Never fatal.
+async function runStagePrepass(chatId, userText) {
+  try {
+    const text = String(userText || "");
+    if (!text.trim() || chatId == null) return;
+    const [defs, states] = await Promise.all([listStages().catch(() => []), listStageStates(chatId).catch(() => [])]);
+    const toggles = defaultStageToggles();
+    for (const d of (defs || [])) {
+      if (d && d.key && toggles[d.key] !== undefined) toggles[d.key] = d.enabled ? 1 : 0;
+    }
+    try {
+      const all = await listChats();
+      const cur = all.find((c) => c.id === chatId);
+      if (cur && cur.stages && typeof cur.stages === "object") {
+        const nt = normalizeToggles(cur.stages);
+        for (const k of STAGE_KEYS) toggles[k] = nt[k];
+      }
+    } catch { /* optional override */ }
+    const byKey = {};
+    for (const s of (states || [])) {
+      if (s && s.stage_key) byKey[s.stage_key] = s;
+    }
+    if (toggles.world) {
+      const cur = normalizeWorld(byKey.world?.state);
+      const upd = applyWorldCommand(cur, text);
+      if (upd.changed) {
+        await saveStageState(chatId, "world", upd.world, byKey.world?.settings || {});
+        try { logInfo("E_STAGE_STATE", "world updated: " + upd.applied.slice(0, 3).join(", ")); } catch { /* noop */ }
+      }
+    }
+    if (toggles.director) {
+      const pd = parseDirector(text);
+      if (pd.longterm.length) {
+        const prev = (byKey.director?.state && typeof byKey.director.state.persistent === "string")
+          ? byKey.director.state.persistent
+          : "";
+        const merged = (prev ? prev + "\n" : "") + pd.longterm.join("\n");
+        await saveStageState(chatId, "director", { persistent: merged.slice(0, 2000) }, byKey.director?.settings || {});
+      }
+    }
+    if (toggles.chess) {
+      let cs = normalizeChess(byKey.chess?.state);
+      const trig = parseChessTriggers(text, cs);
+      if (trig.kind === "start") {
+        cs = startChessGame(cs.difficulty);
+        await saveStageState(chatId, "chess", cs, byKey.chess?.settings || {});
+        try { logInfo("E_STAGE_STATE", "chess started"); } catch { /* noop */ }
+      } else if (trig.kind === "move" && trig.moves && trig.moves.length) {
+        for (const mv of trig.moves) {
+          const r = playChessTurn(cs, mv.from, mv.to, mv.promo);
+          if (r.ok) cs = r.state;
+        }
+        await saveStageState(chatId, "chess", cs, byKey.chess?.settings || {});
+      } else if (trig.kind === "forfeit") {
+        cs = forfeitChess(cs);
+        await saveStageState(chatId, "chess", cs, byKey.chess?.settings || {});
+      }
+    }
+  } catch (e) {
+    try { logWarn("E_STAGE_STATE", "prepass skipped: " + (e?.message || e)); } catch { /* noop */ }
+  }
+}
+
+// Persist [[persistent]] director notes found in an assistant reply. History untouched.
+async function runStagePostpass(chatId, assistantText) {
+  try {
+    if (!assistantText || chatId == null) return;
+    const pd = parseDirector(assistantText);
+    if (!pd.longterm.length) return;
+    const prev = await getStageState(chatId, "director").catch(() => null);
+    const old = (prev && prev.state && typeof prev.state.persistent === "string") ? prev.state.persistent : "";
+    const merged = (old ? old + "\n" : "") + pd.longterm.join("\n");
+    await saveStageState(chatId, "director", { persistent: merged.slice(0, 2000) }, (prev && prev.settings) || {});
+  } catch { /* never fatal */ }
+}
+
 // Fresh assistant reply for history rows (+ optional trailing user text already saved).
 async function generateAssistant(chatId, pastRows, { groupId = null, titleHint = "" } = {}) {
   const { preset, provider, chName, built } = await buildContext(pastRows);
@@ -1353,6 +1798,7 @@ async function generateAssistant(chatId, pastRows, { groupId = null, titleHint =
       swipe_active: 1, timestamp: Date.now()
     });
     if (groupId) await setActiveSibling(chatId, groupId, id);
+    await runStagePostpass(chatId, content || "");
     await touchChatById(chatId, titleHint);
     triggerHaptic(25);
   } catch (e) {
@@ -1385,6 +1831,7 @@ async function handleSend() {
   const { chain } = await getChatChain(chatId);
   const parent = chain.length ? chain[chain.length - 1].id : null;
   await saveMessage({ chat_id: chatId, role: "user", content: text, parent_id: parent, timestamp: Date.now() });
+  await runStagePrepass(chatId, text);
   // Paint instantly (includes the new user message), then generate below it.
   await renderCurrentChat();
   const { chain: full } = await getChatChain(chatId);
@@ -1766,6 +2213,57 @@ async function handleBookImportFile(file) {
 }
 
 // ---------- Character editor + card import ----------
+function openPersonaEditor(id = null) {
+  edPersonaId = id;
+  $("#persona-title").textContent = id == null ? "New persona" : "Edit persona";
+  $("#pe-name").value = "";
+  $("#pe-desc").value = "";
+  $("#persona-status").textContent = "";
+  if (id != null) {
+    listPersonas().then((all) => {
+      const p = all.find((x) => x.id === id);
+      if (!p || edPersonaId !== id) return;
+      $("#pe-name").value = p.name || "";
+      $("#pe-desc").value = p.description || "";
+    });
+  }
+  $("#persona-modal").hidden = false;
+}
+
+function closePersonaEditor() {
+  $("#persona-modal").hidden = true;
+  edPersonaId = null;
+}
+
+async function savePersonaEditor() {
+  const name = $("#pe-name").value.trim();
+  const description = $("#pe-desc").value.trim();
+  if (!name) {
+    $("#persona-status").textContent = "Name is required.";
+    return;
+  }
+  try {
+    let id = edPersonaId;
+    if (id == null) {
+      id = await savePersona({ name, description });
+    } else {
+      const all = await listPersonas();
+      const prev = all.find((x) => x.id === id) || {};
+      await savePersona({ ...prev, name, description, id });
+    }
+    ui.personaId = id;
+    persistUI();
+    await ensureSelection();
+    await refreshLibrary();
+    await renderCurrentChat();
+    closePersonaEditor();
+    logInfo("E_UI_PERSONA", `persona saved (${name})`);
+  } catch (e) {
+    logErr("E_UI_PERSONA", e.message);
+    $("#persona-status").textContent = `Save failed: ${e.message}`;
+  }
+  refreshDiag();
+}
 function setCardStatus(msg) {
   $("#card-status").textContent = msg;
   // The drawer status is invisible when importing from the Characters tab or
@@ -2150,7 +2648,7 @@ function showView(name) {
   const bb = $("#branchbar");
   if (bb && !inChat) bb.hidden = true;
   $("#views").style.display = inChat ? "none" : "";
-  for (const v of ["home", "chars", "detail", "presets", "books", "regex"]) {
+  for (const v of ["home", "chars", "detail", "presets", "books", "regex", "stages", "forge"]) {
     const el = $(`#view-${v}`);
     if (el) el.hidden = name !== v;
   }
@@ -2160,6 +2658,8 @@ function showView(name) {
   if (name === "presets") { renderPresetCards(); renderProviderCards(); }
   if (name === "books") renderBooksView();
   if (name === "regex") renderRegexView();
+  if (name === "stages") renderStagesView();
+  if (name === "forge") renderForgeView();
   if (name === "chat") {
     renderCurrentChat();
     window.setTimeout(autogrow, 0);
@@ -2950,6 +3450,312 @@ async function handleRegexImportFile(file) {
   refreshDiag();
 }
 
+// ---------- Phase 6: Stages manager + Forge supervisor ----------
+function stageToggleRow(key, enabled, onFlip) {
+  const row = document.createElement("div");
+  row.className = "row";
+  const tx = document.createElement("span");
+  tx.className = "nm";
+  const t = document.createElement("div");
+  t.textContent = (enabled ? "" : "⏸ ") + (STAGE_META[key]?.name || key);
+  const s = document.createElement("div");
+  s.className = "csub";
+  s.textContent = STAGE_META[key]?.desc || key;
+  tx.append(t, s);
+  const b = document.createElement("button");
+  b.type = "button";
+  b.textContent = enabled ? "⏸" : "▶";
+  b.title = enabled ? "Disable stage" : "Enable stage";
+  b.addEventListener("click", onFlip);
+  row.append(tx, b);
+  return row;
+}
+
+async function currentChatToggles() {
+  const t = defaultStageToggles();
+  try {
+    const defs = await listStages().catch(() => []);
+    for (const d of (defs || [])) {
+      if (d && d.key && t[d.key] !== undefined) t[d.key] = d.enabled ? 1 : 0;
+    }
+    if (ui.chatId != null) {
+      const all = await listChats();
+      const cur = all.find((c) => c.id === ui.chatId);
+      if (cur && cur.stages && typeof cur.stages === "object") {
+        const nt = normalizeToggles(cur.stages);
+        for (const k of STAGE_KEYS) t[k] = nt[k];
+      }
+    }
+  } catch { /* defaults stand */ }
+  return t;
+}
+
+async function renderStagesView() {
+  const box = $("#stage-list");
+  if (!box) return;
+  box.innerHTML = "";
+  const toggles = await currentChatToggles();
+  const chatLabel = $("#stage-chat-label");
+  if (chatLabel) {
+    try {
+      const all = await listChats();
+      const cur = all.find((c) => c.id === ui.chatId);
+      chatLabel.textContent = cur ? ("Chat: " + (cur.title || ("#" + cur.id))) : "No chat selected — toggles edit global defaults.";
+    } catch {
+      chatLabel.textContent = "";
+    }
+  }
+  for (const k of STAGE_KEYS) {
+    const row = stageToggleRow(k, !!toggles[k], async () => {
+      const next = toggles[k] ? 0 : 1;
+      try {
+        if (ui.chatId != null) {
+          const all = await listChats();
+          const cur = all.find((c) => c.id === ui.chatId);
+          if (cur) {
+            const nt = normalizeToggles(cur.stages);
+            nt[k] = next;
+            await saveChat({ ...cur, stages: nt });
+          }
+        } else {
+          const defs = await listStages().catch(() => []);
+          const found = (defs || []).find((d) => d && d.key === k);
+          await saveStage({ ...(found || { key: k, name: STAGE_META[k]?.name || k }), enabled: next, id: found?.id });
+        }
+        logInfo("E_STAGE_RULE", "stage " + k + " " + (next ? "enabled" : "disabled"));
+      } catch (e) {
+        logErr("E_STAGE_RULE", e?.message || String(e));
+      }
+      refreshDiag();
+      await renderStagesView();
+    });
+    box.append(row);
+  }
+  // World sheet + chess board preview for the current chat.
+  const prev = $("#stage-preview");
+  if (prev) {
+    prev.innerHTML = "";
+    if (ui.chatId == null) {
+      prev.textContent = "Open a chat to preview world + board.";
+    } else {
+      try {
+        const states = await listStageStates(ui.chatId).catch(() => []);
+        const byKey = {};
+        for (const s of (states || [])) {
+          if (s && s.stage_key) byKey[s.stage_key] = s.state || {};
+        }
+        const w = normalizeWorld(byKey.world);
+        const sheet = document.createElement("div");
+        sheet.className = "card wide";
+        const h = document.createElement("strong");
+        h.textContent = "World — " + (w.location || "unknown place");
+        const p = document.createElement("div");
+        p.className = "status";
+        p.textContent = formatWorldSheet(w);
+        sheet.append(h, p);
+        prev.append(sheet);
+        const cs = normalizeChess(byKey.chess);
+        if (cs.active) {
+          const b = document.createElement("pre");
+          b.className = "board-pre";
+          b.textContent = renderBoardText(cs) + "\nFEN: " + cs.fen;
+          prev.append(b);
+        }
+      } catch { /* preview optional */ }
+    }
+  }
+}
+
+let forgeProposals = [];
+
+async function executeSupervisorAction(a) {
+  const errV = validateAction(a);
+  if (errV) throw new Error(errV);
+  const act = normalizeAction(a, ui.chatId);
+  const chars = await listCharacters();
+  const byId = (id) => chars.find((c) => c && c.id === Number(id));
+  const byName = (n) => {
+    const t = String(n || "").trim().toLowerCase();
+    return chars.find((c) => String(c.name || "").trim().toLowerCase() === t);
+  };
+  if (act.action === "create_character") {
+    const id = await saveCharacter({
+      name: String(act.name).slice(0, 80),
+      description: String(act.description || ""),
+      personality: String(act.personality || ""),
+      scenario: String(act.scenario || ""),
+      first_mes: String(act.first_mes || ""),
+      mes_example: String(act.mes_example || ""),
+      system_prompt: String(act.system_prompt || ""),
+      avatar: null
+    });
+    await refreshLibrary();
+    return "created character #" + id;
+  }
+  if (act.action === "polish_character" || act.action === "write_scenario") {
+    const target = act.character_id != null ? byId(act.character_id) : byName(act.name || act.character_name);
+    if (!target) throw new Error("E_SUPERVISOR: character not found.");
+    const patch = { ...target };
+    for (const k of ["description", "personality", "scenario", "first_mes", "mes_example", "system_prompt"]) {
+      if (typeof act[k] === "string" && act[k].trim()) patch[k] = act[k];
+    }
+    if (act.action === "write_scenario" && act.scenario) patch.scenario = act.scenario;
+    await saveCharacter(patch);
+    await refreshLibrary();
+    return "updated " + (target.name || ("#" + target.id));
+  }
+  if (act.action === "add_stage") {
+    const chatId = act.chat_id != null ? Number(act.chat_id) : ui.chatId;
+    if (chatId == null) throw new Error("E_SUPERVISOR: no chat selected for add_stage.");
+    const all = await listChats();
+    const cur = all.find((c) => c.id === chatId);
+    if (!cur) throw new Error("E_SUPERVISOR: chat not found.");
+    const nt = normalizeToggles(cur.stages);
+    nt[act.stage_key] = act.enabled === 0 ? 0 : 1;
+    await saveChat({ ...cur, stages: nt });
+    return "stage " + act.stage_key + " " + (nt[act.stage_key] ? "on" : "off") + " for chat #" + chatId;
+  }
+  if (act.action === "set_world") {
+    const chatId = act.chat_id != null ? Number(act.chat_id) : ui.chatId;
+    if (chatId == null) throw new Error("E_SUPERVISOR: no chat selected for set_world.");
+    const prev = await getStageState(chatId, "world").catch(() => null);
+    const cur = normalizeWorld(prev?.state);
+    const next = normalizeWorld({
+      ...cur,
+      location: act.location ?? cur.location,
+      time: act.time ?? cur.time,
+      weather: act.weather ?? cur.weather,
+      notes: act.notes ?? cur.notes,
+      party: Array.isArray(act.party) ? act.party : cur.party,
+      inventory: Array.isArray(act.inventory) ? act.inventory : cur.inventory,
+      flags: (act.flags && typeof act.flags === "object") ? act.flags : cur.flags
+    });
+    await saveStageState(chatId, "world", next, prev?.settings || {});
+    return "world set for chat #" + chatId;
+  }
+  throw new Error("E_SUPERVISOR: rejected.");
+}
+
+async function renderForgeView() {
+  const box = $("#forge-results");
+  if (!box) return;
+  box.innerHTML = "";
+  if (!forgeProposals.length) {
+    box.innerHTML = `<div class="status">No proposals yet. Describe a character or say "polish Rin" / "write a tavern scenario" / "add chess to this chat". Proposals appear here for approval — nothing is applied until you tap Approve.</div>`;
+    return;
+  }
+  const chars = await listCharacters().catch(() => []);
+  for (let i = 0; i < forgeProposals.length; i++) {
+    const a = forgeProposals[i];
+    const card = document.createElement("div");
+    card.className = "card wide";
+    const h = document.createElement("strong");
+    h.textContent = describeAction(a, chars);
+    const pre = document.createElement("pre");
+    pre.className = "status";
+    pre.style.whiteSpace = "pre-wrap";
+    pre.textContent = JSON.stringify(a, null, 1).slice(0, 1500);
+    const row = document.createElement("div");
+    row.className = "vaultbtns";
+    const ok = document.createElement("button");
+    ok.className = "btn";
+    ok.type = "button";
+    ok.textContent = "Approve";
+    ok.addEventListener("click", async () => {
+      try {
+        const msg = await executeSupervisorAction(a);
+        forgeProposals.splice(i, 1);
+        logInfo("E_SUPERVISOR", "applied: " + msg);
+        window.alert(msg);
+      } catch (e) {
+        logErr("E_SUPERVISOR", e?.message || String(e));
+        window.alert("Supervisor action failed: " + (e?.message || e));
+      }
+      refreshDiag();
+      await renderForgeView();
+      await renderStagesView().catch(() => {});
+    });
+    const no = document.createElement("button");
+    no.className = "btn secondary";
+    no.type = "button";
+    no.textContent = "Reject";
+    no.addEventListener("click", async () => {
+      forgeProposals.splice(i, 1);
+      logInfo("E_SUPERVISOR", "proposal rejected");
+      await renderForgeView();
+    });
+    row.append(ok, no);
+    card.append(h, pre, row);
+    box.append(card);
+  }
+}
+
+async function handleForgeRun() {
+  const ta = $("#forge-input");
+  const req = (ta?.value || "").trim();
+  if (!req) return;
+  const btn = $("#btn-forge-run");
+  if (btn) btn.disabled = true;
+  try {
+    const [chars, chats] = await Promise.all([listCharacters().catch(() => []), listChats().catch(() => [])]);
+    const lower = req.toLowerCase();
+    // Fast offline paths: no model needed for skeleton drafts and stage toggles.
+    if (/^(make|create|new)\b/.test(lower) && !presetModel(await getActivePreset().catch(() => null))) {
+      forgeProposals = [{ action: "create_character", ...localDraftCharacter(req) }];
+      await renderForgeView();
+      return;
+    }
+    const mStage = lower.match(/add\s+(director|world|dice|chess)(?:\s+to\s+(?:this\s+|current\s+)?chat)?/);
+    if (mStage && !presetModel(await getActivePreset().catch(() => null))) {
+      forgeProposals = [{ action: "add_stage", stage_key: mStage[1], chat_id: ui.chatId, enabled: 1 }];
+      await renderForgeView();
+      return;
+    }
+    const preset = await getActivePreset().catch(() => null);
+    if (!presetModel(preset)) {
+      // Offline default: draft a character skeleton for approval.
+      forgeProposals = [{ action: "create_character", ...localDraftCharacter(req) }];
+      logInfo("E_SUPERVISOR", "offline draft proposed (no model set)");
+      await renderForgeView();
+      return;
+    }
+    const provider = await getActiveProvider().catch(() => null);
+    const sys = buildSupervisorPrompt({ characters: chars, chats, stageStates: [] });
+    const { content } = await sendChat({
+      provider: provider || undefined,
+      preset,
+      connection: preset?.connection,
+      samplers: { ...(preset?.samplers || {}), max_tokens: 900, temperature: 0.4 },
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: req + "\nCurrent chat id: " + (ui.chatId ?? "none") + ". Reply with ONE ```tool fenced JSON action." }
+      ],
+      signal: null
+    });
+    const parsed = parseSupervisorReply(content || "");
+    const valid = [];
+    for (const a of parsed.actions) {
+      const e = validateAction(a);
+      if (!e) valid.push(normalizeAction(a, ui.chatId));
+      else logErr("E_SUPERVISOR", e);
+    }
+    if (parsed.skipped.length) logErr("E_SUPERVISOR", "skipped: " + parsed.skipped.join("; "));
+    if (!valid.length) {
+      window.alert("Supervisor returned no valid action. Try: 'Create a gruff dwarven barkeep' or 'Add chess to this chat'.");
+      return;
+    }
+    forgeProposals = valid.slice(0, 5);
+    logInfo("E_SUPERVISOR", "proposed " + forgeProposals.length + " action(s)");
+    await renderForgeView();
+  } catch (e) {
+    logErr("E_SUPERVISOR", e?.message || String(e));
+    window.alert("Supervisor failed: " + (e?.message || e));
+  } finally {
+    if (btn) btn.disabled = false;
+    refreshDiag();
+  }
+}
+
 function refreshViews() {
   if (view === "home") refreshHome();
   else if (view === "chars") renderCharsView();
@@ -2957,6 +3763,8 @@ function refreshViews() {
   else if (view === "presets") { renderPresetCards(); renderProviderCards(); }
   else if (view === "books") renderBooksView();
   else if (view === "regex") renderRegexView();
+  else if (view === "stages") renderStagesView();
+  else if (view === "forge") renderForgeView();
 }
 
 // ---------- Phase 4: theme presets + *action* and "dialogue" colors ----------
@@ -3065,6 +3873,9 @@ async function init() {
     provider: { ...DEFAULT_PROVIDER }
   });
   await migrateLegacyPresetsIfNeeded();
+  try {
+    await seedStagesIfEmpty();
+  } catch { /* stages seed must never brick boot */ }
   await ensureSelection();
   await refreshLibrary();
   await refreshPresets();
@@ -3090,6 +3901,8 @@ async function init() {
       closeDrawers();
       closeCharEditor();
       closeBookEditor();
+      closePersonaEditor();
+      closeGraph();
       const sm = $("#starter-modal");
       if (sm) sm.hidden = true;
     }
@@ -3107,15 +3920,9 @@ async function init() {
     }
   });
 
-  $("#btn-new-persona").addEventListener("click", async () => {
-    const name = window.prompt("Persona name:", "You");
-    if (!name) return;
-    const id = await savePersona({ name: name.trim() });
-    ui.personaId = id;
-    persistUI();
-    await refreshLibrary();
-    await renderCurrentChat();
-  });
+  $("#btn-new-persona").addEventListener("click", () => openPersonaEditor(null));
+  $("#btn-persona-close")?.addEventListener("click", closePersonaEditor);
+  $("#btn-persona-save")?.addEventListener("click", savePersonaEditor);
   $("#btn-new-char").addEventListener("click", () => openCharEditor(null));
   $("#btn-new-chat").addEventListener("click", async () => {
     const chars = await listCharacters();
@@ -3332,7 +4139,29 @@ async function init() {
   });
 
   // ---------- v1.5 wiring: memory book editor ----------
+  // ---------- v1.5 wiring: memory book editor ----------
   $("#btn-book-new")?.addEventListener("click", () => openBookEditor(null));
+  $("#btn-graph-close")?.addEventListener("click", closeGraph);
+  $("#btn-graph-reset")?.addEventListener("click", async () => {
+    if (!graphState) return;
+    graphState.needsFit = true;
+    await renderGraph();
+  });
+  $("#btn-graph-rotate")?.addEventListener("click", async () => {
+    if (!graphState) return;
+    graphState.horizontal = !graphState.horizontal;
+    graphState.needsFit = true;
+    await renderGraph();
+  });
+  $("#btn-graph-collapse")?.addEventListener("click", async () => {
+    if (!graphState) return;
+    graphState.collapsed = !graphState.collapsed;
+    graphState.needsFit = true;
+    await renderGraph();
+  });
+  $("#btn-graph-fork")?.addEventListener("click", () => {
+    forkChatFromGraph().catch((e) => logErr("E_UI_GRAPH", e.message));
+  });
   $("#btn-starter-close")?.addEventListener("click", () => { $("#starter-modal").hidden = true; });
   $("#btn-bk-close")?.addEventListener("click", closeBookEditor);
   $("#btn-bk-save")?.addEventListener("click", saveBookEditor);
@@ -3489,6 +4318,47 @@ async function init() {
     e.target.value = "";
     if (f) await handleRegexImportFile(f);
   });
+  $("#btn-forge-run")?.addEventListener("click", handleForgeRun);
+  $("#btn-forge-draft")?.addEventListener("click", async () => {
+    const ta = $("#forge-input");
+    const brief = (ta?.value || "").trim() || "A curious traveler with a secret";
+    forgeProposals = [{ action: "create_character", ...localDraftCharacter(brief) }];
+    logInfo("E_SUPERVISOR", "offline draft proposed");
+    refreshDiag();
+    await renderForgeView();
+  });
+  $("#btn-forge-polish")?.addEventListener("click", async () => {
+    try {
+      const chars = await listCharacters();
+      const ch = chars.find((c) => c.id === ui.characterId) || chars[0];
+      if (!ch) {
+        window.alert("No character to polish yet.");
+        return;
+      }
+      forgeProposals = [{ action: "polish_character", character_id: ch.id, ...localPolishCharacter(ch) }];
+      logInfo("E_SUPERVISOR", "polish draft proposed for " + (ch.name || ch.id));
+      refreshDiag();
+      await renderForgeView();
+    } catch (e) {
+      logErr("E_SUPERVISOR", e?.message || String(e));
+    }
+  });
+  $("#btn-stage-export")?.addEventListener("click", async () => {
+    try {
+      const [defs, states] = await Promise.all([listStages().catch(() => []), listStageStates(ui.chatId).catch(() => [])]);
+      const blob = new Blob([JSON.stringify({ defs, states }, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `polyglot-stages-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.append(a);
+      a.click();
+      a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    } catch (e) {
+      logErr("E_STAGE_RULE", e?.message || String(e));
+    }
+    refreshDiag();
+  });
 
   $("#btn-diag-copy").addEventListener("click", copyDiagReport);
   $("#btn-diag-export").addEventListener("click", () => {
@@ -3518,7 +4388,7 @@ async function init() {
   trackKeyboard();
   registerSW();
   await getRegexRules();
-  showView(["home", "chars", "chat", "presets", "books", "detail", "regex"].includes(view) ? view : "home");
+  showView(["home", "chars", "chat", "presets", "books", "detail", "regex", "stages", "forge"].includes(view) ? view : "home");
   if (bootError) {
     const msg = bootError && bootError.message ? bootError.message : String(bootError);
     const ch = document.getElementById("chat");
