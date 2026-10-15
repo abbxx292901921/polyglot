@@ -32,7 +32,7 @@ import {
   importVaultFromJSON,
   seedIfEmpty
 } from "./db.js";
-import { buildMessages, estimateTokens } from "./prompt-engine.js";
+import { buildMessages, estimateTokens, activeChain, parentMap, childrenMap, treeLayout } from "./prompt-engine.js";
 import { sendChat, fetchModels } from "./api-client.js";
 import { parsePNGCard, parseCharacterJSON, normalizeCharacter, fileToAvatarDataURL } from "./png-parser.js";
 import {
@@ -71,6 +71,10 @@ const generating = () => !!aborter;
 let edId = null;
 let edAvatar = null;
 let edLore = [];
+let edAlts = [];
+let edExtra = {};
+// Branch graph panel: null = auto (opens once a real fork exists).
+let graphOpen = null;
 
 export function triggerHaptic(ms = 10) {
   try {
@@ -284,6 +288,64 @@ async function ensureChat() {
   return id;
 }
 
+// All openers for a card (first_mes + alternate_greetings), non-empty.
+function charStarters(ch) {
+  const out = [];
+  if (ch?.first_mes && String(ch.first_mes).trim()) out.push(String(ch.first_mes));
+  for (const g of (ch?.alternate_greetings || [])) {
+    if (g && String(g).trim()) out.push(String(g));
+  }
+  return out;
+}
+
+async function createChatWithStarter(charId, idx = 0) {
+  const chars = await listCharacters();
+  const starters = charStarters(chars.find((c) => c.id === charId));
+  const id = await saveChat({
+    character_id: charId,
+    persona_id: ui.personaId,
+    title: `Chat ${new Date().toLocaleString()}`
+  });
+  const pick = starters[idx] ?? starters[0];
+  if (pick) {
+    await saveMessage({ chat_id: id, role: "assistant", content: pick, parent_id: null, timestamp: Date.now() });
+  }
+  ui.characterId = charId;
+  ui.chatId = id;
+  persistUI();
+  await refreshLibrary();
+  await renderCurrentChat();
+  return id;
+}
+
+let pendingStarterChar = null;
+
+function openStarterPicker(charId, starters, chName) {
+  pendingStarterChar = charId;
+  $("#starter-title").textContent = `Openings — ${chName || "Character"}`;
+  const list = $("#starter-list");
+  list.innerHTML = "";
+  starters.forEach((s, i) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "starter-opt";
+    const lab = document.createElement("strong");
+    lab.textContent = i === 0 ? "Main greeting" : `Alternate ${i}`;
+    const prev = document.createElement("span");
+    prev.className = "starter-prev";
+    prev.textContent = s.length > 160 ? `${s.slice(0, 160)}…` : s;
+    b.append(lab, prev);
+    b.addEventListener("click", async () => {
+      $("#starter-modal").hidden = true;
+      await createChatWithStarter(pendingStarterChar, i);
+      showView("chat");
+      closeDrawers();
+    });
+    list.append(b);
+  });
+  $("#starter-modal").hidden = false;
+}
+
 async function getActivePreset() {
   const presets = await listPresets();
   return presets.find((p) => p.id === ui.presetId) || presets[0] || null;
@@ -363,8 +425,13 @@ async function migrateLegacyPresetsIfNeeded() {
   }
 }
 
-// ---------- Message tree (swipe groups) ----------
-function groupRows(rows) {
+// ---------- Message tree (branches + swipe groups) ----------
+// The visible history is the active chain: walk parent_id links back from
+// the chat's active leaf (latest message when no leaf is set, so legacy
+// chats behave exactly as before). Swipes stay orthogonal: variants share
+// a swipe_group; pathIds marks which variant the chain passes through so
+// the display matches the context even on non-active variants.
+function groupRows(rows, pathIds = null) {
   // Returns ordered items: {kind:'user',msg} | {kind:'group',msgs:[...],active}
   const items = [];
   const byGroup = new Map();
@@ -383,10 +450,136 @@ function groupRows(rows) {
   for (const it of items) {
     if (it.kind === "group") {
       it.msgs.sort((a, b) => a.timestamp - b.timestamp || a.id - b.id);
-      it.active = it.msgs.find((m) => m.swipe_active === 1) || it.msgs[it.msgs.length - 1];
+      it.active = (pathIds && it.msgs.find((m) => pathIds.has(m.id)))
+        || it.msgs.find((m) => m.swipe_active === 1)
+        || it.msgs[it.msgs.length - 1];
     }
   }
   return items;
+}
+
+// Load a chat's full rows plus its visible chain. Returns
+// {rows, chain, pathIds, chat, leafId, latestId, hidden} where hidden is
+// the number of newer messages on other branches.
+async function getChatChain(chatId) {
+  const [rows, chats] = await Promise.all([listMessages(chatId), listChats()]);
+  const chat = chats.find((c) => c.id === chatId) || null;
+  const sorted = [...rows].sort((a, b) => a.timestamp - b.timestamp || a.id - b.id);
+  const latestId = sorted.length ? sorted[sorted.length - 1].id : null;
+  const leafId = chat?.active_leaf_id ?? null;
+  const chain = activeChain(rows, leafId);
+  const pathIds = new Set(chain.map((m) => m.id));
+  const effLeaf = chain.length ? chain[chain.length - 1].id : null;
+  return { rows, chain, pathIds, chat, leafId: effLeaf, latestId, hidden: rows.length - chain.length };
+}
+
+// Point a chat's view at a message (rewind/fast-forward). The next sent
+// message parents onto the leaf, forking a new branch automatically.
+async function setActiveLeaf(chatId, msgId) {
+  const chats = await listChats();
+  const chat = chats.find((c) => c.id === chatId);
+  if (!chat) return;
+  await saveChat({ ...chat, active_leaf_id: msgId });
+  await renderCurrentChat();
+}
+
+function clearBranchbar() {
+  const bar = $("#branchbar");
+  if (!bar) return;
+  bar.innerHTML = "";
+  bar.hidden = true;
+}
+
+// Slim bar above the transcript: off-branch banner + tap-to-jump tree.
+function renderBranchbar(rows, chain, pathIds, { leafId, latestId, hidden }) {
+  const bar = $("#branchbar");
+  if (!bar) return;
+  bar.innerHTML = "";
+  if (!rows.length) {
+    bar.hidden = true;
+    return;
+  }
+  const offBranch = leafId !== latestId;
+  if (!offBranch && !hidden) {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  const banner = document.createElement("div");
+  banner.className = "branch-banner";
+  const info = document.createElement("span");
+  info.textContent = offBranch
+    ? `On a branch — ${hidden} later message${hidden === 1 ? "" : "s"} on other branches hidden.`
+    : `${hidden} message${hidden === 1 ? "" : "s"} on other branches.`;
+  banner.append(info);
+  if (offBranch) {
+    banner.append(actionButton("Latest ▶", "Jump to the newest message", () =>
+      setActiveLeaf(ui.chatId, latestId)));
+  }
+  bar.append(banner);
+  renderBranchGraph(bar, rows, pathIds, leafId);
+}
+
+function renderBranchGraph(bar, rows, pathIds, leafId) {
+  const { nodes, maxDepth } = treeLayout(rows);
+  if (nodes.length < 2) return;
+  const kids = childrenMap(rows);
+  let forks = 0;
+  for (const [, k] of kids) if (k.length > 1) forks++;
+  const det = document.createElement("details");
+  det.className = "branch-tree";
+  det.open = graphOpen ?? forks > 0;
+  det.addEventListener("toggle", () => { graphOpen = det.open; });
+  const sum = document.createElement("summary");
+  sum.textContent = `⑂ Tree: ${nodes.length} message${nodes.length === 1 ? "" : "s"}${forks ? `, ${forks} fork${forks === 1 ? "" : "s"}` : ""} — tap a dot to jump`;
+  det.append(sum);
+  const NS = "http://www.w3.org/2000/svg";
+  const rowH = 16;
+  const colW = 20;
+  const pad = 10;
+  const maxLane = nodes.reduce((a, n) => Math.max(a, n.lane), 0);
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("width", String(pad * 2 + maxDepth * colW + 8));
+  svg.setAttribute("height", String(pad * 2 + maxLane * rowH + 8));
+  svg.setAttribute("role", "img");
+  const pmap = parentMap(rows);
+  const byId = new Map(rows.map((m) => [m.id, m]));
+  const X = (d) => pad + 4 + d * colW;
+  const Y = (l) => pad + 4 + l * rowH;
+  for (const n of nodes) {
+    const p = pmap.get(n.id);
+    if (p != null) {
+      const pn = nodes.find((x) => x.id === p);
+      if (pn) {
+        const ln = document.createElementNS(NS, "line");
+        ln.setAttribute("x1", X(pn.depth));
+        ln.setAttribute("y1", Y(pn.lane));
+        ln.setAttribute("x2", X(n.depth));
+        ln.setAttribute("y2", Y(n.lane));
+        ln.setAttribute("class", "bn-edge" + (pathIds.has(n.id) && pathIds.has(p) ? " on" : ""));
+        svg.append(ln);
+      }
+    }
+  }
+  for (const n of nodes) {
+    const m = byId.get(n.id);
+    const c = document.createElementNS(NS, "circle");
+    c.setAttribute("cx", X(n.depth));
+    c.setAttribute("cy", Y(n.lane));
+    c.setAttribute("r", n.id === leafId ? "5.5" : "4");
+    c.setAttribute("class", `bn-dot bn-${n.role === "user" ? "user" : "asst"}${pathIds.has(n.id) ? " on" : ""}${n.id === leafId ? " leaf" : ""}`);
+    c.style.cursor = "pointer";
+    const tip = document.createElementNS(NS, "title");
+    tip.textContent = `${n.role === "user" ? "You" : "AI"}: ${String(m?.content || "").replace(/\s+/g, " ").slice(0, 80)}`;
+    c.append(tip);
+    c.addEventListener("click", () => setActiveLeaf(ui.chatId, n.id));
+    svg.append(c);
+  }
+  const wrap = document.createElement("div");
+  wrap.className = "branch-scroll";
+  wrap.append(svg);
+  det.append(wrap);
+  bar.append(det);
 }
 
 function actionButton(label, title, fn) {
@@ -474,6 +667,7 @@ async function renderCurrentChat() {
   await getRegexRules();
   if (ui.chatId == null) {
     if (ui.characterId == null) {
+      clearBranchbar();
       clearChatView("No characters yet. Tap ☰ to create or import one.");
       return;
     }
@@ -481,6 +675,7 @@ async function renderCurrentChat() {
     if (!mine.length) {
       const chars = await listCharacters();
       const ch = chars.find((c) => c.id === ui.characterId);
+      clearBranchbar();
       $("#chat").innerHTML = "";
       if (ch?.first_mes) {
         const s = paintShell("assistant", ch.name);
@@ -494,12 +689,13 @@ async function renderCurrentChat() {
     ui.chatId = mine[0].id;
     persistUI();
   }
-  const rows = await listMessages(ui.chatId);
+  const { rows, chain, pathIds, leafId, latestId, hidden } = await getChatChain(ui.chatId);
   const [chars, personas] = await Promise.all([listCharacters(), listPersonas()]);
   const ch = chars.find((c) => c.id === ui.characterId);
   const me = personas.find((p) => p.id === ui.personaId);
   const chName = ch?.name || "Polyglot";
   const meName = me?.name || "You";
+  renderBranchbar(rows, chain, pathIds, { leafId, latestId, hidden });
   $("#chat").innerHTML = "";
   if (!rows.length) {
     if (ch?.first_mes) {
@@ -513,7 +709,7 @@ async function renderCurrentChat() {
     }
     return;
   }
-  const items = groupRows(rows);
+  const items = groupRows(chain, pathIds);
   items.forEach((it, ii) => {
     const isLast = ii === items.length - 1;
     if (it.kind === "user") {
@@ -535,6 +731,8 @@ async function renderCurrentChat() {
         actionButton("⧉ Copy", "Copy message text", async () => {
           await copyText(it.msg.content);
         }),
+        actionButton("⑂ Branch", "Rewind to here — your next message starts a new branch", () =>
+          setActiveLeaf(ui.chatId, it.msg.id)),
         actionButton("🗑 Delete", "Delete message", async () => {
           if (!window.confirm("Delete this message?")) return;
           await deleteMessage(it.msg.id);
@@ -599,6 +797,8 @@ async function renderCurrentChat() {
       actionButton("⧉ Copy", "Copy message text", async () => {
         await copyText(active.content);
       }),
+      actionButton("⑂ Branch", "Rewind to here — your next message starts a new branch", () =>
+        setActiveLeaf(ui.chatId, active.id)),
       actionButton("🗑 Delete", "Delete message", async () => {
         if (!window.confirm("Delete this message?")) return;
         await deleteMessage(active.id);
@@ -1036,9 +1236,14 @@ async function buildContext(pastRows, extraUserText = "") {
     role: m.role === "assistant" ? "assistant" : "user",
     content: m.content
   }));
-  const charHead = [ch?.description, ch?.personality, ch?.scenario, ch?.mes_example]
-    .filter((s) => s && String(s).trim()).join("\n\n");
-  const sysBase = [preset?.prompts?.system || "", charHead].filter((s) => s.trim()).join("\n\n");
+  const charSecs = [];
+  if (ch?.description?.trim()) charSecs.push(ch.description.trim());
+  if (ch?.personality?.trim()) charSecs.push(`Personality: ${ch.personality.trim()}`);
+  if (ch?.scenario?.trim()) charSecs.push(`Scenario: ${ch.scenario.trim()}`);
+  if (ch?.mes_example?.trim()) charSecs.push(`Example dialogue:\n${ch.mes_example.trim()}`);
+  const charHead = charSecs.join("\n\n");
+  const sysBase = [preset?.prompts?.system || "", ch?.system_prompt?.trim() || "", charHead]
+    .filter((s) => s && s.trim()).join("\n\n");
   const built = buildMessages({
     system: sysBase,
     jailbreak: preset?.prompts?.jailbreak || "",
@@ -1123,6 +1328,7 @@ async function generateAssistant(chatId, pastRows, { groupId = null, titleHint =
     const reply = offlineEcho(lastUser?.content || "", chName);
     const id = await saveMessage({
       chat_id: chatId, role: "assistant", content: reply,
+      parent_id: pastRows.length ? pastRows[pastRows.length - 1].id : null,
       swipe_group_id: groupId || `g${Date.now()}`, swipe_active: 1, timestamp: Date.now()
     });
     if (groupId) await setActiveSibling(chatId, groupId, id);
@@ -1142,6 +1348,7 @@ async function generateAssistant(chatId, pastRows, { groupId = null, titleHint =
     const id = await saveMessage({
       chat_id: chatId, role: "assistant",
       content: content || "(thinking only — see trace)",
+      parent_id: pastRows.length ? pastRows[pastRows.length - 1].id : null,
       reasoning_content: reasoning, swipe_group_id: gid,
       swipe_active: 1, timestamp: Date.now()
     });
@@ -1175,11 +1382,13 @@ async function handleSend() {
   ta.value = "";
   autogrow();
   const chatId = await ensureChat();
-  await saveMessage({ chat_id: chatId, role: "user", content: text, timestamp: Date.now() });
+  const { chain } = await getChatChain(chatId);
+  const parent = chain.length ? chain[chain.length - 1].id : null;
+  await saveMessage({ chat_id: chatId, role: "user", content: text, parent_id: parent, timestamp: Date.now() });
   // Paint instantly (includes the new user message), then generate below it.
   await renderCurrentChat();
-  const rows = await listMessages(chatId);
-  await generateAssistant(chatId, rows, { titleHint: text });
+  const { chain: full } = await getChatChain(chatId);
+  await generateAssistant(chatId, full, { titleHint: text });
 }
 
 async function handleRetry(item) {
@@ -1187,11 +1396,12 @@ async function handleRetry(item) {
   if (!item || (item.kind !== "group" && item.kind !== "solo")) return;
   triggerHaptic(10);
   const chatId = ui.chatId;
-  const rows = await listMessages(chatId);
+  const { chain } = await getChatChain(chatId);
   const sibs = item.kind === "group" ? item.msgs : [item.msg];
+  const anchorId = (item.kind === "group" ? item.active?.id : item.msg.id) ?? sibs[0].id;
   const first = sibs[0];
-  const pos = rows.findIndex((m) => m.id === first.id);
-  const history = pos === -1 ? rows : rows.slice(0, pos);
+  const pos = chain.findIndex((m) => m.id === anchorId);
+  const history = pos === -1 ? chain : chain.slice(0, pos);
   const groupId = item.kind === "group" ? item.groupId : `g${Date.now()}`;
   if (item.kind === "solo") {
     await saveMessage({ ...first, swipe_group_id: groupId });
@@ -1204,16 +1414,17 @@ async function handleRetryFromUser(userMsg) {
   triggerHaptic(10);
   const chatId = ui.chatId;
   if (chatId == null) return;
-  const rows = await listMessages(chatId);
-  const pos = rows.findIndex((m) => m.id === userMsg.id);
-  const history = pos === -1 ? rows : rows.slice(0, pos + 1);
+  const { chain } = await getChatChain(chatId);
+  const pos = chain.findIndex((m) => m.id === userMsg.id);
+  const history = pos === -1 ? chain : chain.slice(0, pos + 1);
   await generateAssistant(chatId, history, {});
 }
 
 async function handleContinue() {
   if (generating()) return;
   const chatId = await ensureChat();
-  const rows = await listMessages(chatId);
+  const { chain } = await getChatChain(chatId);
+  const rows = chain;
   if (!rows.length) return;
   const last = rows[rows.length - 1];
   triggerHaptic(10);
@@ -1266,12 +1477,16 @@ async function handleContinue() {
 async function handleImpersonate() {
   if (generating()) return;
   const chatId = await ensureChat();
-  const rows = await listMessages(chatId);
+  const { chain } = await getChatChain(chatId);
+  const rows = chain;
   const { preset, provider, meName } = await buildContext(rows);
   triggerHaptic(10);
   if (!presetModel(preset)) {
     const text = "*leans forward, offline echo as you.* \"No model set — open ⚙ and add a preset.\"";
-    await saveMessage({ chat_id: chatId, role: "user", content: text, timestamp: Date.now() });
+    await saveMessage({
+      chat_id: chatId, role: "user", content: text,
+      parent_id: rows.length ? rows[rows.length - 1].id : null, timestamp: Date.now()
+    });
     await touchChatById(chatId);
     await renderCurrentChat();
     await refreshLibrary();
@@ -1289,7 +1504,10 @@ async function handleImpersonate() {
   try {
     const { content } = await runStream(preset, provider, ctx.built.messages, shell, aborter.signal);
     if (!content) throw new Error("E_UI_SEND: empty impersonation from provider.");
-    await saveMessage({ chat_id: chatId, role: "user", content, timestamp: Date.now() });
+    await saveMessage({
+      chat_id: chatId, role: "user", content,
+      parent_id: rows.length ? rows[rows.length - 1].id : null, timestamp: Date.now()
+    });
     await touchChatById(chatId);
     triggerHaptic(25);
   } catch (e) {
@@ -1413,6 +1631,8 @@ async function handleImportChatFile(file) {
           scenario: data.character.scenario || "",
           first_mes: data.character.first_mes || "",
           mes_example: data.character.mes_example || "",
+          alternate_greetings: data.character.alternate_greetings || [],
+          system_prompt: data.character.system_prompt || "",
           avatar: data.character.avatar || null
         });
       }
@@ -1427,15 +1647,36 @@ async function handleImportChatFile(file) {
     });
     const sorted = [...data.messages].sort((a, b) =>
       (a.timestamp - b.timestamp) || ((a.id || 0) - (b.id || 0)));
+    // Import mints fresh IDs, so remap old parent links (branch structure
+    // survives; unknown parents fall back to linear order on render).
+    const idMap = new Map();
+    const saved = [];
     for (const m of sorted) {
-      await saveMessage({
+      const rec = {
         chat_id: chatId,
         role: m.role === "assistant" ? "assistant" : "user",
         content: String(m.content ?? ""),
         reasoning_content: m.reasoning_content || "",
         swipe_group_id: m.swipe_group_id || null,
+        swipe_active: m.swipe_active === 1 ? 1 : 0,
+        parent_id: null,
         timestamp: Number(m.timestamp) || Date.now()
-      });
+      };
+      const nid = await saveMessage(rec);
+      if (m.id != null) idMap.set(m.id, nid);
+      saved.push({ ...rec, id: nid, oldParent: m.parent_id ?? null });
+    }
+    for (const s of saved) {
+      if (s.oldParent != null && idMap.has(s.oldParent)) {
+        const { oldParent, ...rest } = s;
+        void oldParent;
+        await saveMessage({ ...rest, parent_id: idMap.get(s.oldParent) });
+      }
+    }
+    if (data.chat?.active_leaf_id != null && idMap.has(data.chat.active_leaf_id)) {
+      const chats = await listChats();
+      const chat = chats.find((c) => c.id === chatId);
+      if (chat) await saveChat({ ...chat, active_leaf_id: idMap.get(data.chat.active_leaf_id) });
     }
     ui.characterId = charId;
     ui.chatId = chatId;
@@ -1563,6 +1804,39 @@ function renderEditorLore() {
   });
 }
 
+function renderEditorAlts() {
+  const box = $("#ch-alts-list");
+  if (!box) return;
+  box.innerHTML = "";
+  if (!edAlts.length) {
+    box.innerHTML = '<div class="status">No alternate openings — new chats start with the first message.</div>';
+    return;
+  }
+  edAlts.forEach((s, i) => {
+    const wrap = document.createElement("div");
+    wrap.className = "altrow";
+    const lab = document.createElement("span");
+    lab.className = "nm";
+    lab.textContent = `Alternate ${i + 1}`;
+    const ta = document.createElement("textarea");
+    ta.rows = 2;
+    ta.value = s;
+    ta.setAttribute("aria-label", `Alternate opening ${i + 1}`);
+    ta.addEventListener("input", () => { edAlts[i] = ta.value; });
+    const x = document.createElement("button");
+    x.className = "x";
+    x.type = "button";
+    x.textContent = "×";
+    x.setAttribute("aria-label", "Delete alternate");
+    x.addEventListener("click", () => {
+      edAlts.splice(i, 1);
+      renderEditorAlts();
+    });
+    wrap.append(lab, ta, x);
+    box.append(wrap);
+  });
+}
+
 function openCharEditor(charId = null, prefill = null) {
   edId = charId;
   edAvatar = prefill?.avatar ?? null;
@@ -1572,6 +1846,14 @@ function openCharEditor(charId = null, prefill = null) {
     enabled: e.enabled !== false,
     insertion_order: e.insertion_order ?? 0
   }));
+  // Alternate starters + extra card metadata ride the same draft so an
+  // import survives review → Save (edits merge over the stored record).
+  edAlts = [...(prefill?.character?.alternate_greetings || [])];
+  edExtra = {
+    creator_notes: prefill?.character?.creator_notes || "",
+    tags: prefill?.character?.tags || [],
+    character_version: prefill?.character?.character_version || ""
+  };
   $("#ch-title").textContent = charId == null ? "New character" : "Edit character";
   const fill = async () => {
     if (prefill?.character) {
@@ -1582,6 +1864,7 @@ function openCharEditor(charId = null, prefill = null) {
       $("#ch-scen").value = c.scenario || "";
       $("#ch-first").value = c.first_mes || "";
       $("#ch-example").value = c.mes_example || "";
+      $("#ch-sys").value = c.system_prompt || "";
     } else if (charId != null) {
       const chars = await listCharacters();
       const c = chars.find((x) => x.id === charId);
@@ -1593,6 +1876,13 @@ function openCharEditor(charId = null, prefill = null) {
       $("#ch-scen").value = c.scenario || "";
       $("#ch-first").value = c.first_mes || "";
       $("#ch-example").value = c.mes_example || "";
+      $("#ch-sys").value = c.system_prompt || "";
+      edAlts = [...(c.alternate_greetings || [])];
+      edExtra = {
+        creator_notes: c.creator_notes || "",
+        tags: c.tags || [],
+        character_version: c.character_version || ""
+      };
       const books = await listLorebooks(charId);
       edLore = [];
       books.forEach((b) => {
@@ -1608,6 +1898,7 @@ function openCharEditor(charId = null, prefill = null) {
       $("#ch-scen").value = "";
       $("#ch-first").value = "";
       $("#ch-example").value = "";
+      $("#ch-sys").value = "";
     }
     const img = $("#ch-avatar");
     if (edAvatar) {
@@ -1618,6 +1909,7 @@ function openCharEditor(charId = null, prefill = null) {
       img.style.display = "none";
     }
     renderEditorLore();
+    renderEditorAlts();
     setCharStatus(prefill?.note || "");
   };
   fill();
@@ -1637,6 +1929,9 @@ async function saveCharEditor() {
       scenario: $("#ch-scen").value,
       first_mes: $("#ch-first").value,
       mes_example: $("#ch-example").value,
+      system_prompt: $("#ch-sys").value,
+      alternate_greetings: edAlts.map((s) => String(s)).filter((s) => s.trim()),
+      ...edExtra,
       avatar: edAvatar
     };
     let id = edId;
@@ -1665,6 +1960,19 @@ async function saveCharEditor() {
   refreshDiag();
 }
 
+// One-line import receipt: which core fields landed, so a bad scrape is
+// visible immediately instead of surfacing mid-chat.
+function importReport(kind, norm) {
+  const c = norm.character || {};
+  const core = ["name", "description", "personality", "scenario", "first_mes", "mes_example"];
+  const filled = core.filter((k) => c[k] && String(c[k]).trim()).length;
+  const bits = [`${filled}/${core.length} sections`];
+  if ((c.alternate_greetings || []).length) bits.push(`${c.alternate_greetings.length} alternate opening${c.alternate_greetings.length === 1 ? "" : "s"}`);
+  if ((norm.loreEntries || []).length) bits.push(`${norm.loreEntries.length} lore entries`);
+  if (c.system_prompt && String(c.system_prompt).trim()) bits.push("system prompt");
+  return `Imported ${kind} (${bits.join(" · ")}).`;
+}
+
 async function handleCardFile(file) {
   const name = file.name.toLowerCase();
   try {
@@ -1679,8 +1987,9 @@ async function handleCardFile(file) {
       const { data, kind } = parseCharacterJSON(await file.text());
       const norm = normalizeCharacter(data);
       norm.avatar = avatar;
-      setCardStatus(`Parsed ${kind}. Review below, then Save.`);
-      openCharEditor(null, { ...norm, note: `Imported ${kind}. Review the text, then Save character.` });
+      const rep = importReport(kind, norm);
+      setCardStatus(`${rep} Review below, then Save.`);
+      openCharEditor(null, { ...norm, note: `${rep} Review the text, then Save character.` });
       return;
     }
     if (name.endsWith(".webp") && file.type === "image/webp") {
@@ -1696,8 +2005,9 @@ async function handleCardFile(file) {
     const { data, kind } = await parsePNGCard(buf);
     const norm = normalizeCharacter(data);
     norm.avatar = avatar;
-    setCardStatus(`Parsed ${kind}. Review below, then Save.`);
-    openCharEditor(null, { ...norm, note: `Imported ${kind}${norm.loreEntries.length ? ` + ${norm.loreEntries.length} lore entries` : ""}. Review the text, then Save character.` });
+    const rep = importReport(kind, norm);
+    setCardStatus(`${rep} Review below, then Save.`);
+    openCharEditor(null, { ...norm, note: `${rep} Review the text, then Save character.` });
   } catch (e) {
     logErr("E_UI_IMPORT", e.message);
     setCardStatus(`Import failed: ${e.message}`);
@@ -1786,6 +2096,8 @@ function showView(name) {
   const inChat = name === "chat";
   $("#chat").style.display = inChat ? "" : "none";
   $("#composer").style.display = inChat ? "" : "none";
+  const bb = $("#branchbar");
+  if (bb && !inChat) bb.hidden = true;
   $("#views").style.display = inChat ? "none" : "";
   for (const v of ["home", "chars", "detail", "presets", "books", "regex"]) {
     const el = $(`#view-${v}`);
@@ -2727,6 +3039,8 @@ async function init() {
       closeDrawers();
       closeCharEditor();
       closeBookEditor();
+      const sm = $("#starter-modal");
+      if (sm) sm.hidden = true;
     }
   });
   $("#send").addEventListener("click", handleSend);
@@ -2753,6 +3067,13 @@ async function init() {
   });
   $("#btn-new-char").addEventListener("click", () => openCharEditor(null));
   $("#btn-new-chat").addEventListener("click", async () => {
+    const chars = await listCharacters();
+    const ch = chars.find((c) => c.id === ui.characterId);
+    const starters = charStarters(ch);
+    if (starters.length > 1) {
+      openStarterPicker(ui.characterId, starters, ch?.name);
+      return;
+    }
     await ensureChat();
     const id = await saveChat({
       character_id: ui.characterId,
@@ -2814,6 +3135,10 @@ async function init() {
     $("#ch-lore-keys").value = "";
     $("#ch-lore-content").value = "";
     renderEditorLore();
+  });
+  $("#btn-ch-alt-add").addEventListener("click", () => {
+    edAlts.push("");
+    renderEditorAlts();
   });
 
   $("#btn-new-preset").addEventListener("click", async () => {
@@ -2957,6 +3282,7 @@ async function init() {
 
   // ---------- v1.5 wiring: memory book editor ----------
   $("#btn-book-new")?.addEventListener("click", () => openBookEditor(null));
+  $("#btn-starter-close")?.addEventListener("click", () => { $("#starter-modal").hidden = true; });
   $("#btn-bk-close")?.addEventListener("click", closeBookEditor);
   $("#btn-bk-save")?.addEventListener("click", saveBookEditor);
   $("#btn-bk-entry-add")?.addEventListener("click", () => {
@@ -3001,6 +3327,16 @@ async function init() {
   );
 
   const newChatFor = async (charId) => {
+    const chars = await listCharacters();
+    const ch = chars.find((c) => c.id === charId);
+    const starters = charStarters(ch);
+    if (starters.length > 1) {
+      ui.characterId = charId;
+      persistUI();
+      await ensureSelection();
+      openStarterPicker(charId, starters, ch?.name);
+      return;
+    }
     ui.characterId = charId;
     persistUI();
     await ensureSelection();

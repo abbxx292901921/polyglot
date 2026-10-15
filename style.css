@@ -287,3 +287,32 @@ details.thought .thought-body { padding: 6px 10px 10px; font-size: 13px; color: 
   #composer { max-width: 720px; margin: 0 auto; width: 100%; border-left: 1px solid var(--line); border-right: 1px solid var(--line); border-radius: 14px 14px 0 0; }
   #tabs { justify-content: center; }
 }
+
+/* Branch bar: off-branch banner + tap-to-jump tree graph. */
+#branchbar[hidden] { display: none; }
+#branchbar { padding: 6px 12px 0; font-size: 13px; color: var(--muted); }
+@media (min-width: 760px) {
+  #branchbar { max-width: 720px; margin: 0 auto; width: 100%; }
+}
+.branch-banner { display: flex; align-items: center; gap: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; margin-bottom: 6px; }
+.branch-banner button { background: transparent; color: var(--muted); border: 1px solid var(--line); border-radius: 8px; font-size: 12px; padding: 3px 9px; cursor: pointer; margin-left: auto; }
+.branch-banner button:hover { color: var(--ink); border-color: var(--accent); }
+details.branch-tree { border: 1px solid var(--line); border-radius: 10px; margin-bottom: 6px; }
+details.branch-tree summary { cursor: pointer; padding: 6px 10px; font-size: 13px; color: var(--muted); }
+.branch-scroll { max-height: 180px; overflow: auto; padding: 4px 6px 8px; }
+.bn-edge { stroke: var(--line); stroke-width: 1.5; }
+.bn-edge.on { stroke: var(--accent); }
+.bn-dot { fill: transparent; stroke: var(--muted); stroke-width: 1.5; }
+.bn-dot.on { fill: var(--accent); stroke: var(--accent); }
+.bn-dot.leaf { stroke: var(--ink); stroke-width: 2.5; }
+
+/* Starter picker options. */
+.starter-opt { display: flex; flex-direction: column; gap: 4px; width: 100%; text-align: left; background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; font-size: 14px; cursor: pointer; }
+.starter-opt:hover { border-color: var(--accent); }
+.starter-opt .starter-prev { font-size: 13px; color: var(--muted); white-space: pre-wrap; }
+
+/* Character editor alternate openings. */
+.altrow { display: grid; grid-template-columns: 1fr auto; gap: 4px 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; margin-bottom: 6px; }
+.altrow .nm { font-size: 12px; color: var(--muted); }
+.altrow textarea { grid-column: 1; background: var(--bg2); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font: inherit; font-size: 14px; }
+.altrow .x { grid-column: 2; grid-row: 1 / span 2; align-self: start; background: transparent; border: 0; color: var(--muted); font-size: 16px; cursor: pointer; padding: 2px 6px; }

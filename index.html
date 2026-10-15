@@ -20,7 +20,7 @@
     <header class="topbar">
       <button id="btn-left" class="iconbtn" aria-label="Open library">&#9776;</button>
       <h1>Polyglot</h1>
-      <span id="ver" class="ver">v1.5.1</span>
+      <span id="ver" class="ver">v1.5.2</span>
       <div class="spacer"></div>
       <button id="btn-right" class="iconbtn" aria-label="Open settings">&#9881;</button>
     </header>
@@ -175,6 +175,7 @@
       </div>
     </section>
 
+    <div id="branchbar" hidden></div>
     <main id="chat" aria-live="polite">
       <div class="empty" id="empty">
         Polyglot is ready. Your chats stay on this device.
@@ -383,6 +384,10 @@
         <label class="field">Scenario<textarea id="ch-scen" rows="2"></textarea></label>
         <label class="field">First message<textarea id="ch-first" rows="2"></textarea></label>
         <label class="field">Example messages<textarea id="ch-example" rows="3"></textarea></label>
+        <label class="field">System prompt (sent as instructions)<textarea id="ch-sys" rows="2"></textarea></label>
+        <h3>Alternate openings</h3>
+        <div id="ch-alts-list" class="list"></div>
+        <button id="btn-ch-alt-add" class="btn secondary" type="button">Add alternate</button>
         <h3>Lorebook entries</h3>
         <div id="ch-lore-list" class="list"></div>
         <div class="grid2">
@@ -398,8 +403,16 @@
     </div>
   </div>
 
-  <div id="book-modal" class="modal" hidden>
-    <div class="sheet" role="dialog" aria-label="Memory book editor">
+  <div id="starter-modal" class="modal" hidden>
+    <div class="sheet" role="dialog" aria-label="Choose opening message">
+      <header><h2 id="starter-title">Openings</h2><button class="iconbtn" id="btn-starter-close" aria-label="Close">&times;</button></header>
+      <div class="mbody">
+        <div id="starter-list" class="list"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="book-modal" class="modal" hidden>    <div class="sheet" role="dialog" aria-label="Memory book editor">
       <header><h2 id="bk-title">Memory book</h2><button class="iconbtn" id="btn-bk-close" aria-label="Close">&times;</button></header>
       <div class="mbody">
         <label class="field">Book name<input id="bk-name" type="text" autocomplete="off" /></label>

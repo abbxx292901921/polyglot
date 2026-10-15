@@ -136,6 +136,8 @@ export function saveCharacter(c) {
     scenario: "",
     first_mes: "",
     mes_example: "",
+    alternate_greetings: [],
+    system_prompt: "",
     avatar: null,
     ...c,
     updated_at: now
@@ -224,6 +226,7 @@ export function saveMessage(m) {
     timestamp: Date.now(),
     reasoning_content: "",
     swipe_group_id: null,
+    parent_id: null,
     ...m
   });
 }

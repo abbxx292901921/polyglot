@@ -126,8 +126,10 @@ function parsePayloadText(text, maybeRaw) {
   }
 }
 
-// Extract raw card JSON from PNG bytes. Prefers ccv3 (V3) over chara (V2)
-// when both are present.
+// Extract raw card JSON from PNG bytes. A file can carry both a V2
+// "chara" chunk and a V3 "ccv3" chunk; some tools write a stripped V3
+// (name + avatar only) next to a full V2. Score both payloads by filled
+// core fields and keep the fuller one (V3 wins ties).
 export async function parsePNGCard(arrayBuffer) {
   const u8 = arrayBuffer instanceof Uint8Array ? arrayBuffer : new Uint8Array(arrayBuffer);
   const chunks = walkChunks(u8);
@@ -139,14 +141,14 @@ export async function parsePNGCard(arrayBuffer) {
     if (!got) continue;
     const parsed = parsePayloadText(got.text, got.maybeRaw);
     if (got.keyword === "ccv3") {
-      v3 = parsed;
-      break; // V3 wins immediately
-    }
-    if (!v2) v2 = parsed;
+      if (!v3) v3 = parsed;
+    } else if (!v2) v2 = parsed;
   }
-  if (v3) return { data: v3, kind: "ccv3" };
-  if (v2) return { data: v2, kind: "chara" };
-  throw new Error("E_CARD_NONE: no character data found (missing chara/ccv3 chunk).");
+  if (v3 && !v2) return { data: v3, kind: "ccv3" };
+  if (v2 && !v3) return { data: v2, kind: "chara" };
+  if (!v2) throw new Error("E_CARD_NONE: no character data found (missing chara/ccv3 chunk).");
+  const useV3 = scoreCardFields(v3) >= scoreCardFields(v2);
+  return { data: useV3 ? v3 : v2, kind: useV3 ? "ccv3" : "chara" };
 }
 
 export function parseCharacterJSON(text) {
@@ -172,15 +174,79 @@ function loreEntriesFromBook(book) {
 }
 
 // Map V2/V3 card JSON to a Polyglot character record + lorebook entries.
+// Cards in the wild are messy: Risu-style exports use arrays for
+// mes_example/personality, some tools nest {data:{data:{...}}}, aliases
+// vary. Coerce everything to clean strings so fields never import as
+// comma-joined mush, and preserve alternate starters + system prompt.
+function cardInner(data) {
+  let d = data;
+  for (let i = 0; i < 3; i++) {
+    if (!d || typeof d !== "object" || Array.isArray(d)) break;
+    const inner = d.data;
+    if (!inner || typeof inner !== "object" || Array.isArray(inner)) break;
+    // Descend when the inner layer looks more like the card: it has a
+    // name, or the outer layer is an unnamed wrapper around card fields
+    // (covers {data:{data:{...}}} double wraps from some exporters).
+    const outerNamed = d.name || d.char_name;
+    const innerNamed = inner.name || inner.char_name;
+    const innerCardy = inner.description || inner.personality || inner.first_mes || inner.data;
+    if (innerNamed || (!outerNamed && innerCardy)) d = inner;
+    else break;
+  }
+  return (d && typeof d === "object" && !Array.isArray(d)) ? d : {};
+}
+
+function textField(v, joiner = "\n\n") {
+  if (v == null) return "";
+  if (Array.isArray(v)) {
+    return v
+      .map((x) => (x == null ? "" : String(x)).trim())
+      .filter((s) => s.length)
+      .join(joiner);
+  }
+  if (typeof v === "object") return "";
+  return String(v);
+}
+
+function stringList(v, cap = 20) {
+  const arr = Array.isArray(v) ? v : (v == null ? [] : [v]);
+  return arr
+    .map((x) => (x == null ? "" : String(x)).trim())
+    .filter((s) => s.length)
+    .slice(0, cap)
+    .map((s) => s.slice(0, 2000));
+}
+
+function fillCount(d) {
+  const core = ["name", "description", "personality", "scenario", "first_mes", "mes_example"];
+  let n = 0;
+  for (const k of core) {
+    if (textField(d[k]).trim()) n++;
+  }
+  if (stringList(d.alternate_greetings).length) n++;
+  return n;
+}
+
+// Fullness score for V2-vs-V3 arbitration in parsePNGCard.
+export function scoreCardFields(data) {
+  return fillCount(cardInner(data));
+}
+
+// Map V2/V3 card JSON to a Polyglot character record + lorebook entries.
 export function normalizeCharacter(data) {
-  const d = data?.data && typeof data.data === "object" && data.data.name ? data.data : data;
+  const d = cardInner(data);
   const rec = {
-    name: String(d.name || d.char_name || "Imported").slice(0, 80),
-    description: String(d.description || d.char_persona || ""),
-    personality: String(d.personality || ""),
-    scenario: String(d.scenario || ""),
-    first_mes: String(d.first_mes || d.char_greeting || ""),
-    mes_example: String(d.mes_example || d.char_example || "")
+    name: textField(d.name || d.char_name || "Imported", " ").trim().slice(0, 80) || "Imported",
+    description: textField(d.description || d.char_persona || ""),
+    personality: textField(d.personality || d.char_personality || ""),
+    scenario: textField(d.scenario || d.char_scenario || ""),
+    first_mes: textField(d.first_mes || d.char_greeting || "", "\n"),
+    mes_example: textField(d.mes_example || d.char_example || "", "\n<START>\n"),
+    alternate_greetings: stringList(d.alternate_greetings || d.alternate_greeting),
+    system_prompt: textField(d.system_prompt || ""),
+    creator_notes: textField(d.creator_notes || d.creator_note || ""),
+    tags: stringList(d.tags, 30),
+    character_version: textField(d.character_version || d.version || "", " ").trim().slice(0, 40)
   };
   const book = d.character_book || d.char_book || null;
   return { character: rec, loreEntries: loreEntriesFromBook(book) };

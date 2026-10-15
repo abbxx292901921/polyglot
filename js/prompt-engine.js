@@ -111,6 +111,99 @@ export function applyTokenBudget(messages, { limit = 8192, maxTokens = 800 } = {
   return { messages: msgs, estimated: estimateMessages(msgs), dropped };
 }
 
+// ---------- Message tree (chat branching) ----------
+// Rows are flat {id, chat_id, timestamp, role, content, parent_id?...}.
+// parent_id links a message to its parent; rows without one (all pre-
+// branch chats) form a linear chain in time order. All helpers are pure.
+
+// Oldest-first sort shared by every tree walk.
+export function sortRows(rows) {
+  return [...(rows || [])].sort((a, b) =>
+    (a.timestamp - b.timestamp) || (a.id - b.id));
+}
+
+// Map id -> effective parent id (null = root). An explicit parent_id wins
+// when it points at another row of the same chat (deleted parents and
+// cross-chat junk fall back to linear order).
+export function parentMap(rows) {
+  const sorted = sortRows(rows);
+  const ids = new Set(sorted.map((m) => m.id));
+  const map = new Map();
+  sorted.forEach((m, i) => {
+    const p = m.parent_id;
+    map.set(m.id, (p != null && ids.has(p) && p !== m.id) ? p : (i > 0 ? sorted[i - 1].id : null));
+  });
+  return map;
+}
+
+// Walk from leafId back to the root, oldest-first. Guards cycles.
+// leafId null/unknown -> latest message (classic linear behavior).
+export function activeChain(rows, leafId = null) {
+  const sorted = sortRows(rows);
+  if (!sorted.length) return [];
+  const byId = new Map(sorted.map((m) => [m.id, m]));
+  const pmap = parentMap(sorted);
+  let leaf = (leafId != null && byId.has(leafId)) ? byId.get(leafId) : sorted[sorted.length - 1];
+  const chain = [];
+  const seen = new Set();
+  let cur = leaf;
+  while (cur && !seen.has(cur.id)) {
+    seen.add(cur.id);
+    chain.unshift(cur);
+    const p = pmap.get(cur.id);
+    cur = p == null ? null : byId.get(p);
+  }
+  return chain;
+}
+
+// Map parent id (null = roots) -> child rows in time order, for the graph.
+export function childrenMap(rows) {
+  const sorted = sortRows(rows);
+  const pmap = parentMap(sorted);
+  const kids = new Map();
+  for (const m of sorted) {
+    const p = pmap.get(m.id);
+    if (!kids.has(p)) kids.set(p, []);
+    kids.get(p).push(m);
+  }
+  return kids;
+}
+
+// Compact tree layout: depth (root = 0) + lane (DFS pre-order row) per id.
+// Pure geometry for the SVG branch graph in app.js.
+export function treeLayout(rows) {
+  const sorted = sortRows(rows);
+  const byId = new Map(sorted.map((m) => [m.id, m]));
+  const pmap = parentMap(sorted);
+  const kids = childrenMap(sorted);
+  const depth = new Map();
+  const getDepth = (id) => {
+    if (depth.has(id)) return depth.get(id);
+    const seen = new Set();
+    let d = 0;
+    let cur = id;
+    while (pmap.get(cur) != null && !seen.has(cur)) {
+      seen.add(cur);
+      cur = pmap.get(cur);
+      d++;
+      if (!byId.has(cur)) break;
+    }
+    depth.set(id, d);
+    return d;
+  };
+  const nodes = [];
+  let lane = 0;
+  const visit = (id) => {
+    const m = byId.get(id);
+    if (!m) return;
+    nodes.push({ id, role: m.role, depth: getDepth(id), lane: lane++ });
+    for (const k of (kids.get(id) || [])) visit(k.id);
+  };
+  for (const r of (kids.get(null) || kids.get(undefined) || [])) visit(r.id);
+  if (!nodes.length) sorted.forEach((m) => nodes.push({ id: m.id, role: m.role, depth: 0, lane: lane++ }));
+  return { nodes, maxDepth: nodes.reduce((a, n) => Math.max(a, n.depth), 0) };
+}
+
 // Full pipeline: macros → lorebook → depth inject → budget → prefill.
 // history: [{role, content}] oldest→newest (already macro-safe raw text).
 export function buildMessages({
