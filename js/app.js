@@ -1973,38 +1973,51 @@ function importReport(kind, norm) {
   return `Imported ${kind} (${bits.join(" · ")}).`;
 }
 
-async function handleCardFile(file) {
+// Shared card-file reader: returns {norm, kind} or throws. WebP-only files
+// carry no embed, so they come back as a name + avatar shell.
+async function parseCardFile(file) {
   const name = file.name.toLowerCase();
+  let avatar = null;
+  try {
+    if (file.type.startsWith("image/")) avatar = await fileToAvatarDataURL(file);
+  } catch (e) {
+    logWarn("E_IMG_AVATAR", e.message);
+  }
+  if (name.endsWith(".json")) {
+    const { data, kind } = parseCharacterJSON(await file.text());
+    const norm = normalizeCharacter(data);
+    norm.avatar = avatar;
+    return { norm, kind };
+  }
+  if (name.endsWith(".webp") && file.type === "image/webp") {
+    return {
+      norm: {
+        character: { name: file.name.replace(/\.webp$/i, "") },
+        loreEntries: [],
+        avatar
+      },
+      kind: "webp-avatar"
+    };
+  }
+  const buf = await file.arrayBuffer();
+  const { data, kind } = await parsePNGCard(buf);
+  const norm = normalizeCharacter(data);
+  norm.avatar = avatar;
+  return { norm, kind };
+}
+
+async function handleCardFile(file) {
   try {
     setCardStatus("Reading card…");
-    let avatar = null;
-    try {
-      if (file.type.startsWith("image/")) avatar = await fileToAvatarDataURL(file);
-    } catch (e) {
-      logWarn("E_IMG_AVATAR", e.message);
-    }
-    if (name.endsWith(".json")) {
-      const { data, kind } = parseCharacterJSON(await file.text());
-      const norm = normalizeCharacter(data);
-      norm.avatar = avatar;
-      const rep = importReport(kind, norm);
-      setCardStatus(`${rep} Review below, then Save.`);
-      openCharEditor(null, { ...norm, note: `${rep} Review the text, then Save character.` });
-      return;
-    }
-    if (name.endsWith(".webp") && file.type === "image/webp") {
+    const { norm, kind } = await parseCardFile(file);
+    if (kind === "webp-avatar") {
       setCardStatus("WebP holds no embed — set fields manually or import its JSON.");
       openCharEditor(null, {
-        character: { name: file.name.replace(/\.webp$/i, "") },
-        loreEntries: [], avatar,
+        ...norm,
         note: "E_CARD_NONE: WebP image loaded as avatar only; paste fields or import JSON."
       });
       return;
     }
-    const buf = await file.arrayBuffer();
-    const { data, kind } = await parsePNGCard(buf);
-    const norm = normalizeCharacter(data);
-    norm.avatar = avatar;
     const rep = importReport(kind, norm);
     setCardStatus(`${rep} Review below, then Save.`);
     openCharEditor(null, { ...norm, note: `${rep} Review the text, then Save character.` });
@@ -2012,6 +2025,44 @@ async function handleCardFile(file) {
     logErr("E_UI_IMPORT", e.message);
     setCardStatus(`Import failed: ${e.message}`);
   }
+  refreshDiag();
+}
+
+// Bulk import: two or more files are saved directly (no per-card review),
+// with progress in the import status and a saved/failed summary at the end.
+// Nameless cards fall back to their filename so nothing is silently skipped.
+async function handleCardFiles(files) {
+  if (!files.length) return;
+  if (files.length === 1) {
+    await handleCardFile(files[0]);
+    return;
+  }
+  let ok = 0;
+  const failed = [];
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    setCardStatus(`Importing ${i + 1}/${files.length}: ${f.name}…`);
+    try {
+      const { norm } = await parseCardFile(f);
+      const c = { ...(norm.character || {}) };
+      if (!c.name || !String(c.name).trim()) c.name = f.name.replace(/\.(png|json|webp)$/i, "");
+      const id = await saveCharacter({ ...c, avatar: norm.avatar ?? null });
+      if ((norm.loreEntries || []).length) {
+        await saveLorebook({ character_id: id, name: "Character book", entries: norm.loreEntries });
+      }
+      ok++;
+    } catch (e) {
+      logErr("E_UI_IMPORT", `${f.name}: ${e.message}`);
+      failed.push(`${f.name} (${e.message})`);
+    }
+  }
+  await refreshLibrary();
+  showView("chars");
+  const summary = failed.length
+    ? `Bulk import: ${ok} saved, ${failed.length} failed: ${failed.join("; ")}`
+    : `Bulk import: ${ok} character${ok === 1 ? "" : "s"} saved.`;
+  setCardStatus(summary);
+  logInfo("E_UI_IMPORT", summary);
   refreshDiag();
 }
 
@@ -3095,9 +3146,9 @@ async function init() {
     await handleImportFile(f);
   });
   $("#file-card").addEventListener("change", async (e) => {
-    const f = e.target.files?.[0];
+    const files = [...(e.target.files || [])];
     e.target.value = "";
-    if (f) await handleCardFile(f);
+    if (files.length) await handleCardFiles(files);
   });
   $("#btn-export-chat").addEventListener("click", handleExportChat);
   $("#file-chat-import").addEventListener("change", async (e) => {

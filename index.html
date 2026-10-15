@@ -20,7 +20,7 @@
     <header class="topbar">
       <button id="btn-left" class="iconbtn" aria-label="Open library">&#9776;</button>
       <h1>Polyglot</h1>
-      <span id="ver" class="ver">v1.5.2</span>
+      <span id="ver" class="ver">v1.5.3</span>
       <div class="spacer"></div>
       <button id="btn-right" class="iconbtn" aria-label="Open settings">&#9881;</button>
     </header>
@@ -65,7 +65,7 @@
               <option value="favorites">Favorites first</option>
             </select>
             <button id="btn-chars-new" class="btn" type="button">+ New</button>
-            <label class="btn secondary" for="file-card">Import PNG</label>
+            <label class="btn secondary" for="file-card" title="Select one or more PNG/JSON cards — several at once are saved directly">Import cards</label>
           </div>
           <h3>Favorites</h3>
           <div id="chars-fav-list" class="list"></div>
@@ -202,8 +202,8 @@
         <h3>Characters <button id="btn-new-char" class="mini" type="button">+ New</button></h3>
         <div id="char-list" class="list"></div>
         <div class="vaultbtns">
-          <label class="btn secondary" for="file-card">Import card</label>
-          <input id="file-card" type="file" accept=".png,.json,.webp,image/png,application/json,image/webp" hidden />
+          <label class="btn secondary" for="file-card" title="Select one or more PNG/JSON cards — several at once are saved directly">Import card(s)</label>
+          <input id="file-card" type="file" accept=".png,.json,.webp,image/png,application/json,image/webp" multiple hidden />
         </div>
         <div id="card-status" class="status" role="status"></div>
       </section>
