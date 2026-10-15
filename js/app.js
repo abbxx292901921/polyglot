@@ -1,6 +1,6 @@
 import { APP_VERSION, DEFAULT_CONNECTION, DEFAULT_PROVIDER, DEFAULT_SAMPLERS, DEFAULT_PROMPTS, THEMES } from "./config.js";
 import { applyRules, compileRule, cleanFlags } from "./regex-engine.js";
-import { STAGE_KEYS, STAGE_META, normalizeToggles, defaultStageToggles, parseDirector, directorBlocks, parseDice, diceBlocks, defaultWorldState, normalizeWorld, applyWorldCommand, formatWorldSheet, worldBlocks, defaultChessState, normalizeChess, parseChessTriggers, chessBlocks, renderBoardText, startChessGame, playChessTurn, forfeitChess, buildStageBlocks } from "./stages.js";
+import { STAGE_KEYS, STAGE_META, normalizeToggles, defaultStageToggles, parseDirector, parseDice, normalizeWorld, applyWorldCommand, formatWorldSheet, normalizeChess, parseChessTriggers, renderBoardText, toFEN, startChessGame, playChessTurn, forfeitChess, buildStageBlocks } from "./stages.js";
 import { SUPERVISOR_ACTIONS, parseSupervisorReply, validateAction, normalizeAction, describeAction, buildSupervisorPrompt, localDraftCharacter, localPolishCharacter } from "./supervisor.js";
 import {
   openDB,
@@ -1605,7 +1605,23 @@ async function buildContext(pastRows, extraUserText = "") {
       for (const s of (states || [])) {
         if (s && s.stage_key) stateMap[s.stage_key] = s.state || {};
       }
-      stageBlocks = buildStageBlocks({ toggles, states: stateMap, lastUserText: extraUserText || recent || "" });
+      const probeText = extraUserText || recent || "";
+      const pdProbe = parseDirector(probeText);
+      const diceProbe = parseDice(probeText);
+      const dirPersistent = (stateMap.director && typeof stateMap.director.persistent === "string")
+        ? stateMap.director.persistent
+        : "";
+      const sysBlocks = buildStageBlocks({
+        toggles,
+        directorImmediate: pdProbe.immediate,
+        directorPersistent: dirPersistent,
+        diceRolls: diceProbe,
+        diceWho: me?.name || "You",
+        worldState: stateMap.world || {},
+        chessState: stateMap.chess || {},
+        chessNote: ""
+      });
+      stageBlocks = (sysBlocks || []).map((b) => (b && b.content) || "").filter(Boolean);
     }
   } catch (e) {
     try { logWarn("E_STAGE_STATE", "stage inject skipped: " + (e?.message || e)); } catch { /* noop */ }
@@ -1713,10 +1729,10 @@ async function runStagePrepass(chatId, userText) {
     }
     if (toggles.world) {
       const cur = normalizeWorld(byKey.world?.state);
-      const upd = applyWorldCommand(cur, text);
+      const upd = applyWorldCommand(text, cur);
       if (upd.changed) {
-        await saveStageState(chatId, "world", upd.world, byKey.world?.settings || {});
-        try { logInfo("E_STAGE_STATE", "world updated: " + upd.applied.slice(0, 3).join(", ")); } catch { /* noop */ }
+        await saveStageState(chatId, "world", upd.state, byKey.world?.settings || {});
+        try { logInfo("E_STAGE_STATE", "world updated: " + (upd.reply || "ok").slice(0, 120)); } catch { /* noop */ }
       }
     }
     if (toggles.director) {
@@ -1731,18 +1747,20 @@ async function runStagePrepass(chatId, userText) {
     }
     if (toggles.chess) {
       let cs = normalizeChess(byKey.chess?.state);
-      const trig = parseChessTriggers(text, cs);
-      if (trig.kind === "start") {
+      const trig = parseChessTriggers(text);
+      if (trig.wantsStart) {
         cs = startChessGame(cs.difficulty);
         await saveStageState(chatId, "chess", cs, byKey.chess?.settings || {});
         try { logInfo("E_STAGE_STATE", "chess started"); } catch { /* noop */ }
-      } else if (trig.kind === "move" && trig.moves && trig.moves.length) {
+      } else if (trig.moves && trig.moves.length && cs.active) {
         for (const mv of trig.moves) {
-          const r = playChessTurn(cs, mv.from, mv.to, mv.promo);
+          const r = playChessTurn(cs, mv.from, mv.to);
           if (r.ok) cs = r.state;
+          else break;
         }
         await saveStageState(chatId, "chess", cs, byKey.chess?.settings || {});
-      } else if (trig.kind === "forfeit") {
+      }
+      if (trig.wantsForfeit && cs.active) {
         cs = forfeitChess(cs);
         await saveStageState(chatId, "chess", cs, byKey.chess?.settings || {});
       }
@@ -3558,7 +3576,7 @@ async function renderStagesView() {
         if (cs.active) {
           const b = document.createElement("pre");
           b.className = "board-pre";
-          b.textContent = renderBoardText(cs) + "\nFEN: " + cs.fen;
+          b.textContent = renderBoardText(cs) + "\nFEN: " + toFEN(cs);
           prev.append(b);
         }
       } catch { /* preview optional */ }

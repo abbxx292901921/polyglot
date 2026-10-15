@@ -110,7 +110,7 @@ export function diceBlocks(rolls, who) {
 
 // ---------- World state ----------
 export function defaultWorldState() {
-  return { location: "", time: "", party: [], inventory: [], flags: {}, notes: "" };
+  return { location: "", time: "", weather: "", party: [], inventory: [], flags: {}, notes: "" };
 }
 
 export function normalizeWorld(raw) {
@@ -119,6 +119,7 @@ export function normalizeWorld(raw) {
   return {
     location: String(raw.location || ""),
     time: String(raw.time || ""),
+    weather: String(raw.weather || ""),
     party: Array.isArray(raw.party) ? raw.party.map((s) => String(s)).filter(Boolean).slice(0, 24) : [],
     inventory: Array.isArray(raw.inventory) ? raw.inventory.map((s) => String(s)).filter(Boolean).slice(0, 48) : [],
     flags: (raw.flags && typeof raw.flags === "object") ? { ...raw.flags } : {},
@@ -134,10 +135,11 @@ export function applyWorldCommand(text, state) {
   if (!src.startsWith("/")) return { state: st, changed: false, reply: "" };
   const line = src.replace(/\s+/g, " ").trim();
   let m;
-  m = /^\/set\s+(location|time|place|where)\s+(.+)$/i.exec(line);
+  m = /^\/set\s+(location|time|place|where|weather)\s+(.+)$/i.exec(line);
   if (m) {
     const val = m[2].trim().slice(0, 160);
     if (/^time/i.test(m[1])) st.time = val;
+    else if (/^weather/i.test(m[1])) st.weather = val;
     else st.location = val;
     return { state: st, changed: true, reply: `World updated: ${m[1].toLowerCase()} = ${val}` };
   }
@@ -203,6 +205,7 @@ export function formatWorldSheet(st) {
   const lines = [
     `Location: ${s.location || "-"}`,
     `Time: ${s.time || "-"}`,
+    `Weather: ${s.weather || "-"}`,
     `Party: ${s.party.length ? s.party.join(", ") : "-"}`,
     `Inventory: ${s.inventory.length ? s.inventory.join(", ") : "-"}`,
     `Flags: ${flagKeys.length ? flagKeys.map((k) => `${k}=${s.flags[k]}`).join(", ") : "-"}`
@@ -213,7 +216,7 @@ export function formatWorldSheet(st) {
 
 export function worldBlocks(st) {
   const s = normalizeWorld(st);
-  const empty = !s.location && !s.time && !s.party.length && !s.inventory.length && !Object.keys(s.flags || {}).length && !s.notes;
+  const empty = !s.location && !s.time && !s.weather && !s.party.length && !s.inventory.length && !Object.keys(s.flags || {}).length && !s.notes;
   if (empty) return [];
   return [{ role: "system", content: "[World State - authoritative, do not contradict]\n" + formatWorldSheet(s) }];
 }
