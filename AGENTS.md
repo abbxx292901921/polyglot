@@ -48,11 +48,18 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   character editor modal, card import + per-chat export/import, vault
   export/import, diagnostics panel, SW registration.
 - `js/prompt-engine.js` — pure context pipeline: resolveMacros, estimateTokens,
-  scanLorebook, injectAtDepth, applyTokenBudget, buildMessages.
+  scanLorebook, injectAtDepth, applyTokenBudget, buildMessages (+reasoningStyle
+  softener), normalizeAgentic (strict user/assistant alternation, final user).
 - `js/sse-streamer.js` — SSE decoder (TextDecoder stream) + createThinkSplitter
   for split `<think>` tags; routes reasoning_content + inline thinks to reasoning.
-- `js/api-client.js` — sanitizePayload per reasoning_strategy, resolveEndpoint
-  (proxy-aware), sendChat streaming via fetch + streamSSE.
+- `js/api-client.js` — buildPayload (allowlist + ONE validated thinking knob) +
+  sanitizePayload wrapper, resolveEndpoint (proxy-aware), fetchReasoningModes
+  (docs OpenAPI page, key never sent, catalog fallback), sendChat streaming via
+  fetch + streamSSE with onNote surfacing.
+- `js/reasoning-modes.js` — pure thinking-knob resolver: CATALOG (surveyed
+  per-model effort/budget/kwargs shapes), parseModesPage (docs OpenAPI),
+  mergeReasoning (new schema + legacy mapping), applyThinking (validated,
+  exactly one knob), modeValues/describeMode for the preset UI.
 - `js/png-parser.js` — card ingestion: walkChunks, tEXt/zTXt/iTXt, chara/ccv3
   (V3 wins), parsePNGCard/parseCharacterJSON/normalizeCharacter,
   fileToAvatarDataURL (512px webp→jpeg fallback).
@@ -115,5 +122,12 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   `node --check` passed. Static shell, all buttons dead. Fixed the comment,
   wrapped init data-load in try/catch (wiring always runs, failure surfaces in
   #chat + diag log), global error/unhandledrejection reporter, `onblocked`
-  rejection in `openDB`. Verified by executing `init()` in node with DOM/IDB
-  stubs (INIT_OK, 0 rejections).
+   rejection in `openDB`. Verified by executing `init()` in node with DOM/IDB
+   stubs (INIT_OK, 0 rejections).
+- v1.6.1 DONE: per-model thinking knobs — `reasoning-modes.js` (CATALOG +
+  docs-OpenAPI parse + merge/apply, exactly one validated knob), `buildPayload`
+  + `fetchReasoningModes` (key never sent, catalog fallback) in api-client,
+  `normalizeAgentic` + `reasoningStyle` softener in prompt-engine, Thinking
+  mode/Level/Budget/JSON/Agentic UI + Fetch thinking modes button, `E_MODES_
+  FETCH/E_REASONING/E_AGENCY` diagnostics. Legacy reasoning_strategy presets
+  still send via mergeReasoning mapping; no DB migration (preset fields only).

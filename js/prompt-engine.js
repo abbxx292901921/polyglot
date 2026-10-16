@@ -204,6 +204,48 @@ export function treeLayout(rows) {
   return { nodes, maxDepth: nodes.reduce((a, n) => Math.max(a, n.depth), 0) };
 }
 
+// Agentic-format normalizer for strict gateways (Nemotron/Step/Kimi NIM
+// additionalProperties:false endpoints): their chat templates require one
+// optional leading system message, strict user/assistant alternation, and a
+// final user turn. Merges are content-preserving ("\n\n" joins); a trailing
+// assistant turn (continue/prefill flows) is kept and followed by a user
+// nudge so the model extends it instead of being handed an invalid shape.
+export function normalizeAgentic(messages = []) {
+  const sys = [];
+  const rest = [];
+  for (const m of (Array.isArray(messages) ? messages : [])) {
+    if (!m || typeof m.content !== "string" || !m.content.trim()) continue;
+    (m.role === "system" ? sys : rest).push(m);
+  }
+  const out = [];
+  if (sys.length) out.push({ role: "system", content: sys.map((m) => m.content).join("\n\n") });
+  let merged = 0;
+  for (const m of rest) {
+    const role = m.role === "assistant" ? "assistant" : "user";
+    const last = out[out.length - 1];
+    if (last && last.role === role) {
+      last.content += "\n\n" + m.content;
+      merged++;
+    } else {
+      out.push({ role, content: m.content });
+    }
+  }
+  let nudged = false;
+  if (!out.length || out[out.length - 1].role !== "user") {
+    out.push({ role: "user", content: "(Continue seamlessly from where you stopped. Do not repeat yourself.)" });
+    nudged = true;
+  }
+  return { messages: out, merged, nudged };
+}
+
+// Prompt-side softener for always-thinking checkpoints with no API knob
+// (step-5, kimi-k2-thinking, qwq, step-3.5-flash): a short system directive
+// is the only lever those models expose.
+const SOFTENERS = {
+  brief: "Reasoning style: keep your internal reasoning brief — at most a few short sentences — then give your reply.",
+  terse: "Reasoning style: skip extended deliberation. Reason in one or two short sentences at most, then reply immediately."
+};
+
 // Full pipeline: macros → lorebook → stages → depth inject → budget → prefill.
 // history: [{role, content}] oldest→newest (already macro-safe raw text).
 // stageBlocks: prebuilt system strings from stages.js buildStageBlocks (already safe).
@@ -218,10 +260,12 @@ export function buildMessages({
   recentText = "",
   history = [],
   prefill = null,
+  reasoningStyle = "",
   macroCtx = {},
   budget = {}
 } = {}) {
-  const sys = resolveMacros(system, macroCtx);
+  const softener = SOFTENERS[String(reasoningStyle || "").toLowerCase()] || "";
+  const sys = [resolveMacros(system, macroCtx), softener].filter((s) => s && s.trim()).join("\n\n");
   const jb = jailbreak ? resolveMacros(jailbreak, macroCtx) : "";
   const note = authorsNote ? resolveMacros(authorsNote, macroCtx) : "";
   const lore = activeLore ?? scanLorebook(loreEntries, recentText);

@@ -1,19 +1,28 @@
-/* Polyglot api-client — OpenAI-Compatible payload sanitizer + streaming sender.
-   Extra inputs are not permitted by strict gateways (400s), so every body is
-   built from a tight allowlist plus exactly one reasoning strategy:
-   - "none": strip all reasoning keys (Nemotron / Llama standard / base GLM).
-   - "openai_effort": + reasoning_effort low|medium|high, no numeric budgets.
-   - "anthropic_budget": + thinking {type:"enabled", budget_tokens>=1024}.
-   - "tag_only": zero reasoning keys on the wire; <think> parsed client-side
-     (DeepSeek R1-style on NIM). Same wire shape as "none".
-   Keys are sent only in the Authorization header, never logged or put in URLs.
-   Providers (base_url + key + proxy) and model presets (model + samplers +
-   prompts) are distinct and mixed at send time. Legacy presets that still
-   embed connection.* keep working via the merge below. */
+/* Polyglot api-client — OpenAI-Compatible payload builder + streaming sender.
+   Strict gateways (Nvidia NIM: additionalProperties false) reject unknown
+   request keys, so every body is built from a tight allowlist plus exactly
+   ONE validated thinking knob shape, resolved from the model's own schema:
+   - "off": no reasoning keys (client-side think parsing still runs).
+   - "effort": reasoning_effort, validated against the model's enum (kimi-k3
+     low|high|max, nemotron-3-super none|low|high, gpt-oss low|medium|high).
+   - "budget": reasoning_budget (Nemotron -1..32768), clamped per model.
+   - "kwargs": chat_template_kwargs (step-5/nemotron enable_thinking,
+     low_effort, medium_effort, preserve_thinking) from fetched/catalog modes.
+   - "anthropic": thinking {type:"enabled", budget_tokens>=1024}.
+   - "custom": user JSON merged at the body root (their responsibility).
+   Modes come from fetchReasoningModes() (the model's OpenAPI page on
+   docs.api.nvidia.com, proxy-aware, key never sent) or the built-in catalog
+   in reasoning-modes.js — never guessed per-request.
+   Agentic-format endpoints additionally get normalizeAgentic() messages:
+   one leading system, strict user/assistant alternation, final user turn.
+   Keys are sent only in the Authorization header, never logged or put in
+   URLs. Providers (base_url + key + proxy) and model presets (model +
+   samplers + prompts) are distinct and mixed at send time. Legacy presets
+   that still embed connection.* keep working via mergeReasoning's mapping. */
 
 import { streamSSE } from "./sse-streamer.js";
-
-const EFFORTS = new Set(["low", "medium", "high"]);
+import { normalizeAgentic } from "./prompt-engine.js";
+import { mergeReasoning, agenticWanted, applyThinking, catalogLookup, parseModesPage } from "./reasoning-modes.js";
 
 function pickModel(preset) {
   if (typeof preset?.model === "string" && preset.model.trim()) return preset.model.trim();
@@ -22,23 +31,23 @@ function pickModel(preset) {
   return "";
 }
 
-function pickReasoning(preset) {
-  const c = preset?.connection || {};
-  return {
-    strategy: preset?.reasoning_strategy || c.reasoning_strategy || "none",
-    effort: preset?.reasoning_effort || c.reasoning_effort || "medium",
-    budget: preset?.thinking_budget ?? c.thinking_budget ?? 2048
-  };
+function proxified({ use_proxy, proxy_url }, host, path) {
+  const proxy = use_proxy ? String(proxy_url || "").trim().replace(/\/+$/, "") : "";
+  const target = `https://${host}${path}`;
+  return proxy ? proxy + "/" + target.replace(/^https?:\/\//, "") : target;
 }
 
-export function sanitizePayload(preset, messages) {
+// Builds the wire body + human-readable notes (invalid mode values, budget
+// bumps, agentic merges). sanitizePayload() returns just the body for
+// back-compat; sendChat uses this and surfaces notes via onNote.
+export function buildPayload(preset, messages) {
   const sam = preset?.samplers || {};
-  const strategy = pickReasoning(preset).strategy;
   const model = pickModel(preset);
+  const r = mergeReasoning(preset || {}, preset?.connection || {}, model);
+  const notes = [];
 
   const body = {
     model,
-    messages,
     temperature: Number(sam.temperature ?? 0.9),
     top_p: Number(sam.top_p ?? 1.0),
     max_tokens: Math.max(1, Number(sam.max_tokens ?? 800)),
@@ -49,17 +58,23 @@ export function sanitizePayload(preset, messages) {
   if (Number(sam.frequency_penalty)) body.frequency_penalty = Number(sam.frequency_penalty);
   if (Number(sam.presence_penalty)) body.presence_penalty = Number(sam.presence_penalty);
 
-  if (strategy === "openai_effort") {
-    const raw = pickReasoning(preset).effort;
-    const e = String(raw || "medium").toLowerCase();
-    body.reasoning_effort = EFFORTS.has(e) ? e : "medium";
-  } else if (strategy === "anthropic_budget") {
-    const raw = pickReasoning(preset).budget;
-    const b = Math.max(1024, Number(raw ?? 2048) || 2048);
-    body.thinking = { type: "enabled", budget_tokens: b };
+  let msgs = Array.isArray(messages) ? messages : [];
+  if (agenticWanted(r)) {
+    const n = normalizeAgentic(msgs);
+    msgs = n.messages;
+    const bits = [];
+    if (n.merged) bits.push(`merged ${n.merged} same-role message${n.merged === 1 ? "" : "s"}`);
+    if (n.nudged) bits.push("appended final user turn");
+    if (bits.length) notes.push(`E_AGENCY: agentic format — ${bits.join(", ")}.`);
   }
-  // "none" and "tag_only": no reasoning keys at all.
-  return body;
+  body.messages = msgs;
+
+  notes.push(...applyThinking(body, r));
+  return { body, notes };
+}
+
+export function sanitizePayload(preset, messages) {
+  return buildPayload(preset, messages).body;
 }
 
 export function resolveEndpoint(connection) {
@@ -136,6 +151,41 @@ export async function fetchModels({ base_url, api_key, use_proxy, proxy_url, sig
   return normalizeModelList(json);
 }
 
+// Resolves a model's thinking knobs from its own OpenAPI page on
+// docs.api.nvidia.com (public docs; the provider key is NEVER sent here).
+// Model ids like "stepfun-ai/step-5-preview" map to slugs like
+// "stepfun-ai-step-5-preview-infer". Never throws: docs fetch is
+// CORS-blocked from browsers without a proxy, so any failure falls back to
+// the surveyed catalog in reasoning-modes.js. Resolves
+// { descriptor, source: "fetched"|"catalog"|"none", note }.
+export async function fetchReasoningModes({ model, use_proxy, proxy_url, signal } = {}) {
+  const id = String(model || "").trim();
+  if (!id) throw new Error("E_MODES_FETCH: no model name — pick a model first.");
+  const slug = id.toLowerCase().replace(/[\/. _]+/g, "-").replace(/[^a-z0-9-]/g, "") + "-infer";
+  const url = proxified({ use_proxy, proxy_url }, "docs.api.nvidia.com", "/nim/reference/" + slug);
+  try {
+    const res = await fetch(url, { method: "GET", signal });
+    if (!res.ok) throw new Error(`docs page ${res.status}`);
+    const html = await res.text();
+    const parsed = parseModesPage(html, id);
+    if (parsed) {
+      return { descriptor: parsed, source: "fetched", note: `Fetched live schema for ${id} (${parsed.hint || "no knobs"}).` };
+    }
+    const cat = catalogLookup(id);
+    if (cat) {
+      return { descriptor: cat, source: "catalog", note: `Docs page for ${id} had no reasoning schema; using surveyed catalog (${cat.hint || "no knobs"}).` };
+    }
+    return { descriptor: null, source: "none", note: `No reasoning schema found for ${id} — mode "off" sends no reasoning keys.` };
+  } catch (e) {
+    if (e?.name === "AbortError") throw e;
+    const cat = catalogLookup(id);
+    if (cat) {
+      return { descriptor: cat, source: "catalog", note: `Docs fetch blocked (${e?.message || "offline/CORS"}) — using surveyed catalog for ${id} (${cat.hint || "no knobs"}). Enable the reverse proxy and retry for the live schema.` };
+    }
+    return { descriptor: null, source: "none", note: `Docs fetch blocked (${e?.message || "offline/CORS"}) and ${id} is not in the catalog — mode "off" sends no reasoning keys.` };
+  }
+}
+
 function errMsg(status, text) {
   let detail = "";
   try {
@@ -151,7 +201,7 @@ function errMsg(status, text) {
 // accumulated {content, reasoning}. Throws on HTTP errors or abort.
 // Accepts split shapes: {provider, preset} (v1.5+) or legacy {connection}.
 // Legacy {connection:{...model}} still works: it is merged as the fallback.
-export async function sendChat({ provider, preset, connection, samplers, messages, signal, onContent, onReasoning }) {
+export async function sendChat({ provider, preset, connection, samplers, messages, signal, onContent, onReasoning, onNote }) {
   const effConn = { ...(provider || {}), ...(connection || {}) };
   const effSamplers = samplers ?? preset?.samplers ?? {};
   const effPreset = {
@@ -165,7 +215,8 @@ export async function sendChat({ provider, preset, connection, samplers, message
   };
   if (!pickModel(effPreset)) throw new Error("E_NET_MODEL: preset has no model name.");
   const url = resolveEndpoint(effConn);
-  const body = sanitizePayload(effPreset, messages);
+  const { body, notes } = buildPayload(effPreset, messages);
+  if (onNote) for (const n of notes) { try { onNote(n); } catch { /* notes never break send */ } }
   const headers = { "Content-Type": "application/json" };
   if (effConn.api_key) headers.Authorization = "Bearer " + effConn.api_key;
 

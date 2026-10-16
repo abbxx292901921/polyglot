@@ -34,7 +34,10 @@ export const CODES = {
   E_REGEX_RULE: "Regex script saved/applied/skipped; invalid patterns are rejected or skipped, never fatal.",
   E_STAGE_STATE: "Stage state load/save/dice/chess/world event; never fatal to send.",
   E_STAGE_RULE: "Stage def saved/applied/skipped; invalid config rejected, never fatal.",
-  E_SUPERVISOR: "Supervisor router action proposed/applied/rejected; schema errors are rejected, never fatal."
+  E_SUPERVISOR: "Supervisor router action proposed/applied/rejected; schema errors are rejected, never fatal.",
+  E_MODES_FETCH: "Thinking-modes fetch for a model: live docs schema, surveyed catalog fallback, or none.",
+  E_REASONING: "Thinking knob applied/skipped at send time; invalid values fall back, never fatal.",
+  E_AGENCY: "Agentic message normalization at send time (strict user/assistant alternation)."
 };
 
 export function log(level, code, msg) {

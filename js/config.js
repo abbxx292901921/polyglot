@@ -1,8 +1,8 @@
 // Polyglot — single source of truth for version + defaults.
 // Phase 2/3 modules import from here so a preset change is one edit.
-export const APP_VERSION = "v1.6.0";
+export const APP_VERSION = "v1.6.1";
 
-export const CACHE_NAME = "polyglot-v1.6.0";
+export const CACHE_NAME = "polyglot-v1.6.1";
 export const DB_NAME = "PolyglotDB";
 export const DB_VERSION = 4;
 
@@ -19,9 +19,12 @@ export const DEFAULT_CONNECTION = {
   base_url: "https://api.openai.com",
   api_key: "",
   model: "",
-  reasoning_strategy: "none", // "none" | "openai_effort" | "anthropic_budget" | "tag_only"
-  reasoning_effort: "medium", // for openai_effort: "low" | "medium" | "high"
-  thinking_budget: 2048, // for anthropic_budget, clamped >= 1024 at send time
+  reasoning_mode: "off", // "off" | "effort" | "budget" | "kwargs" | "anthropic" | "custom"
+  reasoning_value: "", // effort level or kwargs mode id, validated per model
+  reasoning_budget: 2048, // for budget/anthropic modes, clamped per model
+  reasoning_kwargs: "", // raw JSON for kwargs/custom modes
+  reasoning_modes: null, // descriptor cache from Fetch modes (or catalog)
+  agentic_format: "auto", // "auto" | "on" | "off" — strict user/assistant shape
   use_proxy: false,
   proxy_url: ""
 };
@@ -43,6 +46,7 @@ export const DEFAULT_PROMPTS = {
   jailbreak: "",
   authors_note: "",
   authors_note_depth: 2,
+  reasoning_style: "", // "" | "brief" | "terse" — prompt-side think softener
   prefill_enabled: false,
   prefill_text: "*"
 };

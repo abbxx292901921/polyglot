@@ -20,7 +20,7 @@
     <header class="topbar">
       <button id="btn-left" class="iconbtn" aria-label="Open library">&#9776;</button>
       <h1>Polyglot</h1>
-      <span id="ver" class="ver">v1.6.0</span>
+      <span id="ver" class="ver">v1.6.1</span>
       <div class="spacer"></div>
       <button id="btn-right" class="iconbtn" aria-label="Open settings">&#9881;</button>
     </header>
@@ -303,22 +303,36 @@
         <label class="field">Preset name<input id="conn-label" type="text" autocomplete="off" /></label>
         <label class="field">Model<input id="conn-model" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="model-id — Fetch models from the provider above" list="model-choices" /></label>
         <datalist id="model-choices"></datalist>
-        <label class="field">Reasoning strategy
+        <label class="field">Thinking mode
           <select id="conn-strategy">
-            <option value="none">none — strip reasoning keys</option>
-            <option value="openai_effort">openai_effort — reasoning_effort</option>
-            <option value="anthropic_budget">anthropic_budget — thinking budget</option>
-            <option value="tag_only">tag_only — client-side &lt;think&gt; only</option>
+            <option value="off">off — no reasoning keys</option>
+            <option value="effort">effort — reasoning_effort (validated per model)</option>
+            <option value="budget">budget — reasoning_budget (Nemotron)</option>
+            <option value="kwargs">kwargs — chat_template_kwargs (Step/Nemotron)</option>
+            <option value="anthropic">anthropic — thinking budget</option>
+            <option value="custom">custom — raw JSON at body root</option>
           </select>
         </label>
-        <label class="field">Effort (openai_effort)
-          <select id="conn-effort">
-            <option value="low">low</option>
-            <option value="medium">medium</option>
-            <option value="high">high</option>
+        <div class="grid2">
+          <label class="field">Level / kwargs mode
+            <select id="conn-effort" aria-label="Thinking level">
+              <option value="">auto (model default)</option>
+            </select>
+          </label>
+          <label class="field">Budget<input id="conn-budget" type="number" min="-1" step="256" /></label>
+        </div>
+        <label class="field">Kwargs / custom JSON<input id="conn-kwargs" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder='{"enable_thinking": true}' /></label>
+        <label class="field">Agentic format
+          <select id="conn-agentic">
+            <option value="auto">auto (strict models only)</option>
+            <option value="on">on — always normalize roles</option>
+            <option value="off">off — never normalize</option>
           </select>
         </label>
-        <label class="field">Thinking budget (anthropic, min 1024)<input id="conn-budget" type="number" min="1024" step="256" /></label>
+        <div class="vaultbtns">
+          <button id="btn-fetch-modes" class="btn secondary" type="button">Fetch thinking modes</button>
+        </div>
+        <div id="reasoning-status" class="status" role="status"></div>
         <div class="grid2">
           <label class="field">Max tokens<input id="sam-max" type="number" step="1" /></label>
           <label class="field">Context limit<input id="sam-ctx" type="number" step="512" /></label>
@@ -339,6 +353,13 @@
       <section class="sec" data-ppane="prompt" hidden>
         <h3>Prompts</h3>
         <label class="field">System prompt<textarea id="pr-system" rows="4"></textarea></label>
+        <label class="field">Reasoning style (always-thinking models)
+          <select id="pr-soften">
+            <option value="">off — no directive</option>
+            <option value="brief">brief — keep internal reasoning short</option>
+            <option value="terse">terse — barely deliberate, reply fast</option>
+          </select>
+        </label>
         <label class="field">Jailbreak / system follow-up<textarea id="pr-jailbreak" rows="3"></textarea></label>
         <label class="checkline"><input type="checkbox" id="pr-prefill-use" /> Assistant prefill</label>
         <label class="field">Prefill text<input id="pr-prefill-text" type="text" /></label>

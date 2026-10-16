@@ -41,7 +41,8 @@ import {
   seedIfEmpty
 } from "./db.js";
 import { buildMessages, estimateTokens, activeChain, parentMap, childrenMap, treeLayout } from "./prompt-engine.js";
-import { sendChat, fetchModels } from "./api-client.js";
+import { sendChat, fetchModels, fetchReasoningModes } from "./api-client.js";
+import { mergeReasoning, modeValues, describeMode, catalogLookup } from "./reasoning-modes.js";
 import { parsePNGCard, parseCharacterJSON, normalizeCharacter, fileToAvatarDataURL } from "./png-parser.js";
 import {
   err as logErr, warn as logWarn, info as logInfo,
@@ -395,12 +396,7 @@ function presetModel(p) {
 }
 
 function presetReasoning(p) {
-  const c = p?.connection || {};
-  return {
-    strategy: p?.reasoning_strategy || c.reasoning_strategy || "none",
-    effort: p?.reasoning_effort || c.reasoning_effort || "medium",
-    budget: p?.thinking_budget ?? c.thinking_budget ?? 2048
-  };
+  return mergeReasoning(p || {}, p?.connection || {}, presetModel(p));
 }
 
 // v1.4 presets embedded connection.*. v1.5 splits providers out so any
@@ -438,6 +434,11 @@ async function migrateLegacyPresetsIfNeeded() {
       reasoning_strategy: p.reasoning_strategy || c.reasoning_strategy || "none",
       reasoning_effort: p.reasoning_effort || c.reasoning_effort || "medium",
       thinking_budget: p.thinking_budget ?? c.thinking_budget ?? 2048,
+      reasoning_mode: p.reasoning_mode || "",
+      reasoning_value: p.reasoning_value ?? "",
+      reasoning_budget: p.reasoning_budget ?? p.thinking_budget ?? c.thinking_budget ?? 2048,
+      reasoning_kwargs: p.reasoning_kwargs ?? "",
+      agentic_format: p.agentic_format || "auto",
       connection: undefined,
       updated_at: Date.now()
     });
@@ -1299,9 +1300,11 @@ function readPresetForm() {
   return {
     name: $("#conn-label").value.trim() || "Preset",
     model: $("#conn-model").value.trim(),
-    reasoning_strategy: $("#conn-strategy").value || "none",
-    reasoning_effort: $("#conn-effort").value || "medium",
-    thinking_budget: Number($("#conn-budget").value) || 2048,
+    reasoning_mode: $("#conn-strategy").value || "off",
+    reasoning_value: $("#conn-effort").value || "",
+    reasoning_budget: Number($("#conn-budget").value) || 2048,
+    reasoning_kwargs: $("#conn-kwargs").value.trim(),
+    agentic_format: $("#conn-agentic").value || "auto",
     samplers: {
       temperature: Number($("#sam-temp").value),
       top_p: Number($("#sam-topp").value),
@@ -1318,6 +1321,7 @@ function readPresetForm() {
       jailbreak: $("#pr-jailbreak").value,
       authors_note: $("#pr-note").value,
       authors_note_depth: Number($("#pr-depth").value) || 0,
+      reasoning_style: $("#pr-soften")?.value || "",
       prefill_enabled: $("#pr-prefill-use").checked,
       prefill_text: $("#pr-prefill-text").value
     }
@@ -1331,9 +1335,11 @@ function fillPresetForm(preset) {
   const r = presetReasoning(preset);
   $("#conn-label").value = preset.name || "";
   $("#conn-model").value = presetModel(preset);
-  $("#conn-strategy").value = r.strategy || "none";
-  $("#conn-effort").value = r.effort || "medium";
+  $("#conn-strategy").value = r.mode || "off";
   $("#conn-budget").value = r.budget ?? 2048;
+  $("#conn-kwargs").value = r.kwargs || "";
+  $("#conn-agentic").value = r.agentic || "auto";
+  refreshReasoningUI(preset, r.value || "");
   $("#sam-temp").value = s.temperature ?? 0.9;
   $("#sam-topp").value = s.top_p ?? 1.0;
   $("#sam-topk").value = s.top_k ?? 0;
@@ -1344,11 +1350,83 @@ function fillPresetForm(preset) {
   $("#sam-pres").value = s.presence_penalty ?? 0;
   $("#sam-stop").value = (s.stop || []).join("\n");
   $("#pr-system").value = p.system || "";
+  if ($("#pr-soften")) $("#pr-soften").value = p.reasoning_style || "";
   $("#pr-jailbreak").value = p.jailbreak || "";
   $("#pr-note").value = p.authors_note || "";
   $("#pr-depth").value = p.authors_note_depth ?? 2;
   $("#pr-prefill-use").checked = !!p.prefill_enabled;
   $("#pr-prefill-text").value = p.prefill_text || "";
+}
+
+function setReasoningStatus(msg) {
+  const el = $("#reasoning-status");
+  if (el) el.textContent = msg;
+}
+
+// Rebuilds the Level select from the model's own modes (fetched descriptor,
+// else surveyed catalog, else the generic effort trio) and shows the schema
+// hint. Called by fillPresetForm and on model/mode changes.
+function refreshReasoningUI(preset, keepValue) {
+  const sel = $("#conn-effort");
+  if (!sel) return;
+  const model = $("#conn-model")?.value.trim() || presetModel(preset);
+  const mode = $("#conn-strategy")?.value || "off";
+  const r = mergeReasoning(preset || {}, preset?.connection || {}, model);
+  const desc = r.descriptor || catalogLookup(model);
+  const vals = mode === "effort" || mode === "kwargs"
+    ? modeValues({ mode, descriptor: desc })
+    : [];
+  const want = keepValue ?? r.value ?? "";
+  sel.innerHTML = "";
+  const auto = document.createElement("option");
+  auto.value = "";
+  auto.textContent = desc?.effort?.default ? `auto (${desc.effort.default})` : "auto (model default)";
+  sel.append(auto);
+  for (const v of vals) {
+    const o = document.createElement("option");
+    o.value = v;
+    o.textContent = v;
+    sel.append(o);
+  }
+  sel.value = [...sel.options].some((o) => o.value === want) ? want : "";
+  if (desc) {
+    setReasoningStatus(`${desc.source === "fetched" ? "Live schema" : "Catalog"} for ${desc.model || model}: ${desc.hint || describeMode(r)}.`);
+  } else if (mode === "off") {
+    setReasoningStatus("Thinking off — no reasoning keys are sent.");
+  } else {
+    setReasoningStatus(`No schema for this model yet — Fetch thinking modes, or use off.`);
+  }
+}
+
+async function handleFetchModes() {
+  const model = $("#conn-model")?.value.trim() || "";
+  if (!model) {
+    setReasoningStatus("Enter a model id first (or Fetch models from the provider).");
+    return;
+  }
+  let proxy = {};
+  try { proxy = readProviderForm(); } catch { proxy = {}; }
+  setReasoningStatus(`Fetching thinking modes for ${model}…`);
+  try {
+    const { descriptor, source, note } = await fetchReasoningModes({
+      model,
+      use_proxy: proxy.use_proxy,
+      proxy_url: proxy.proxy_url
+    });
+    logInfo("E_MODES_FETCH", `${source}: ${note}`);
+    setReasoningStatus(note);
+    const active = await getActivePreset();
+    if (active && descriptor) {
+      await savePreset({ ...active, reasoning_modes: descriptor, id: active.id, updated_at: Date.now() });
+      refreshReasoningUI({ ...active, reasoning_modes: descriptor });
+    } else {
+      refreshReasoningUI(active);
+    }
+  } catch (e) {
+    logErr("E_MODES_FETCH", e.message);
+    setReasoningStatus(`Fetch failed: ${e.message}`);
+  }
+  refreshDiag();
 }
 
 function readProviderForm() {
@@ -1638,6 +1716,7 @@ async function buildContext(pastRows, extraUserText = "") {
     recentText: recent,
     history,
     prefill: preset?.prompts?.prefill_enabled ? preset.prompts.prefill_text || "*" : null,
+    reasoningStyle: preset?.prompts?.reasoning_style || "",
     macroCtx,
     budget: {
       limit: preset?.samplers?.context_window_limit ?? 8192,
@@ -1682,7 +1761,8 @@ async function runStream(preset, provider, messages, shell, signal) {
     messages,
     signal,
     onContent: (t) => { acc += t; renderLive(); },
-    onReasoning: (t) => { accThink += t; renderLive(); }
+    onReasoning: (t) => { accThink += t; renderLive(); },
+    onNote: (n) => { try { logWarn("E_REASONING", n); } catch { /* notes never break send */ } }
   });
   shell.body.innerHTML = renderMsg(content || acc);
   if ((reasoning || accThink) && tg.thought) {
@@ -2175,6 +2255,12 @@ async function handlePresetImportFile(file) {
         reasoning_strategy: rest.reasoning_strategy || legacy.reasoning_strategy || "none",
         reasoning_effort: rest.reasoning_effort || legacy.reasoning_effort || "medium",
         thinking_budget: rest.thinking_budget ?? legacy.thinking_budget ?? 2048,
+        reasoning_mode: rest.reasoning_mode || "",
+        reasoning_value: rest.reasoning_value ?? "",
+        reasoning_budget: rest.reasoning_budget ?? rest.thinking_budget ?? legacy.thinking_budget ?? 2048,
+        reasoning_kwargs: rest.reasoning_kwargs ?? "",
+        reasoning_modes: rest.reasoning_modes ?? null,
+        agentic_format: rest.agentic_format || "auto",
         samplers: { ...DEFAULT_SAMPLERS, ...(rest.samplers || {}) },
         prompts: { ...DEFAULT_PROMPTS, ...(rest.prompts || {}) }
       });
@@ -2901,7 +2987,7 @@ async function renderPresetCards() {
         const s = document.createElement("div");
         s.className = "csub";
         const r = presetReasoning(p);
-        s.textContent = `${r.strategy || "none"} | ${presetModel(p) || "no model"}`;
+        s.textContent = `${describeMode(r)} | ${presetModel(p) || "no model"}`;
         tx.append(t, s);
         tx.addEventListener("click", async () => {
           ui.presetId = p.id;
@@ -3882,9 +3968,11 @@ async function init() {
     preset: {
       name: "Default",
       model: "nvidia/llama-3.1-nemotron-70b-instruct",
-      reasoning_strategy: "none",
-      reasoning_effort: "medium",
-      thinking_budget: 2048,
+      reasoning_mode: "off",
+      reasoning_value: "",
+      reasoning_budget: 2048,
+      reasoning_kwargs: "",
+      agentic_format: "auto",
       samplers: { ...DEFAULT_SAMPLERS },
       prompts: { ...DEFAULT_PROMPTS }
     },
@@ -4023,9 +4111,11 @@ async function init() {
     const id = await savePreset({
       name: name.trim(),
       model: "nvidia/llama-3.1-nemotron-70b-instruct",
-      reasoning_strategy: "none",
-      reasoning_effort: "medium",
-      thinking_budget: 2048,
+      reasoning_mode: "off",
+      reasoning_value: "",
+      reasoning_budget: 2048,
+      reasoning_kwargs: "",
+      agentic_format: "auto",
       samplers: { ...DEFAULT_SAMPLERS },
       prompts: { ...DEFAULT_PROMPTS }
     });
@@ -4092,6 +4182,13 @@ async function init() {
   });
   $("#btn-fetch-models")?.addEventListener("click", handleFetchModels);
   $("#btn-test-conn")?.addEventListener("click", handleTestConnection);
+  $("#btn-fetch-modes")?.addEventListener("click", handleFetchModes);
+  $("#conn-strategy")?.addEventListener("change", async () => {
+    refreshReasoningUI(await getActivePreset().catch(() => null));
+  });
+  $("#conn-model")?.addEventListener("change", async () => {
+    refreshReasoningUI(await getActivePreset().catch(() => null));
+  });
   $("#btn-use-model")?.addEventListener("click", async () => {
     const pick = $("#prov-models")?.value || "";
     if (!pick) {
@@ -4260,9 +4357,11 @@ async function init() {
     const id = await savePreset({
       name: name.trim(),
       model: "nvidia/llama-3.1-nemotron-70b-instruct",
-      reasoning_strategy: "none",
-      reasoning_effort: "medium",
-      thinking_budget: 2048,
+      reasoning_mode: "off",
+      reasoning_value: "",
+      reasoning_budget: 2048,
+      reasoning_kwargs: "",
+      agentic_format: "auto",
       samplers: { ...DEFAULT_SAMPLERS },
       prompts: { ...DEFAULT_PROMPTS }
     });
