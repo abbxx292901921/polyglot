@@ -131,3 +131,11 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   mode/Level/Budget/JSON/Agentic UI + Fetch thinking modes button, `E_MODES_
   FETCH/E_REASONING/E_AGENCY` diagnostics. Legacy reasoning_strategy presets
   still send via mergeReasoning mapping; no DB migration (preset fields only).
+- v1.6.2 DONE: Forge agent loop — `supervisor.js` protocol extended to 14 reads
+  (list/get across characters, chats, lorebooks, presets, personas, providers,
+  regex, world, stage states) + 19 writes + done/answer controls; `handleForgeRun`
+  runs up to 6 steps (reads live, writes become approval proposals, transcript in
+  `#forge-results`, Stop button aborts in-flight call); `executeSupervisorAction`
+  applies deletes/upserts/exports (vault/chat/character/preset/lorebook/regex
+  downloads, keys always stripped, avatars never enter the prompt). No DB
+  migration; all writes still need Approve.

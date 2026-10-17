@@ -20,7 +20,7 @@
     <header class="topbar">
       <button id="btn-left" class="iconbtn" aria-label="Open library">&#9776;</button>
       <h1>Polyglot</h1>
-      <span id="ver" class="ver">v1.6.1</span>
+      <span id="ver" class="ver">v1.6.2</span>
       <div class="spacer"></div>
       <button id="btn-right" class="iconbtn" aria-label="Open settings">&#9881;</button>
     </header>
@@ -190,11 +190,12 @@
       </div>
       <div id="view-forge" class="view" hidden>
         <div class="wrap">
-          <h2>Forge — Supervisor</h2>
-          <p class="status">Draft characters, polish them, write scenarios, attach stages. The model only proposes — you approve every change.</p>
-          <label class="field">Request<textarea id="forge-input" rows="3" placeholder="Create a gruff dwarven barkeep with a secret… / Polish Rin / Write a tavern ambush scenario / Add chess to this chat"></textarea></label>
+          <h2>Forge — Agent</h2>
+          <p class="status">An agent over your whole library: characters, chats, lorebooks, presets, personas, regex, stages, exports. It reads what it needs, works step by step, and proposes every change — nothing is applied until you tap Approve.</p>
+          <label class="field">Request<textarea id="forge-input" rows="3" placeholder="Create a gruff dwarven barkeep with a secret… / Which characters lack a scenario? / Start a new chat with Rin and set the scene at midnight / Export my vault"></textarea></label>
           <div class="vaultbtns">
-            <button id="btn-forge-run" class="btn" type="button">Run supervisor</button>
+            <button id="btn-forge-run" class="btn" type="button">Run agent</button>
+            <button id="btn-forge-stop" class="btn secondary" type="button" disabled>Stop</button>
             <button id="btn-forge-draft" class="btn secondary" type="button">Offline draft</button>
             <button id="btn-forge-polish" class="btn secondary" type="button">Polish current</button>
           </div>

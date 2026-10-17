@@ -1,7 +1,7 @@
 import { APP_VERSION, DEFAULT_CONNECTION, DEFAULT_PROVIDER, DEFAULT_SAMPLERS, DEFAULT_PROMPTS, THEMES } from "./config.js";
 import { applyRules, compileRule, cleanFlags } from "./regex-engine.js";
 import { STAGE_KEYS, STAGE_META, normalizeToggles, defaultStageToggles, parseDirector, parseDice, normalizeWorld, applyWorldCommand, formatWorldSheet, normalizeChess, parseChessTriggers, renderBoardText, toFEN, startChessGame, playChessTurn, forfeitChess, buildStageBlocks } from "./stages.js";
-import { SUPERVISOR_ACTIONS, parseSupervisorReply, validateAction, normalizeAction, describeAction, buildSupervisorPrompt, localDraftCharacter, localPolishCharacter } from "./supervisor.js";
+import { SUPERVISOR_ACTIONS, parseSupervisorReply, validateAction, normalizeAction, describeAction, buildSupervisorPrompt, localDraftCharacter, localPolishCharacter, isReadAction, isControlAction } from "./supervisor.js";
 import {
   openDB,
   listCharacters,
@@ -3671,6 +3671,185 @@ async function renderStagesView() {
 }
 
 let forgeProposals = [];
+let forgeTranscript = [];
+let forgeFinal = "";
+let forgeRunning = false;
+let forgeCancel = false;
+let forgeAbort = null;
+const FORGE_MAX_STEPS = 6;
+const FORGE_OBS_CHARS = 2200;
+
+function truncForge(s, n) {
+  const t = String(s ?? "");
+  return t.length > n ? t.slice(0, n) + "…" : t;
+}
+
+function forgeObs(data) {
+  return truncForge(JSON.stringify(data), FORGE_OBS_CHARS);
+}
+
+function scrubForgeKeys(obj) {
+  try {
+    return JSON.parse(JSON.stringify(obj, (k, v) => (k === "api_key" ? undefined : v)));
+  } catch { return null; }
+}
+
+function downloadForgeFile(name, data) {
+  const blob = new Blob([typeof data === "string" ? data : JSON.stringify(data, null, 2)],
+    { type: typeof data === "string" ? "text/plain" : "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 4000);
+}
+
+// Read actions run live inside the agent loop (no approval needed — read-only).
+// Never returns api_key fields or avatar bytes; truncates long text.
+async function executeForgeRead(a) {
+  const chars = await listCharacters().catch(() => []);
+  const byCharId = (id) => chars.find((c) => c && c.id === Number(id));
+  const byCharName = (n) => {
+    const t = String(n || "").trim().toLowerCase();
+    return chars.find((c) => String(c.name || "").trim().toLowerCase() === t);
+  };
+  const q = String(a.query || "").trim().toLowerCase();
+  if (a.action === "list_characters") {
+    return chars
+      .filter((c) => !q || String(c.name || "").toLowerCase().includes(q))
+      .slice(0, 60)
+      .map((c) => ({ id: c.id, name: c.name || "", has_scenario: !!(c.scenario && String(c.scenario).trim()) }));
+  }
+  if (a.action === "get_character") {
+    const t = a.character_id != null ? byCharId(a.character_id) : byCharName(a.name || a.character_name);
+    if (!t) throw new Error("E_SUPERVISOR: character not found.");
+    const { avatar, ...rest } = t;
+    return { ...rest, has_avatar: !!avatar };
+  }
+  if (a.action === "list_chats") {
+    let all = await listChats().catch(() => []);
+    if (a.character_id != null || a.character_name || a.name) {
+      const t = a.character_id != null ? byCharId(a.character_id) : byCharName(a.character_name || a.name);
+      if (!t) throw new Error("E_SUPERVISOR: character not found.");
+      all = all.filter((c) => Number(c.character_id) === Number(t.id));
+    }
+    return all
+      .filter((c) => !q || String(c.title || "").toLowerCase().includes(q))
+      .slice(-40)
+      .map((c) => ({ id: c.id, character_id: c.character_id ?? null, title: String(c.title || "").slice(0, 60), updated_at: c.updated_at ?? null }));
+  }
+  if (a.action === "read_chat") {
+    const all = await listChats().catch(() => []);
+    const chat = all.find((c) => c.id === Number(a.chat_id));
+    if (!chat) throw new Error("E_SUPERVISOR: chat not found.");
+    const msgs = await listMessages(chat.id).catch(() => []);
+    const lim = a.limit != null ? a.limit : 10;
+    return {
+      chat: { id: chat.id, character_id: chat.character_id ?? null, title: chat.title || "" },
+      messages: msgs.slice(-lim).map((m) => ({
+        id: m.id, role: m.role, name: m.name || undefined,
+        content: truncForge(m.content, 500), timestamp: m.timestamp ?? null
+      }))
+    };
+  }
+  if (a.action === "list_lorebooks") {
+    let all = await listLorebooks().catch(() => []);
+    if (a.character_id != null || a.character_name || a.name) {
+      const t = a.character_id != null ? byCharId(a.character_id) : byCharName(a.character_name || a.name);
+      if (!t) throw new Error("E_SUPERVISOR: character not found.");
+      all = all.filter((b) => Number(b.character_id) === Number(t.id));
+    }
+    return all.slice(0, 40).map((b) => ({
+      id: b.id, name: b.name || "", character_id: b.character_id ?? null,
+      entries: Array.isArray(b.entries) ? b.entries.length : 0
+    }));
+  }
+  if (a.action === "get_lorebook") {
+    const all = await listLorebooks().catch(() => []);
+    const t = String(a.name || a.lorebook_name || "").trim().toLowerCase();
+    const b = a.lorebook_id != null
+      ? all.find((x) => x && x.id === Number(a.lorebook_id))
+      : all.find((x) => String(x.name || "").trim().toLowerCase() === t);
+    if (!b) throw new Error("E_SUPERVISOR: lorebook not found.");
+    const entries = Array.isArray(b.entries) ? b.entries : [];
+    return {
+      id: b.id, name: b.name || "", character_id: b.character_id ?? null,
+      description: truncForge(b.description || "", 300), entry_count: entries.length,
+      entries: entries.slice(0, 20).map((e) => ({
+        keys: Array.isArray(e.keys) ? e.keys : (Array.isArray(e.keywords) ? e.keywords : []),
+        content: truncForge(e.content || "", 400), enabled: e.enabled === 0 ? 0 : 1
+      }))
+    };
+  }
+  if (a.action === "list_presets") {
+    const all = await listPresets().catch(() => []);
+    return all.map((p) => ({ id: p.id, name: p.name || "", model: presetModel(p) }));
+  }
+  if (a.action === "get_preset") {
+    const all = await listPresets().catch(() => []);
+    const t = String(a.name || "").trim().toLowerCase();
+    const p = a.preset_id != null
+      ? all.find((x) => x && x.id === Number(a.preset_id))
+      : all.find((x) => String(x.name || "").trim().toLowerCase() === t);
+    if (!p) throw new Error("E_SUPERVISOR: preset not found.");
+    return scrubForgeKeys(p);
+  }
+  if (a.action === "list_providers") {
+    const all = await listProviders().catch(() => []);
+    return all.map((p) => ({
+      id: p.id, name: p.name || "", base_url: String(p.base_url || "").slice(0, 120),
+      models: Array.isArray(p.models) ? p.models.length : 0
+    }));
+  }
+  if (a.action === "list_personas") {
+    const all = await listPersonas().catch(() => []);
+    return all.map((p) => ({ id: p.id, name: p.name || "" }));
+  }
+  if (a.action === "get_persona") {
+    const all = await listPersonas().catch(() => []);
+    const t = String(a.name || "").trim().toLowerCase();
+    const p = a.persona_id != null
+      ? all.find((x) => x && x.id === Number(a.persona_id))
+      : all.find((x) => String(x.name || "").trim().toLowerCase() === t);
+    if (!p) throw new Error("E_SUPERVISOR: persona not found.");
+    return { id: p.id, name: p.name || "", description: truncForge(p.description || "", 1500) };
+  }
+  if (a.action === "list_regex") {
+    let all = [];
+    try {
+      all = await listAllRegexRules();
+      if (a.character_id != null || a.character_name || a.name) {
+        const t = a.character_id != null ? byCharId(a.character_id) : byCharName(a.character_name || a.name);
+        if (!t) throw new Error("E_SUPERVISOR: character not found.");
+        all = all.filter((r) => r.character_id == null || Number(r.character_id) === Number(t.id));
+      }
+    } catch { all = []; }
+    return all.slice(0, 40).map((r) => ({
+      id: r.id, name: r.name || "", pattern: truncForge(r.pattern || "", 200),
+      replacement: truncForge(r.replacement || "", 200), flags: r.flags || "",
+      place: r.place || "both", character_id: r.character_id ?? null, enabled: r.enabled === 0 ? 0 : 1
+    }));
+  }
+  if (a.action === "get_world") {
+    const chatId = a.chat_id != null ? Number(a.chat_id) : ui.chatId;
+    if (chatId == null) throw new Error("E_SUPERVISOR: no chat selected for get_world.");
+    const st = await getStageState(chatId, "world").catch(() => null);
+    return { chat_id: chatId, world: st?.state ?? null };
+  }
+  if (a.action === "list_stage_states") {
+    const chatId = a.chat_id != null ? Number(a.chat_id) : ui.chatId;
+    if (chatId == null) throw new Error("E_SUPERVISOR: no chat selected for list_stage_states.");
+    const states = await listStageStates(chatId).catch(() => []);
+    return {
+      chat_id: chatId,
+      stages: (Array.isArray(states) ? states : []).map((s) => ({
+        stage_key: s.stage_key || s.key || "?", has_state: !!(s.state || s.settings)
+      }))
+    };
+  }
+  throw new Error("E_SUPERVISOR: not a read action.");
+}
 
 async function executeSupervisorAction(a) {
   const errV = validateAction(a);
@@ -3737,6 +3916,215 @@ async function executeSupervisorAction(a) {
     await saveStageState(chatId, "world", next, prev?.settings || {});
     return "world set for chat #" + chatId;
   }
+  if (act.action === "delete_character") {
+    const target = act.character_id != null ? byId(act.character_id) : byName(act.name || act.character_name);
+    if (!target) throw new Error("E_SUPERVISOR: character not found.");
+    await deleteCharacter(target.id);
+    await refreshLibrary();
+    return "deleted character " + (target.name || ("#" + target.id));
+  }
+  if (act.action === "create_chat") {
+    const target = act.character_id != null ? byId(act.character_id) : byName(act.name || act.character_name);
+    if (!target) throw new Error("E_SUPERVISOR: character not found.");
+    const personas = await listPersonas().catch(() => []);
+    const persona = personas.find((p) => p.id === ui.personaId) || personas[0];
+    const id = await saveChat({
+      character_id: target.id,
+      persona_id: persona?.id ?? null,
+      title: String(act.title || ("Chat with " + (target.name || ("#" + target.id)))).slice(0, 120)
+    });
+    await refreshLibrary();
+    return "created chat #" + id + " with " + (target.name || ("#" + target.id));
+  }
+  if (act.action === "delete_chat") {
+    const all = await listChats();
+    const chat = all.find((c) => c.id === Number(act.chat_id));
+    if (!chat) throw new Error("E_SUPERVISOR: chat not found.");
+    await deleteChat(chat.id);
+    if (ui.chatId === chat.id) { ui.chatId = null; persistUI(); }
+    await refreshLibrary();
+    return "deleted chat #" + chat.id;
+  }
+  if (act.action === "append_message") {
+    const all = await listChats();
+    const chat = all.find((c) => c.id === Number(act.chat_id));
+    if (!chat) throw new Error("E_SUPERVISOR: chat not found.");
+    const msg = { chat_id: chat.id, role: act.role, content: String(act.content), timestamp: Date.now() };
+    if (act.name) msg.name = String(act.name).slice(0, 80);
+    const id = await saveMessage(msg);
+    try { await touchChat(chat); } catch { /* timestamp optional */ }
+    return "appended " + act.role + " message #" + id + " to chat #" + chat.id;
+  }
+  if (act.action === "delete_message") {
+    await deleteMessage(Number(act.message_id));
+    return "deleted message #" + act.message_id;
+  }
+  if (act.action === "create_lorebook") {
+    let cid = null;
+    if (act.character_id != null || act.character_name) {
+      const t = act.character_id != null ? byId(act.character_id) : byName(act.character_name);
+      if (!t) throw new Error("E_SUPERVISOR: character not found.");
+      cid = t.id;
+    }
+    const rec = { character_id: cid, name: String(act.name).slice(0, 120), entries: [] };
+    if (act.description) rec.description = String(act.description).slice(0, 2000);
+    const id = await saveLorebook(rec);
+    return "created lorebook #" + id;
+  }
+  if (act.action === "add_lore_entry") {
+    const all = await listLorebooks().catch(() => []);
+    const t = String(act.name || act.lorebook_name || "").trim().toLowerCase();
+    const b = act.lorebook_id != null
+      ? all.find((x) => x && x.id === Number(act.lorebook_id))
+      : all.find((x) => String(x.name || "").trim().toLowerCase() === t);
+    if (!b) throw new Error("E_SUPERVISOR: lorebook not found.");
+    const keys = Array.isArray(act.keys) ? act.keys.map((k) => String(k).slice(0, 60)).slice(0, 20) : [];
+    const entries = [...(Array.isArray(b.entries) ? b.entries : []),
+      { keys, content: String(act.content), enabled: act.enabled === 0 ? 0 : 1 }];
+    await saveLorebook({ ...b, entries });
+    return "added lore entry to " + (b.name || ("#" + b.id));
+  }
+  if (act.action === "delete_lorebook") {
+    const all = await listLorebooks().catch(() => []);
+    const t = String(act.name || act.lorebook_name || "").trim().toLowerCase();
+    const b = act.lorebook_id != null
+      ? all.find((x) => x && x.id === Number(act.lorebook_id))
+      : all.find((x) => String(x.name || "").trim().toLowerCase() === t);
+    if (!b) throw new Error("E_SUPERVISOR: lorebook not found.");
+    await deleteLorebook(b.id);
+    return "deleted lorebook " + (b.name || ("#" + b.id));
+  }
+  if (act.action === "save_persona") {
+    const all = await listPersonas().catch(() => []);
+    const t = String(act.name || "").trim().toLowerCase();
+    const prev = act.persona_id != null
+      ? all.find((x) => x && x.id === Number(act.persona_id))
+      : all.find((x) => String(x.name || "").trim().toLowerCase() === t);
+    let id;
+    if (prev) {
+      id = await savePersona({
+        ...prev,
+        name: String(act.name || prev.name).slice(0, 120),
+        description: typeof act.description === "string" ? act.description : (prev.description || "")
+      });
+    } else {
+      id = await savePersona({
+        name: String(act.name).slice(0, 120),
+        description: typeof act.description === "string" ? act.description : ""
+      });
+    }
+    await refreshLibrary();
+    return "saved persona #" + id;
+  }
+  if (act.action === "delete_persona") {
+    const all = await listPersonas().catch(() => []);
+    const t = String(act.name || "").trim().toLowerCase();
+    const prev = act.persona_id != null
+      ? all.find((x) => x && x.id === Number(act.persona_id))
+      : all.find((x) => String(x.name || "").trim().toLowerCase() === t);
+    if (!prev) throw new Error("E_SUPERVISOR: persona not found.");
+    await deletePersona(prev.id);
+    if (ui.personaId === prev.id) { ui.personaId = null; persistUI(); }
+    await refreshLibrary();
+    return "deleted persona " + (prev.name || ("#" + prev.id));
+  }
+  if (act.action === "save_preset") {
+    const all = await listPresets().catch(() => []);
+    const t = String(act.name || "").trim().toLowerCase();
+    const prev = act.preset_id != null
+      ? all.find((x) => x && x.id === Number(act.preset_id))
+      : all.find((x) => String(x.name || "").trim().toLowerCase() === t);
+    if (!prev) throw new Error("E_SUPERVISOR: preset not found (agent only edits existing presets).");
+    const patch = { ...prev, updated_at: Date.now() };
+    if (act.model != null) patch.model = String(act.model).slice(0, 200);
+    if (act.reasoning_mode != null) patch.reasoning_mode = act.reasoning_mode;
+    if (act.reasoning_value != null) patch.reasoning_value = String(act.reasoning_value).slice(0, 200);
+    if (act.reasoning_budget != null) {
+      const b = Number(act.reasoning_budget);
+      if (Number.isFinite(b)) patch.reasoning_budget = Math.min(200000, Math.max(-1, Math.floor(b)));
+    }
+    if (act.agentic_format != null) patch.agentic_format = act.agentic_format;
+    await savePreset(patch);
+    return "updated preset " + (prev.name || ("#" + prev.id));
+  }
+  if (act.action === "add_regex_rule") {
+    let cid = null;
+    if (act.character_id != null || act.character_name) {
+      const target = act.character_id != null ? byId(act.character_id) : byName(act.character_name);
+      if (!target && act.character_id != null) throw new Error("E_SUPERVISOR: character not found.");
+      cid = target ? target.id : null;
+    }
+    const rule = {
+      name: String(act.name || "Forge rule").slice(0, 120),
+      pattern: String(act.pattern),
+      replacement: typeof act.replacement === "string" ? act.replacement : "",
+      flags: cleanFlags(act.flags) || "g",
+      place: ["prompt", "display", "both"].includes(act.place) ? act.place : "both",
+      character_id: cid,
+      enabled: act.enabled === 0 ? 0 : 1
+    };
+    if (!compileRule(rule)) throw new Error("E_SUPERVISOR: regex pattern does not compile.");
+    const id = await saveRegexRule(rule);
+    try { bumpRegexCache(); } catch { /* cache optional */ }
+    return "added regex rule #" + id;
+  }
+  if (act.action === "delete_regex_rule") {
+    await deleteRegexRule(Number(act.rule_id));
+    try { bumpRegexCache(); } catch { /* cache optional */ }
+    return "deleted regex rule #" + act.rule_id;
+  }
+  if (act.action === "export_file") {
+    const day = new Date().toISOString().slice(0, 10);
+    const slug = (s) => String(s ?? "export").replace(/[^\w-]+/g, "_").slice(0, 60);
+    if (act.kind === "vault") {
+      const vault = await exportVaultToJSON({ includeKeys: false });
+      downloadForgeFile(`polyglot-vault-forge-${day}.json`, vault);
+      return "exported vault file (keys stripped)";
+    }
+    if (act.kind === "regex") {
+      const rules = await listAllRegexRules().catch(() => []);
+      downloadForgeFile(`polyglot-regex-forge-${day}.json`, { app: "Polyglot", exported_at: Date.now(), rules });
+      return "exported " + rules.length + " regex rule(s)";
+    }
+    if (act.kind === "chat") {
+      const all = await listChats();
+      const chat = all.find((c) => c.id === Number(act.chat_id));
+      if (!chat) throw new Error("E_SUPERVISOR: chat not found.");
+      const messages = await listMessages(chat.id).catch(() => []);
+      downloadForgeFile(`polyglot-chat-forge-${slug(chat.title || chat.id)}.json`,
+        { app: "Polyglot", exported_at: Date.now(), chat, messages });
+      return "exported chat #" + chat.id;
+    }
+    if (act.kind === "character") {
+      const target = act.character_id != null ? byId(act.character_id) : byName(act.name || act.character_name);
+      if (!target) throw new Error("E_SUPERVISOR: character not found.");
+      const { avatar, ...rest } = target;
+      downloadForgeFile(`polyglot-character-forge-${slug(target.name || target.id)}.json`,
+        { app: "Polyglot", exported_at: Date.now(), has_avatar: !!avatar, character: rest });
+      return "exported character " + (target.name || ("#" + target.id));
+    }
+    if (act.kind === "preset") {
+      const all = await listPresets().catch(() => []);
+      const t = String(act.name || "").trim().toLowerCase();
+      const p = act.preset_id != null
+        ? all.find((x) => x && x.id === Number(act.preset_id))
+        : all.find((x) => String(x.name || "").trim().toLowerCase() === t);
+      if (!p) throw new Error("E_SUPERVISOR: preset not found.");
+      downloadForgeFile(`polyglot-preset-forge-${slug(p.name || p.id)}.json`, scrubForgeKeys(p));
+      return "exported preset " + (p.name || ("#" + p.id)) + " (keys stripped)";
+    }
+    if (act.kind === "lorebook") {
+      const all = await listLorebooks().catch(() => []);
+      const t = String(act.name || "").trim().toLowerCase();
+      const b = act.lorebook_id != null
+        ? all.find((x) => x && x.id === Number(act.lorebook_id))
+        : all.find((x) => String(x.name || "").trim().toLowerCase() === t);
+      if (!b) throw new Error("E_SUPERVISOR: lorebook not found.");
+      downloadForgeFile(`polyglot-book-forge-${slug(b.name || b.id)}.json`, b);
+      return "exported lorebook " + (b.name || ("#" + b.id));
+    }
+    throw new Error("E_SUPERVISOR: rejected.");
+  }
   throw new Error("E_SUPERVISOR: rejected.");
 }
 
@@ -3744,8 +4132,30 @@ async function renderForgeView() {
   const box = $("#forge-results");
   if (!box) return;
   box.innerHTML = "";
+  if (forgeTranscript.length || forgeFinal) {
+    const log = document.createElement("div");
+    log.className = "card wide";
+    const h = document.createElement("strong");
+    h.textContent = forgeRunning ? "Agent run (working…)" : "Agent run";
+    log.append(h);
+    for (const s of forgeTranscript.slice(-12)) {
+      const line = document.createElement("div");
+      line.className = "status";
+      line.textContent = "Step " + s.step + " · " + s.action + " → " + s.outcome;
+      log.append(line);
+    }
+    if (forgeFinal) {
+      const fin = document.createElement("div");
+      fin.className = "status";
+      fin.textContent = forgeFinal;
+      log.append(fin);
+    }
+    box.append(log);
+  }
   if (!forgeProposals.length) {
-    box.innerHTML = `<div class="status">No proposals yet. Describe a character or say "polish Rin" / "write a tavern scenario" / "add chess to this chat". Proposals appear here for approval — nothing is applied until you tap Approve.</div>`;
+    if (!forgeTranscript.length && !forgeFinal) {
+      box.innerHTML = `<div class="status">No proposals yet. Ask for anything across your library — characters, chats, lorebooks, presets, personas, regex, stages, exports. The agent reads what it needs, proposes every change, and nothing is applied until you tap Approve.</div>`;
+    }
     return;
   }
   const chars = await listCharacters().catch(() => []);
@@ -3824,38 +4234,123 @@ async function handleForgeRun() {
       return;
     }
     const provider = await getActiveProvider().catch(() => null);
-    const sys = buildSupervisorPrompt({ characters: chars, chats, stageStates: [] });
-    const { content } = await sendChat({
-      provider: provider || undefined,
-      preset,
-      connection: preset?.connection,
-      samplers: { ...(preset?.samplers || {}), max_tokens: 900, temperature: 0.4 },
-      messages: [
-        { role: "system", content: sys },
-        { role: "user", content: req + "\nCurrent chat id: " + (ui.chatId ?? "none") + ". Reply with ONE ```tool fenced JSON action." }
-      ],
-      signal: null
-    });
-    const parsed = parseSupervisorReply(content || "");
-    const valid = [];
-    for (const a of parsed.actions) {
-      const e = validateAction(a);
-      if (!e) valid.push(normalizeAction(a, ui.chatId));
-      else logErr("E_SUPERVISOR", e);
+    const [personas, presets, providers, lorebooks] = await Promise.all([
+      listPersonas().catch(() => []), listPresets().catch(() => []),
+      listProviders().catch(() => []), listLorebooks().catch(() => [])
+    ]);
+    const sys = buildSupervisorPrompt({ characters: chars, chats, personas, presets, providers, lorebooks });
+    forgeTranscript = [];
+    forgeFinal = "";
+    forgeCancel = false;
+    forgeRunning = true;
+    const stopBtn = $("#btn-forge-stop");
+    if (stopBtn) stopBtn.disabled = false;
+    await renderForgeView();
+    forgeAbort = new AbortController();
+    const msgs = [
+      { role: "system", content: sys },
+      { role: "user", content: req + "\nCurrent chat id: " + (ui.chatId ?? "none") + ". Reply with ONE ```tool fenced JSON action." }
+    ];
+    let steps = 0;
+    try {
+      while (steps < FORGE_MAX_STEPS) {
+        if (forgeCancel) {
+          forgeTranscript.push({ step: steps + 1, action: "cancelled", outcome: "stopped by user" });
+          forgeFinal = "Run stopped. Proposals so far are below for approval.";
+          break;
+        }
+        steps++;
+        let content = "";
+        try {
+          const res = await sendChat({
+            provider: provider || undefined,
+            preset,
+            connection: preset?.connection,
+            samplers: { ...(preset?.samplers || {}), max_tokens: 700, temperature: 0.3 },
+            messages: msgs,
+            signal: forgeAbort ? forgeAbort.signal : null
+          });
+          content = res.content || "";
+        } catch (e) {
+          if (forgeCancel) {
+            forgeTranscript.push({ step: steps, action: "cancelled", outcome: "stopped by user" });
+            forgeFinal = "Run stopped. Proposals so far are below for approval.";
+            break;
+          }
+          throw e;
+        }
+        msgs.push({ role: "assistant", content });
+        const parsed = parseSupervisorReply(content);
+        const raw = parsed.actions[0];
+        if (parsed.skipped.length) logErr("E_SUPERVISOR", "step " + steps + " skipped: " + parsed.skipped.join("; "));
+        if (!raw) {
+          const note = "no valid tool action (skipped: " + (parsed.skipped.join("; ") || "empty") + ")";
+          forgeTranscript.push({ step: steps, action: "retry", outcome: note });
+          msgs.push({ role: "user", content: "Observation: " + note + ". Reply with ONE ```tool fenced JSON action, or done/answer to finish." });
+          continue;
+        }
+        const errV = validateAction(raw);
+        if (errV) {
+          logErr("E_SUPERVISOR", "step " + steps + " " + errV);
+          forgeTranscript.push({ step: steps, action: String(raw.action || "?"), outcome: "rejected: " + errV });
+          msgs.push({ role: "user", content: "Observation: invalid action (" + errV + "). Fix it or finish with done/answer." });
+          continue;
+        }
+        const act = normalizeAction(raw, ui.chatId);
+        if (isControlAction(act)) {
+          forgeFinal = act.action === "answer"
+            ? String(act.text || "").slice(0, 2000)
+            : (act.summary ? String(act.summary).slice(0, 2000) : "Done.");
+          forgeTranscript.push({ step: steps, action: act.action, outcome: "finished" });
+          break;
+        }
+        if (isReadAction(act)) {
+          try {
+            const data = await executeForgeRead(act);
+            forgeTranscript.push({ step: steps, action: act.action, outcome: truncForge(JSON.stringify(data), 160) });
+            msgs.push({ role: "user", content: "Observation: " + forgeObs(data) });
+          } catch (e) {
+            const msg = e?.message || String(e);
+            forgeTranscript.push({ step: steps, action: act.action, outcome: "failed: " + truncForge(msg, 120) });
+            msgs.push({ role: "user", content: "Observation: read failed (" + msg + "). Try a different action or finish." });
+          }
+          await renderForgeView();
+          continue;
+        }
+        const key = JSON.stringify(act);
+        if (forgeProposals.some((p) => JSON.stringify(p) === key)) {
+          forgeTranscript.push({ step: steps, action: act.action, outcome: "already proposed" });
+          msgs.push({ role: "user", content: "Observation: that exact proposal is already recorded. Propose something new or finish." });
+          continue;
+        }
+        forgeProposals.push(act);
+        const label = describeAction(act, chars);
+        forgeTranscript.push({ step: steps, action: act.action, outcome: "proposed: " + truncForge(label, 120) });
+        msgs.push({ role: "user", content: "Observation: recorded as proposal (" + label + "). NOT applied — the user approves later. Continue or finish with done/answer." });
+        await renderForgeView();
+      }
+      if (steps >= FORGE_MAX_STEPS && !forgeFinal) {
+        forgeFinal = "Step limit reached (" + FORGE_MAX_STEPS + "). Review the proposals below, or run again to continue.";
+      }
+      if (!forgeProposals.length && !forgeFinal) {
+        forgeFinal = "The run produced no proposals. Try: 'Create a gruff dwarven barkeep' or 'Which characters lack a scenario?'";
+      }
+      logInfo("E_SUPERVISOR", "run finished: " + steps + " step(s), " + forgeProposals.length + " proposal(s)");
+    } finally {
+      forgeRunning = false;
+      forgeAbort = null;
     }
-    if (parsed.skipped.length) logErr("E_SUPERVISOR", "skipped: " + parsed.skipped.join("; "));
-    if (!valid.length) {
-      window.alert("Supervisor returned no valid action. Try: 'Create a gruff dwarven barkeep' or 'Add chess to this chat'.");
-      return;
-    }
-    forgeProposals = valid.slice(0, 5);
-    logInfo("E_SUPERVISOR", "proposed " + forgeProposals.length + " action(s)");
+    await refreshLibrary().catch(() => {});
     await renderForgeView();
   } catch (e) {
     logErr("E_SUPERVISOR", e?.message || String(e));
     window.alert("Supervisor failed: " + (e?.message || e));
   } finally {
     if (btn) btn.disabled = false;
+    const stopBtn = $("#btn-forge-stop");
+    if (stopBtn) stopBtn.disabled = true;
+    forgeRunning = false;
+    forgeAbort = null;
     refreshDiag();
   }
 }
@@ -4436,6 +4931,10 @@ async function init() {
     if (f) await handleRegexImportFile(f);
   });
   $("#btn-forge-run")?.addEventListener("click", handleForgeRun);
+  $("#btn-forge-stop")?.addEventListener("click", () => {
+    forgeCancel = true;
+    try { forgeAbort?.abort(); } catch { /* abort optional */ }
+  });
   $("#btn-forge-draft")?.addEventListener("click", async () => {
     const ta = $("#forge-input");
     const brief = (ta?.value || "").trim() || "A curious traveler with a secret";
