@@ -20,7 +20,7 @@
 // protocol. It is a plain string on purpose: it is written into the srcdoc of
 // the frame and must not contain a closing script tag.
 
-import { sanitizeGameHtml } from "./minigames.js";
+import { sanitizeGameHtml, isLocalReference } from "./minigames.js";
 
 const HOST_SOURCE = "polyglot";
 const GAME_SOURCE = "polyglot-game";
@@ -162,8 +162,13 @@ function parseGameDoc(html) {
     for (const node of Array.from(doc.querySelectorAll(tag))) node.remove();
   }
   for (const node of Array.from(doc.querySelectorAll("*"))) {
-    if (!node.removeAttribute) continue;
-    for (const attr of STRIP_ATTRS) node.removeAttribute(attr);
+    if (!node.removeAttribute || !node.getAttribute) continue;
+    for (const attr of STRIP_ATTRS) {
+      const val = node.getAttribute(attr);
+      if (val == null) continue;
+      if (isLocalReference(val)) continue;
+      node.removeAttribute(attr);
+    }
   }
   return { body: doc.body.innerHTML, styles: styles.join("\n"), scripts };
 }

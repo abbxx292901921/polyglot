@@ -525,12 +525,12 @@ export async function importVaultFromJSON(data, { merge = false } = {}) {
   // Validate the minigame documents BEFORE anything is written. A vault is
   // the one file people share, so a hand-crafted or agent-written one must
   // not be able to install a game that phones home or navigates away.
+  // A single bad game is dropped rather than failing the whole restore.
+  const droppedGames = [];
   if (Array.isArray(data.tables.minigames)) {
     for (const r of data.tables.minigames) {
       const v = validateMinigameHtml(r?.html || "");
-      if (!v.ok) {
-        throw new Error(`E_VAULT_TABLE: vault table "minigames" has an invalid game ("${r?.key || "?"}"): ${v.error}`);
-      }
+      if (!v.ok) droppedGames.push(String(r?.key || "?") + " (" + v.error + ")");
     }
   }
   if (!merge) {
@@ -546,15 +546,16 @@ export async function importVaultFromJSON(data, { merge = false } = {}) {
         const k = String(r && r.key || "").toLowerCase();
         if (!k) continue;
         if (typeof r.html === "string" && r.html.length > 200000) {
-          throw new Error("E_VAULT_TABLE: minigame " + k + " is too large to import.");
+          droppedGames.push(k + " (too large)");
+          continue;
         }
-        seen.set(k, r);
+        if (validateMinigameHtml(r.html || "").ok) seen.set(k, r);
       }
       rows = Array.from(seen.values());
     }
     for (const r of rows) await putRec(n, r);
   }
-  return true;
+  return { droppedGames };
 }
 
 export async function seedIfEmpty(defaults) {

@@ -145,6 +145,12 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
     (`fenceGameText`) before it reaches a system message, and strip
     navigation in `validateMinigameHtml` + `buildGameDocument` — the CSP does
     not stop a frame navigating itself away.
+    The fence and the validator must stay NARROW. A game summary is full of
+    ordinary sentences ("You are now on fire", "You ignore the previous
+    warning", `var location = "the tavern"`), and a pattern that matches
+    those silently deletes real state from the model's context and rejects
+    working games. Only shapes that actually try to take over the prompt or
+    the page belong in those patterns.
 12. Anything that LEAVES the device is a leak surface. A game document is
     agent-authored, so a shared one can carry a tracker aimed at whoever
     opens it. Exports must be sanitized: `sanitizeGameHtml` on the vault and
@@ -158,7 +164,7 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
 - Module-goal parse of `sw.js` + every `js/*.js` clean (see rule 9/10).
 - `node tools/boot.test.mjs` → INIT_OK / NO_REJECTIONS / BOOT_CLEAN.
 - `node tools/minigame.test.mjs`, `node tools/frame.test.mjs`,
-  `node tools/forge-game.test.mjs` → all OK.
+  `node tools/forge-game.test.mjs`, `node tools/db-migrate.test.mjs` → all OK.
 - `node tools/stream-equiv.test.mjs` → 0 failures.
 - Fresh load → send → reload → message persists; new chat/persona/character CRUD works.
 - Export vault with keys OFF → JSON has `"api_key": ""`. Import replaces data.
@@ -264,3 +270,21 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   agent-authored document, so a shared game file cannot report the reader's
   address to whoever wrote it. No existing chat, message or stage behaviour
   changed.
+- v1.8.1 DONE: hardening pass on v1.8.0, driven by an adversarial review and
+  by probing the real behaviour instead of assuming it. FIXED: the injection
+  fence and the navigation validator were too broad and were silently
+  DELETING legitimate game state ("You are now on fire", `var location =
+  "the tavern"`) and REJECTING working games — both narrowed, with the
+  narrowness now a rule. FIXED: the document stripper removed `src` from
+  `data:` images, so a game's artwork vanished — inline and same-document
+  references now survive (`isLocalReference`). FIXED: a vault containing one
+  bad game failed the whole restore; the bad game is now dropped and
+  reported, and the good ones still import. FIXED: the v4→v5 upgrade path
+  was completely untested — `tools/db-migrate.test.mjs` now opens a real v4
+  database, runs the upgrade and checks the old data survived. FIXED: the
+  boot test's IndexedDB stub never fired `tx.oncomplete`, so every write in
+  the app HUNG in silence and the boot test passed without exercising a
+  single write; the stub is now faithful and the test asserts the seed
+  actually landed. ADDED: an endless loop in a game is rejected, because it
+  freezes the page it runs in and the host cannot interrupt a frame that
+  shares the page's thread.

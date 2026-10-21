@@ -147,7 +147,24 @@ export function takePending(session) {
 // reports is data, never instruction. Lines that look like a prompt override
 // are dropped and the rest is fenced with explicit markers, so a hostile game
 // cannot talk its way past the block it is embedded in.
-const INJECTION_RE = /\b(?:ignore|disregard|forget|override|bypass)\b[^.\n]{0,48}\b(?:previous|prior|above|earlier|system|instruction|instructions|prompt|rules|rule)\b|\byou\s+are\s+now\b|\bnew\s+(?:system\s+)?instructions?\b|\bsystem\s+prompt\b|\bdeveloper\s+message\b|<\/?(?:system|instructions?)>/i;
+//
+// The patterns are deliberately narrow. A game summary is full of ordinary
+// sentences ("You are now on fire", "You ignore the previous warning"), and
+// dropping those would silently delete real state from the model's context.
+// Only shapes that actually try to take over the prompt are removed.
+const INJECTION_RE = new RegExp([
+  // "ignore all previous instructions" and close relatives
+  "\\b(?:ignore|disregard|forget|override|bypass)\\b[^.\\n]{0,48}\\b(?:previous|prior|above|earlier)\\s+(?:instructions?|directives?|messages?|prompts?|orders?)\\b",
+  // "disregard the system prompt"
+  "\\b(?:ignore|disregard|forget|override|bypass)\\b[^.\\n]{0,48}\\b(?:system|developer)\\s+(?:prompt|message|instructions?)\\b",
+  // "you are now an unrestricted model"
+  "\\byou\\s+are\\s+now\\s+(?:an?\\s+|the\\s+)?(?:unrestricted|unfiltered|unlimited|uncensored|jailbroken|developer\\s+mode)\\b",
+  // explicit override headers
+  "\\bnew\\s+(?:system\\s+)?instructions?\\s*:",
+  "\\bsystem\\s+prompt\\s*:",
+  "\\bdeveloper\\s+message\\b",
+  "<\\/?(?:system|instructions?)>"
+].join("|"), "i");
 
 export function fenceGameText(text, max = 1200) {
   const raw = String(text ?? "");
@@ -233,7 +250,13 @@ const NET_CALL_RE = /\b(?:fetch\s*\(|new\s+XMLHttpRequest|new\s+WebSocket|new\s+
 // Navigation is NOT covered by the CSP: a frame can navigate itself away, and
 // the new document would run without the game's policy. So it is rejected
 // outright, and the host also watches for a navigation after the fact.
-const NAV_RE = /\b(?:window|document|top|parent|self|frames)\s*\.\s*location\b|\blocation\s*\.\s*href\s*=|\blocation\s*=\s*["']|\bwindow\s*\.\s*open\s*\(|\bopen\s*\(\s*["']https?:|http-equiv\s*=\s*["']?refresh|<base\b/i;
+// Only a navigation is rejected, not every mention of the word: a game may
+// legitimately have a variable called "location" holding the scene name.
+const NAV_RE = /\b(?:window|document|top|parent|self|frames)\s*\.\s*location\b|\blocation\s*\.\s*href\s*=|\blocation\s*=\s*["'](?:https?:|\/\/|\/|\.)|\bwindow\s*\.\s*open\s*\(|\bopen\s*\(\s*["']https?:|http-equiv\s*=\s*["']?refresh|<base\b/i;
+// A game that spins forever freezes the tab it runs in, and the host cannot
+// interrupt a frame that shares the page's thread. The classic model
+// mistake is caught before it is ever stored.
+const SPIN_RE = /\bwhile\s*\(\s*(?:true|1)\s*\)|for\s*\(\s*;\s*;\s*\)/i;
 
 export function validateMinigameHtml(html) {
   const src = String(html ?? "");
@@ -271,7 +294,23 @@ export function validateMinigameHtml(html) {
       error: "E_GAME_CONTRACT: a game may not navigate (location, open, meta refresh or base). It has to stay inside the frame."
     };
   }
+  if (SPIN_RE.test(src)) {
+    return {
+      ok: false,
+      error: "E_GAME_CONTRACT: a game may not loop forever. An endless loop freezes the page it runs in."
+    };
+  }
   return { ok: true, error: "" };
+}
+
+// A reference that cannot leave the device stays; everything else is a way
+// for a game to reach the network, so it goes. Inline data, blob and
+// same-document references are what the CSP allows, and stripping them would
+// silently delete the artwork in a game.
+export function isLocalReference(value) {
+  const t = String(value ?? "").trim().toLowerCase();
+  if (!t) return false;
+  return t.startsWith("data:") || t.startsWith("blob:") || t.startsWith("#");
 }
 
 // Strip everything from a game document that could reach the network or move

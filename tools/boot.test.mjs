@@ -18,6 +18,7 @@ function mkEl(tag = "div") {
     disabled: false,
     className: "",
     dataset: {},
+    options: [],
     style: { setProperty() {}, removeProperty() {} },
     classList: {
       _s: new Set(),
@@ -147,19 +148,48 @@ makeStore._n = 0;
 const objectStoreNames = ["characters", "personas", "chats", "messages", "lorebooks",
   "presets", "providers", "regex_rules", "stages", "chat_stage_state", "minigames"];
 
+// Exposed so the test can prove the boot really wrote to the database
+// instead of hanging on a transaction that never completed.
+const dbStores = {};
+
 globalThis.indexedDB = {
   open() {
     const r = { onupgradeneeded: null, onsuccess: null, onerror: null, onblocked: null, result: null };
     setTimeout(() => {
       const stores = {};
-      for (const n of objectStoreNames) stores[n] = makeStore(n);
+      for (const n of objectStoreNames) {
+        stores[n] = makeStore(n);
+        dbStores[n] = stores[n]._m;
+      }
       r.result = {
         objectStoreNames: { contains: (n) => !!stores[n] },
         createObjectStore: (n) => makeStore(n),
-        transaction: () => ({
-          objectStore: (n) => stores[n],
-          oncomplete: null, onerror: null, onabort: null
-        }),
+        // A transaction has to fire oncomplete. db.js awaits it after every
+        // write, so a transaction that never completes leaves every write
+        // hanging in silence and the boot test would pass without having
+        // exercised a single write.
+        transaction: () => {
+          const tx = { oncomplete: null, onerror: null, onabort: null, _pending: 0, _done: false };
+          const settle = () => {
+            if (tx._pending > 0 || tx._done) return;
+            tx._done = true;
+            setTimeout(() => tx.oncomplete && tx.oncomplete(), 0);
+          };
+          tx.objectStore = (n) => {
+            const st = stores[n] || makeStore(n);
+            for (const op of ["put", "delete", "clear"]) {
+              const orig = st[op].bind(st);
+              st[op] = (...args) => {
+                tx._pending++;
+                const req = orig(...args);
+                setTimeout(() => { tx._pending--; settle(); }, 0);
+                return req;
+              };
+            }
+            return st;
+          };
+          return tx;
+        },
         close() {}
       };
       if (r.onupgradeneeded) r.onupgradeneeded();
@@ -204,6 +234,22 @@ if (typeof mod.renderRich === "function") {
 if (typeof mod.renderGamesView === "function") {
   await mod.renderGamesView();
   console.log("GAMES_OK");
+}
+
+// The boot seeds a default persona, preset, provider and the stage defs. If
+// the stub transaction never completed, those writes would have hung in
+// silence and the boot would still look clean, so assert they actually
+// landed. (Characters are not seeded here: they come from the starter
+// modal, not seedIfEmpty.)
+await new Promise((r) => setTimeout(r, 150));
+const mustBeSeeded = ["personas", "presets", "providers", "stages"];
+const seeded = mustBeSeeded.filter((n) => dbStores[n] && dbStores[n].size > 0);
+const missing = mustBeSeeded.filter((n) => !(dbStores[n] && dbStores[n].size > 0));
+if (missing.length) {
+  console.log("SEED_MISSING " + missing.join(","));
+  process.exitCode = 1;
+} else {
+  console.log("SEED_OK " + seeded.join(","));
 }
 
 await new Promise((r) => setTimeout(r, 250));

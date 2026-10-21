@@ -2595,7 +2595,11 @@ async function handleImportFile(file) {
     setVaultStatus("Reading backup…");
     const text = await file.text();
     const data = JSON.parse(text);
-    await importVaultFromJSON(data, { merge: false });
+    const res = await importVaultFromJSON(data, { merge: false });
+    const dropped = (res && res.droppedGames) || [];
+    if (dropped.length) {
+      try { logWarn("E_GAME_CONTRACT", "vault contained " + dropped.length + " unsafe minigame(s), skipped: " + dropped.join("; ").slice(0, 300)); } catch { /* noop */ }
+    }
     ui.characterId = null;
     ui.chatId = null;
     ui.personaId = null;
@@ -4706,7 +4710,6 @@ async function executeSupervisorAction(a) {
       html,
       author: "forge"
     });
-    gamesEpoch++;
     gameNameCache.delete(key);
     await renderGamesView().catch(() => {});
     return (existing ? "replaced minigame " : "created minigame ") + key + " (#" + id + ")";
@@ -4718,7 +4721,6 @@ async function executeSupervisorAction(a) {
     const g = found && found.kind === "html" ? found : await getMinigame(want);
     if (!g || g.id == null) throw new Error("E_SUPERVISOR: minigame not found.");
     await deleteMinigame(g.id);
-    gamesEpoch++;
     gameNameCache.delete(want);
     gameScenes.delete(sceneKey(want));
     await renderGamesView().catch(() => {});
@@ -5051,10 +5053,6 @@ let gameChar = "";
 function sceneKey(key) {
   return String(ui.chatId ?? "none") + "|" + String(key);
 }
-// Bumped whenever a game session or the game library changes. The games view
-// keys its freshness off this instead of the global revision counter, so an
-// unrelated write elsewhere never reloads a running game.
-let gamesEpoch = 0;
 // True once the games panel has been built at least once. After that the
 // panel is refreshed in place, so tabbing away and back never reloads a
 // running sandboxed game.
@@ -5141,7 +5139,6 @@ async function saveGameSession(key, session) {
   const s = normalizeSession(session);
   s.updated_at = Date.now();
   if (!s.name) s.name = await resolveGameName(key);
-  gamesEpoch++;
   return saveStageState(ui.chatId, gameSessionKey(key), s, {}, { silent: true });
 }
 
@@ -5862,7 +5859,6 @@ async function removeMinigameGame(key) {
     if (!g || g.kind !== "html") return;
     if (!window.confirm("Delete the minigame \"" + g.name + "\"? This cannot be undone.")) return;
     await deleteMinigame(g.id);
-    gamesEpoch++;
     gameScenes.delete(sceneKey(key));
     logInfo("E_GAME_CONTRACT", "deleted minigame " + key);
     await renderGamesView();
@@ -5894,7 +5890,6 @@ async function importMinigameFile(file) {
       html,
       author: "import"
     });
-    gamesEpoch++;
     gameNameCache.delete(key);
     logInfo("E_GAME_CONTRACT", "imported minigame " + key);
     await renderGamesView();
