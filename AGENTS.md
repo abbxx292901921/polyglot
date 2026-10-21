@@ -47,9 +47,19 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   (`swipe_group_id`/`swipe_active`) + retry/continue/impersonate/edit/delete,
   character editor modal, card import + per-chat export/import, vault
   export/import, diagnostics panel, SW registration.
+  BRANCH MODEL: a chat's `active_leaf_id` names the message the transcript,
+  the model context and the graph all agree on. `setLeaf` advances it on
+  EVERY append (send/retry/impersonate/continue/variant pick), `setActiveLeaf`
+  jumps it (rewind = fork point), `branchSiblings` finds the nearest fork for
+  the ◀ ▶ branch switcher, `deleteMessageAndFix` repairs a deleted leaf.
+  Swipe variants and branches are the same tree shape (two rows, one parent):
+  picking a variant re-roots the chain, `groupRows(chain, allRows, pathIds)`
+  resolves groups against ALL rows so off-chain variants stay reachable.
 - `js/prompt-engine.js` — pure context pipeline: resolveMacros, estimateTokens,
   scanLorebook, injectAtDepth, applyTokenBudget, buildMessages (+reasoningStyle
   softener), normalizeAgentic (strict user/assistant alternation, final user).
+  Tree helpers: sortRows, parentMap, activeChain, childrenMap, tidyLayout
+  (leaves take sequential lanes, parents sit at the mean of their children).
 - `js/sse-streamer.js` — SSE decoder (TextDecoder stream) + createThinkSplitter
   for split `<think>` tags; routes reasoning_content + inline thinks to reasoning.
 - `js/api-client.js` — buildPayload (allowlist + ONE validated thinking knob) +
@@ -139,3 +149,17 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   applies deletes/upserts/exports (vault/chat/character/preset/lorebook/regex
   downloads, keys always stripped, avatars never enter the prompt). No DB
   migration; all writes still need Approve.
+- v1.7.0 DONE: branching repaired + graph makeover. Branching: every append
+  advances `active_leaf_id` (`setLeaf`), so pressing ⑂ Branch and typing
+  continues from that point instead of parking on the fork (before, the new
+  message was invisible AND the model answered without it). Swipe variants and
+  branches are one tree shape — picking a variant re-roots the chain
+  (`applyActiveSibling`), `groupRows` resolves groups against all rows so
+  off-chain variants stay swipeable, retry reuses the reply's swipe group, and
+  deleting the leaf repairs the pointer. Branch bar gained a ◀ ▶ branch
+  switcher over the nearest fork (`branchSiblings`). Graph: `tidyLayout` in
+  prompt-engine (leaves get lanes, parents sit at the mean of their children —
+  a straight chain is ONE column), cubic glowing edges with a dash flow on the
+  live tail, radar halo on the current leaf, fork diamonds, zoom-in labels,
+  dot-grid backdrop, and hit-testing in graph space (no per-node hit circles).
+  No DB migration; existing chats keep working (null leaf = linear chain).

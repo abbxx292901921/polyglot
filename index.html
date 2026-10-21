@@ -20,7 +20,7 @@
     <header class="topbar">
       <button id="btn-left" class="iconbtn" aria-label="Open library">&#9776;</button>
       <h1>Polyglot</h1>
-      <span id="ver" class="ver">v1.6.2</span>
+      <span id="ver" class="ver">v1.7.0</span>
       <div class="spacer"></div>
       <button id="btn-right" class="iconbtn" aria-label="Open settings">&#9881;</button>
     </header>
@@ -469,7 +469,13 @@
   <div id="graph-modal" class="modal" hidden>
     <div class="sheet graph-sheet" role="dialog" aria-label="Chat graph">
       <header><h2>Chat Graph</h2><button class="iconbtn" id="btn-graph-close" aria-label="Close">&times;</button></header>
-      <div class="graph-hint">Tap a node to load that path. Drag to pan, pinch or scroll to zoom.</div>
+      <div class="graph-hint">Tap a node to load that path - the branch you came from stays in the tree. Drag to pan, pinch or scroll to zoom, zoom in for labels.</div>
+      <div class="graph-legend">
+        <span><i class="lg lg-user"></i>You</span>
+        <span><i class="lg lg-ai"></i>Character</span>
+        <span><i class="lg lg-fork"></i>Fork</span>
+        <span><i class="lg lg-live"></i>Live path</span>
+      </div>
       <div id="graph-preview" class="graph-preview" hidden></div>
       <div id="graph-view" class="graph-view" tabindex="0" aria-label="Message tree"></div>
       <footer class="graph-bar">

@@ -293,29 +293,57 @@ details.thought .thought-body { padding: 6px 10px 10px; font-size: 13px; color: 
 }
 
 /* Full-screen chat graph modal. */
-.graph-sheet { width: min(96vw, 900px); height: 88vh; height: 88dvh; }
+.graph-sheet { width: min(96vw, 900px); height: 88vh; height: 88dvh; animation: sheetIn .2s ease-out; }
+@keyframes sheetIn { from { opacity: 0; transform: translateY(10px) scale(.985); } to { opacity: 1; transform: none; } }
 .graph-hint { padding: 8px 12px 0; font-size: 13px; color: var(--muted); }
+.graph-legend { display: flex; flex-wrap: wrap; gap: 12px; padding: 6px 12px 0; font-size: 12px; color: var(--muted); }
+.graph-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.graph-legend .lg { display: inline-block; }
+.graph-legend .lg-user { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); }
+.graph-legend .lg-ai { width: 9px; height: 9px; border-radius: 50%; background: var(--dialogue); }
+.graph-legend .lg-fork { width: 8px; height: 8px; border-radius: 2px; background: var(--bg2); border: 1px solid var(--muted); transform: rotate(45deg); }
+.graph-legend .lg-live { width: 16px; height: 3px; border-radius: 2px; background: var(--accent); }
 .graph-preview { margin: 8px 12px 0; font-size: 13px; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; max-height: 64px; overflow: hidden; }
 .graph-preview .who { font-size: 12px; color: var(--muted); margin-bottom: 2px; }
-.graph-view { flex: 1; min-height: 0; overflow: hidden; touch-action: none; cursor: grab; margin-top: 8px; border-top: 1px solid var(--line); }
+.graph-view {
+  flex: 1; min-height: 0; overflow: hidden; touch-action: none; cursor: grab;
+  margin-top: 8px; border-top: 1px solid var(--line);
+  background-color: var(--bg);
+  background-image: radial-gradient(circle at 1px 1px, rgba(140,165,210,.16) 1px, transparent 1.6px);
+  background-size: 22px 22px;
+}
 .graph-view:active { cursor: grabbing; }
 .graph-view svg { display: block; width: 100%; height: 100%; }
 .graph-bar { display: flex; gap: 8px; padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); border-top: 1px solid var(--line); overflow-x: auto; }
 .graph-bar .btn { flex: 1; white-space: nowrap; padding: 8px 6px; }
-.gn-edge { stroke: var(--line); stroke-width: 2; }
-.gn-edge.on { stroke: var(--accent); }
-.gn-dot { stroke-width: 2; cursor: pointer; }
-.gn-dot.gn-user { fill: var(--accent); stroke: var(--accent); }
-.gn-dot.gn-asst { fill: var(--dialogue); stroke: var(--dialogue); }
-.gn-dot.dim { fill: transparent; }
-.gn-dot.gn-user.dim, .gn-dot.gn-asst.dim { stroke: var(--muted); }
-.gn-dot.leaf { stroke: var(--ink); stroke-width: 3.5; }
-.gn-dot.sel { stroke: var(--ink); stroke-width: 3.5; }
-.gn-run { cursor: pointer; }
-.gn-run rect { fill: var(--panel); stroke: var(--muted); stroke-width: 2; }
-.gn-run.on rect { stroke: var(--accent); }
-.gn-run text { fill: var(--muted); font-size: 12px; text-anchor: middle; }
-.gn-run.on text { fill: var(--accent); }
+
+/* Graph nodes: tidy tree, glowing live path, radar halo on the current leaf. */
+.gn-edge { fill: none; stroke: var(--line); stroke-width: 2; stroke-linecap: round; }
+.gn-edge.on { stroke: var(--accent); stroke-width: 2.5; }
+.gn-edge.halo { stroke: var(--accent); stroke-width: 8; opacity: .16; }
+.gn-edge.flow { stroke-dasharray: 7 13; animation: gnFlow 1.2s linear infinite; }
+@keyframes gnFlow { to { stroke-dashoffset: -20; } }
+.gn-node { cursor: pointer; }
+.gn-dot { stroke-width: 2; }
+.gn-node.gn-user .gn-dot { fill: var(--accent); stroke: var(--accent); }
+.gn-node.gn-asst .gn-dot { fill: var(--dialogue); stroke: var(--dialogue); }
+.gn-node.dim .gn-dot { opacity: .45; }
+.gn-node.dim .gn-pill { opacity: .55; }
+.gn-node.leaf .gn-dot { stroke: var(--ink); stroke-width: 3.5; }
+.gn-node.sel .gn-dot { stroke: var(--ink); stroke-width: 3.5; }
+.gn-pill { fill: var(--panel); stroke: var(--muted); stroke-width: 2; }
+.gn-node.on .gn-pill { stroke: var(--accent); }
+.gn-count { fill: var(--muted); font-size: 12px; text-anchor: middle; }
+.gn-node.on .gn-count { fill: var(--accent); }
+.gn-fork { fill: var(--bg2); stroke: var(--muted); stroke-width: 1.5; }
+.gn-halo { fill: none; stroke: var(--accent); stroke-width: 2; stroke-dasharray: 5 7; animation: gnSpin 7s linear infinite; }
+@keyframes gnSpin { to { stroke-dashoffset: -48; } }
+.gn-label { fill: var(--muted); font-size: 11px; pointer-events: none; }
+.gn-nolabels .gn-label { display: none; }
+@media (prefers-reduced-motion: reduce) {
+  .gn-edge.flow { animation: none; stroke-dasharray: none; }
+  .gn-halo { animation: none; }
+}
 
 /* Slim graph entry row above the transcript. */
 .graph-open-row { display: flex; justify-content: flex-end; padding: 6px 12px 0; }
@@ -332,8 +360,15 @@ details.thought .thought-body { padding: 6px 10px 10px; font-size: 13px; color: 
   #branchbar { max-width: 720px; margin: 0 auto; width: 100%; }
 }
 .branch-banner { display: flex; align-items: center; gap: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; margin-bottom: 6px; }
+.branch-banner .bi { min-width: 0; }
 .branch-banner button { background: transparent; color: var(--muted); border: 1px solid var(--line); border-radius: 8px; font-size: 12px; padding: 3px 9px; cursor: pointer; margin-left: auto; }
 .branch-banner button:hover { color: var(--ink); border-color: var(--accent); }
+
+/* Branch switcher: step between the continuations of the nearest fork. */
+.branch-switch { display: flex; align-items: center; gap: 6px; padding: 0 0 4px; }
+.branch-switch .bi { font-size: 12px; color: var(--muted); }
+.branch-switch button { background: transparent; color: var(--muted); border: 1px solid var(--line); border-radius: 8px; font-size: 12px; padding: 3px 9px; cursor: pointer; }
+.branch-switch button:hover { color: var(--ink); border-color: var(--accent); }
 
 /* Starter picker options. */
 .starter-opt { display: flex; flex-direction: column; gap: 4px; width: 100%; text-align: left; background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; font-size: 14px; cursor: pointer; }

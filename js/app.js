@@ -40,7 +40,7 @@ import {
   importVaultFromJSON,
   seedIfEmpty
 } from "./db.js";
-import { buildMessages, estimateTokens, activeChain, parentMap, childrenMap, treeLayout } from "./prompt-engine.js";
+import { buildMessages, estimateTokens, activeChain, parentMap, childrenMap, tidyLayout } from "./prompt-engine.js";
 import { sendChat, fetchModels, fetchReasoningModes } from "./api-client.js";
 import { mergeReasoning, modeValues, describeMode, catalogLookup } from "./reasoning-modes.js";
 import { parsePNGCard, parseCharacterJSON, normalizeCharacter, fileToAvatarDataURL } from "./png-parser.js";
@@ -459,25 +459,38 @@ async function migrateLegacyPresetsIfNeeded() {
 // chats behave exactly as before). Swipes stay orthogonal: variants share
 // a swipe_group; pathIds marks which variant the chain passes through so
 // the display matches the context even on non-active variants.
-function groupRows(rows, pathIds = null) {
+//
+// A swipe variant and a branch are the same thing in the tree: two rows
+// sharing a parent. The chat's active_leaf_id says which one the
+// transcript, the model context and the graph all agree on.
+function groupRows(chain, allRows = chain, pathIds = null) {
   // Returns ordered items: {kind:'user',msg} | {kind:'group',msgs:[...],active}
+  // Swipe groups are resolved against every row of the chat, not just the
+  // chain, so a variant parked on another branch is still reachable with
+  // the arrow buttons.
   const items = [];
-  const byGroup = new Map();
-  for (const m of rows) {
+  const groupOf = new Map();
+  for (const m of (allRows || [])) {
+    if (m.role !== "assistant" || m.swipe_group_id == null) continue;
+    if (!groupOf.has(m.swipe_group_id)) groupOf.set(m.swipe_group_id, []);
+    groupOf.get(m.swipe_group_id).push(m);
+  }
+  for (const g of groupOf.values()) {
+    g.sort((a, b) => a.timestamp - b.timestamp || a.id - b.id);
+  }
+  const seen = new Set();
+  for (const m of chain) {
     if (m.role !== "assistant" || m.swipe_group_id == null) {
       items.push({ kind: m.role === "user" ? "user" : "solo", msg: m });
-    } else {
-      if (!byGroup.has(m.swipe_group_id)) {
-        const g = { kind: "group", groupId: m.swipe_group_id, msgs: [] };
-        byGroup.set(m.swipe_group_id, g);
-        items.push(g);
-      }
-      byGroup.get(m.swipe_group_id).msgs.push(m);
+      continue;
     }
+    const gid = m.swipe_group_id;
+    if (seen.has(gid)) continue;
+    seen.add(gid);
+    items.push({ kind: "group", groupId: gid, msgs: (groupOf.get(gid) || [m]).slice() });
   }
   for (const it of items) {
     if (it.kind === "group") {
-      it.msgs.sort((a, b) => a.timestamp - b.timestamp || a.id - b.id);
       it.active = (pathIds && it.msgs.find((m) => pathIds.has(m.id)))
         || it.msgs.find((m) => m.swipe_active === 1)
         || it.msgs[it.msgs.length - 1];
@@ -501,14 +514,68 @@ async function getChatChain(chatId) {
   return { rows, chain, pathIds, chat, leafId: effLeaf, latestId, hidden: rows.length - chain.length };
 }
 
-// Point a chat's view at a message (rewind/fast-forward). The next sent
-// message parents onto the leaf, forking a new branch automatically.
-async function setActiveLeaf(chatId, msgId) {
+// Persist the chat's active leaf without re-rendering. Every append
+// advances the leaf, so the transcript, the model context and the graph
+// all follow the branch the user is on instead of parking on the fork.
+async function setLeaf(chatId, msgId) {
+  if (chatId == null) return;
   const chats = await listChats();
   const chat = chats.find((c) => c.id === chatId);
   if (!chat) return;
-  await saveChat({ ...chat, active_leaf_id: msgId });
+  const next = msgId ?? null;
+  if ((chat.active_leaf_id ?? null) === next) return;
+  await saveChat({ ...chat, active_leaf_id: next });
+}
+
+// Point a chat's view at a message (rewind/fast-forward). The next sent
+// message parents onto the leaf, forking a new branch automatically.
+async function setActiveLeaf(chatId, msgId) {
+  await setLeaf(chatId, msgId);
   await renderCurrentChat();
+}
+
+// Delete a message and keep the tree connected: its children are promoted
+// to its parent, and the active leaf moves to a row that still exists.
+async function deleteMessageAndFix(chatId, msgId) {
+  const rows = await listMessages(chatId);
+  const parent = parentMap(rows).get(msgId) ?? null;
+  for (const row of rows) {
+    if (row.id !== msgId && row.parent_id === msgId) {
+      await saveMessage({ ...row, parent_id: parent });
+    }
+  }
+  await deleteMessage(msgId);
+  const chats = await listChats();
+  const chat = chats.find((c) => c.id === chatId);
+  if (chat && (chat.active_leaf_id ?? null) === msgId) await setLeaf(chatId, parent);
+}
+
+// Rewind to a message so the next line starts a new branch there, and put
+// the caret back in the composer.
+async function branchFrom(msgId) {
+  await setActiveLeaf(ui.chatId, msgId);
+  try { $("#input")?.focus(); } catch { /* noop */ }
+}
+
+// Sibling branches at the nearest fork above (or at) the current leaf.
+// Returns {point, siblings, index} where siblings are the first messages
+// of each continuation, or null when the path never forked.
+function branchSiblings(rows, leafId) {
+  if (leafId == null || !rows.length) return null;
+  const pmap = parentMap(rows);
+  const kids = childrenMap(rows);
+  const own = kids.get(leafId) || [];
+  if (own.length > 1) return { point: leafId, siblings: own, index: -1 };
+  let cur = leafId;
+  for (;;) {
+    const p = pmap.get(cur);
+    if (p == null) return null;
+    const sibs = kids.get(p) || [];
+    if (sibs.length > 1) {
+      return { point: p, siblings: sibs, index: sibs.findIndex((s) => s.id === cur) };
+    }
+    cur = p;
+  }
 }
 
 function clearBranchbar() {
@@ -518,8 +585,9 @@ function clearBranchbar() {
   bar.hidden = true;
 }
 
-// Slim bar above the transcript: off-branch banner + graph entry button.
-function renderBranchbar(rows, chain, pathIds, { leafId, latestId, hidden }) {
+// Slim bar above the transcript: off-branch banner + branch switcher +
+// graph entry button.
+function renderBranchbar(rows, { leafId, latestId, hidden }) {
   const bar = $("#branchbar");
   if (!bar) return;
   bar.innerHTML = "";
@@ -528,20 +596,44 @@ function renderBranchbar(rows, chain, pathIds, { leafId, latestId, hidden }) {
     return;
   }
   bar.hidden = false;
-  const offBranch = leafId !== latestId;
+  const offBranch = leafId != null && latestId != null && leafId !== latestId;
+  const sib = branchSiblings(rows, leafId);
   if (offBranch || hidden) {
     const banner = document.createElement("div");
     banner.className = "branch-banner";
     const info = document.createElement("span");
+    info.className = "bi";
     info.textContent = offBranch
-      ? `On a branch — ${hidden} later message${hidden === 1 ? "" : "s"} on other branches hidden.`
+      ? `On an older branch - ${hidden} later message${hidden === 1 ? "" : "s"} hidden.`
       : `${hidden} message${hidden === 1 ? "" : "s"} on other branches.`;
     banner.append(info);
     if (offBranch) {
-      banner.append(actionButton("Latest ▶", "Jump to the newest message", () =>
+      banner.append(actionButton("Newest ▶", "Jump to the newest message", () =>
         setActiveLeaf(ui.chatId, latestId)));
     }
     bar.append(banner);
+  }
+  // Branch switcher: step between the continuations of the nearest fork.
+  if (sib && sib.siblings.length > 1) {
+    const row = document.createElement("div");
+    row.className = "branch-switch";
+    const label = document.createElement("span");
+    label.className = "bi";
+    label.textContent = sib.index >= 0
+      ? `Branch ${sib.index + 1}/${sib.siblings.length}`
+      : `${sib.siblings.length} ways forward`;
+    row.append(label);
+    const step = async (dir) => {
+      const n = sib.siblings.length;
+      let i = sib.index >= 0 ? sib.index : (dir > 0 ? -1 : 0);
+      i = (i + dir + n) % n;
+      await setActiveLeaf(ui.chatId, sib.siblings[i].id);
+    };
+    row.append(
+      actionButton("◀", "Previous branch", () => step(-1)),
+      actionButton("▶", "Next branch", () => step(1))
+    );
+    bar.append(row);
   }
   const grow = document.createElement("div");
   grow.className = "graph-open-row";
@@ -600,13 +692,21 @@ function collapseRuns(rows) {
   return runs.map((ids) => ({ ids: ids.map((m) => m.id), role: ids[0].role, count: ids.length }));
 }
 
-function openGraph() {
+async function openGraph() {
   if (ui.chatId == null) return;
+  $("#graph-modal").hidden = false;
+  let count = 0;
+  try {
+    const { rows } = await getChatChain(ui.chatId);
+    count = rows.length;
+  } catch { /* fall back to the collapsed view */ }
+  if ($("#graph-modal").hidden) return;
   graphState = {
-    collapsed: true, horizontal: false, selectedId: null,
+    // Short chats read better as one dot per message; long ones collapse
+    // into runs so the tree stays light.
+    collapsed: count > 30, horizontal: false, selectedId: null,
     k: 1, px: 0, py: 0, bbox: null, items: [], needsFit: true
   };
-  $("#graph-modal").hidden = false;
   renderGraph().catch((e) => logErr("E_UI_GRAPH", e.message));
 }
 
@@ -636,6 +736,8 @@ function graphApplyTransform() {
   const g = $("#graph-g");
   if (!st || !g) return;
   g.setAttribute("transform", `translate(${st.px},${st.py}) scale(${st.k})`);
+  // Labels only earn their pixels once the graph is big enough to read.
+  g.classList.toggle("gn-nolabels", st.k < 0.92);
 }
 
 function graphShowPreview(msgId) {
@@ -659,10 +761,57 @@ function graphShowPreview(msgId) {
   prev.append(body);
 }
 
+// Graph nodes are runs: a straight stretch of the message tree (collapsed)
+// or a single message (expanded). Each run knows the run it hangs off.
+function buildRuns(rows, collapsed) {
+  const pmap = parentMap(rows);
+  const runs = collapsed
+    ? collapseRuns(rows)
+    : rows.map((m) => ({ ids: [m.id], role: m.role, count: 1 }));
+  const owner = new Map();
+  for (const r of runs) for (const id of r.ids) owner.set(id, r);
+  for (const r of runs) {
+    const p = pmap.get(r.ids[0]) ?? null;
+    const pr = p != null && owner.has(p) ? owner.get(p) : null;
+    r.parent = pr && pr !== r ? pr : null;
+  }
+  return runs;
+}
+
+// Cubic connector between two graph nodes. Vertical trees leave the parent
+// downwards and arrive at the child downwards; rotated trees swap roles.
+function graphEdgePath(a, b, horizontal) {
+  const x1 = a.x, y1 = a.y, x2 = b.x, y2 = b.y;
+  if (horizontal) {
+    const dx = (x2 - x1) * 0.45;
+    return `M${x1},${y1} C${x1 + dx},${y1} ${x2 - dx},${y2} ${x2},${y2}`;
+  }
+  const dy = (y2 - y1) * 0.45;
+  return `M${x1},${y1} C${x1},${y1 + dy} ${x2},${y2 - dy} ${x2},${y2}`;
+}
+
+// Nearest graph node under a screen point. Hit testing is done in graph
+// space so no extra transparent hit circles are needed per node.
+function graphNearest(st, clientX, clientY) {
+  const view = $("#graph-view");
+  if (!st || !view || !st.items.length) return null;
+  const rect = view.getBoundingClientRect();
+  const gx = (clientX - rect.left - st.px) / st.k;
+  const gy = (clientY - rect.top - st.py) / st.k;
+  const reach = Math.max(18, 26 / st.k);
+  let best = null;
+  let bd = reach;
+  for (const it of st.items) {
+    const d = Math.hypot(it.x - gx, it.y - gy);
+    if (d < bd) { bd = d; best = it; }
+  }
+  return best;
+}
+
 async function renderGraph() {
   const st = graphState;
   if (!st || ui.chatId == null) return;
-  const { rows, chain, pathIds, leafId } = await getChatChain(ui.chatId);
+  const { rows, pathIds, leafId } = await getChatChain(ui.chatId);
   const chars = await listCharacters();
   const ch = chars.find((c) => c.id === ui.characterId);
   st.chName = ch?.name || "AI";
@@ -670,53 +819,46 @@ async function renderGraph() {
   st.pathIds = pathIds;
   st.leafId = leafId;
   if (st.selectedId != null && !st.byId.has(st.selectedId)) st.selectedId = null;
-  const { nodes } = treeLayout(rows);
-  const pos = new Map(nodes.map((n) => [n.id, n]));
-  const DX = 46;
-  const DY = 42;
-  const items = [];
-  const runs = st.collapsed ? collapseRuns(rows) : rows.map((m) => ({ ids: [m.id], role: m.role, count: 1 }));
-  for (const run of runs) {
-    const first = pos.get(run.ids[0]);
-    const last = pos.get(run.ids[run.ids.length - 1]);
-    if (!first || !last) continue;
-    // Pill sits at the run's midpoint so edges stay attached.
-    const d = (first.depth + last.depth) / 2;
-    const l = (first.lane + last.lane) / 2;
-    items.push({
-      ...run,
-      x: st.horizontal ? d * DX : l * DX,
-      y: st.horizontal ? l * DY : d * DY
-    });
-  }
-  // Edges link run endpoints: parent run -> child run via the actual
-  // parent pointer of the child's first message.
-  const pmap = parentMap(rows);
-  const runOf = new Map();
-  for (const it of items) for (const id of it.ids) runOf.set(id, it);
+
+  // Tidy layout over runs: one column per leaf, parents centred between
+  // their children, so forks read as forks instead of a diagonal staircase.
+  const runs = buildRuns(rows, st.collapsed);
+  const runIndex = new Map(runs.map((r, i) => [r, i]));
+  const items = runs.map((r, i) => ({
+    ids: r.ids,
+    role: r.role,
+    count: r.count,
+    parent: runIndex.has(r.parent) ? runIndex.get(r.parent) : null,
+    kids: 0
+  }));
+  const lay = tidyLayout(items.map((it, i) => ({ id: i, parent: it.parent })));
+  const DX = 74;
+  const DY = 62;
+  items.forEach((it, i) => {
+    const d = lay.depth.get(i) ?? 0;
+    const l = lay.lane.get(i) ?? 0;
+    it.depth = d;
+    it.lane = l;
+    it.x = st.horizontal ? d * DX : l * DX;
+    it.y = st.horizontal ? l * DY : d * DY;
+  });
   const edges = [];
-  const seenEdge = new Set();
   for (const it of items) {
-    const firstId = it.ids[0];
-    const p = pmap.get(firstId);
-    if (p == null) continue;
-    const pit = runOf.get(p);
-    if (!pit || pit === it) continue;
-    const key = `${pit.ids[pit.ids.length - 1]}>${firstId}`;
-    if (seenEdge.has(key)) continue;
-    seenEdge.add(key);
-    edges.push({ a: pit, b: it, on: pathIds.has(firstId) && pathIds.has(p) });
+    if (it.parent == null) continue;
+    const a = items[it.parent];
+    if (!a) continue;
+    a.kids++;
+    const on = it.ids.some((id) => pathIds.has(id)) && a.ids.some((id) => pathIds.has(id));
+    edges.push({ a, b: it, on });
   }
   let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
   for (const it of items) {
     minx = Math.min(minx, it.x); miny = Math.min(miny, it.y);
     maxx = Math.max(maxx, it.x); maxy = Math.max(maxy, it.y);
   }
-  if (!items.length) {
-    st.bbox = null;
-  } else {
-    st.bbox = { x: minx, y: miny, w: Math.max(1, maxx - minx), h: Math.max(1, maxy - miny) };
-  }
+  st.bbox = items.length
+    ? { x: minx, y: miny, w: Math.max(1, maxx - minx), h: Math.max(1, maxy - miny) }
+    : null;
   st.items = items;
   if (st.bbox == null || st.needsFit) {
     st.needsFit = false;
@@ -729,52 +871,92 @@ async function renderGraph() {
   const svg = document.createElementNS(NS, "svg");
   const g = document.createElementNS(NS, "g");
   g.id = "graph-g";
+  // Only the tail of the live path animates: a short dash crawl is enough
+  // to read as "this is where you are" without repainting every edge.
+  const liveEdges = edges.filter((e) => e.on);
+  const flowFrom = Math.max(0, liveEdges.length - 18);
+  liveEdges.forEach((e, i) => { e.flow = i >= flowFrom; });
   for (const e of edges) {
-    const ln = document.createElementNS(NS, "line");
-    ln.setAttribute("x1", e.a.x); ln.setAttribute("y1", e.a.y);
-    ln.setAttribute("x2", e.b.x); ln.setAttribute("y2", e.b.y);
-    ln.setAttribute("class", "gn-edge" + (e.on ? " on" : ""));
-    g.append(ln);
+    const d = graphEdgePath(e.a, e.b, st.horizontal);
+    if (e.on) {
+      const halo = document.createElementNS(NS, "path");
+      halo.setAttribute("d", d);
+      halo.setAttribute("class", "gn-edge halo");
+      g.append(halo);
+    }
+    const p = document.createElementNS(NS, "path");
+    p.setAttribute("d", d);
+    p.setAttribute("class", "gn-edge" + (e.on ? " on" : "") + (e.flow ? " flow" : ""));
+    g.append(p);
   }
+  let labels = 150;
   for (const it of items) {
     const lastId = it.ids[it.ids.length - 1];
+    const onPath = it.ids.some((id) => pathIds.has(id));
+    const isLeaf = leafId != null && it.ids.includes(leafId);
+    const isSel = st.selectedId != null && it.ids.includes(st.selectedId);
+    const node = document.createElementNS(NS, "g");
+    node.setAttribute("class", "gn-node gn-" + (it.role === "user" ? "user" : "asst")
+      + (onPath ? " on" : " dim")
+      + (isLeaf ? " leaf" : "")
+      + (isSel ? " sel" : ""));
+    if (isLeaf) {
+      const halo = document.createElementNS(NS, "circle");
+      halo.setAttribute("cx", it.x);
+      halo.setAttribute("cy", it.y);
+      halo.setAttribute("r", it.count > 1 ? 19 : 15);
+      halo.setAttribute("class", "gn-halo");
+      node.append(halo);
+    }
     if (it.count > 1) {
-      const grp = document.createElementNS(NS, "g");
-      grp.setAttribute("class", "gn-run" + (it.ids.some((id) => pathIds.has(id)) ? " on" : ""));
-      grp.dataset.mid = String(lastId);
       const r = document.createElementNS(NS, "rect");
-      r.setAttribute("x", it.x - 19); r.setAttribute("y", it.y - 12);
-      r.setAttribute("width", "38"); r.setAttribute("height", "24");
+      r.setAttribute("x", it.x - 21); r.setAttribute("y", it.y - 12);
+      r.setAttribute("width", "42"); r.setAttribute("height", "24");
       r.setAttribute("rx", "12");
+      r.setAttribute("class", "gn-pill");
       const t = document.createElementNS(NS, "text");
       t.setAttribute("x", it.x); t.setAttribute("y", it.y + 4);
+      t.setAttribute("class", "gn-count");
       t.textContent = `×${it.count}`;
-      const tip = document.createElementNS(NS, "title");
-      tip.textContent = `${it.count} messages — tap to load through here`;
-      grp.append(r, t, tip);
-      g.append(grp);
+      node.append(r, t);
     } else {
       const c = document.createElementNS(NS, "circle");
       c.setAttribute("cx", it.x); c.setAttribute("cy", it.y);
-      c.setAttribute("r", lastId === leafId ? "10" : "8");
-      c.dataset.mid = String(lastId);
-      const m = st.byId.get(lastId);
-      c.setAttribute("class", "gn-dot gn-" + (it.role === "user" ? "user" : "asst")
-        + (pathIds.has(lastId) ? "" : " dim")
-        + (lastId === leafId ? " leaf" : "")
-        + (lastId === st.selectedId ? " sel" : ""));
-      const tip = document.createElementNS(NS, "title");
-      tip.textContent = `${it.role === "user" ? "You" : st.chName}: ${String(m?.content || "").replace(/\s+/g, " ").slice(0, 80)}`;
-      c.append(tip);
-      g.append(c);
-      // Fat transparent hit area for thumbs.
-      const hit = document.createElementNS(NS, "circle");
-      hit.setAttribute("cx", it.x); hit.setAttribute("cy", it.y);
-      hit.setAttribute("r", "22");
-      hit.setAttribute("fill", "transparent");
-      hit.dataset.mid = String(lastId);
-      g.append(hit);
+      c.setAttribute("r", isLeaf ? 10 : 8);
+      c.setAttribute("class", "gn-dot");
+      node.append(c);
     }
+    if (it.kids > 1) {
+      const fork = document.createElementNS(NS, "path");
+      fork.setAttribute("d", `M${it.x},${it.y - 17} l5,5 l-5,5 l-5,-5 z`);
+      fork.setAttribute("class", "gn-fork");
+      node.append(fork);
+    }
+    const m = st.byId.get(lastId);
+    const tip = document.createElementNS(NS, "title");
+    tip.textContent = it.count > 1
+      ? `${it.count} messages - tap to load through here`
+      : `${it.role === "user" ? "You" : st.chName}: ${String(m?.content || "").replace(/\s+/g, " ").slice(0, 80)}`;
+    node.append(tip);
+    if (labels > 0) {
+      labels--;
+      const first = st.byId.get(it.ids[0]);
+      const txt = String(first?.content || "").replace(/\s+/g, " ").trim();
+      const label = document.createElementNS(NS, "text");
+      label.setAttribute("class", "gn-label");
+      if (st.horizontal) {
+        label.setAttribute("x", it.x);
+        label.setAttribute("y", it.y + 28);
+        label.setAttribute("text-anchor", "middle");
+      } else {
+        label.setAttribute("x", it.x + 28);
+        label.setAttribute("y", it.y + 4);
+        label.setAttribute("text-anchor", "start");
+      }
+      label.textContent = txt.slice(0, 34) || (it.role === "user" ? "You" : st.chName);
+      node.append(label);
+    }
+    g.append(node);
   }
   svg.append(g);
   view.append(svg);
@@ -794,10 +976,7 @@ function graphWireGestures(view) {
   const pts = new Map();
   let pinchD = 0;
   let moved = 0;
-  const midOf = (e) => {
-    const t = e.target;
-    return t && t.dataset && t.dataset.mid ? Number(t.dataset.mid) : null;
-  };
+  let hoverId = null;
   view.addEventListener("pointerdown", (e) => {
     view.setPointerCapture?.(e.pointerId);
     pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -835,15 +1014,25 @@ function graphWireGestures(view) {
       st.px += dx;
       st.py += dy;
       graphApplyTransform();
+      // While the finger is still, preview whatever sits under it.
+      if (moved > 6) { hoverId = null; return; }
+      const hit = graphNearest(st, e.clientX, e.clientY);
+      const hid = hit ? hit.ids[hit.ids.length - 1] : null;
+      if (hid !== hoverId) {
+        hoverId = hid;
+        graphShowPreview(hid);
+      }
     }
   });
   const up = async (e) => {
     const st = graphState;
     const wasTap = moved < 10 && pts.size <= 1;
-    const mid = midOf(e);
     pts.delete(e.pointerId);
     if (pts.size < 2) pinchD = 0;
-    if (st && wasTap && mid != null && ui.chatId != null) {
+    if (st && wasTap && ui.chatId != null) {
+      const hit = graphNearest(st, e.clientX, e.clientY);
+      if (!hit) return;
+      const mid = hit.ids[hit.ids.length - 1];
       st.selectedId = mid;
       try {
         await setActiveLeaf(ui.chatId, mid);
@@ -943,7 +1132,10 @@ function attachSwipe(el, onPrev, onNext) {
   }, { passive: true });
 }
 
-async function setActiveSibling(chatId, groupId, msgId) {
+// Flip the active variant inside a swipe group. The chosen variant also
+// becomes the branch the chat sits on, so the transcript and the model
+// context never disagree about which version is live.
+async function applyActiveSibling(chatId, groupId, msgId) {
   const rows = await listMessages(chatId);
   const sibs = rows.filter((m) => m.swipe_group_id === groupId);
   for (const s of sibs) {
@@ -951,6 +1143,11 @@ async function setActiveSibling(chatId, groupId, msgId) {
       await saveMessage({ ...s, swipe_active: s.id === msgId ? 1 : 0 });
     }
   }
+  await setLeaf(chatId, msgId);
+}
+
+async function setActiveSibling(chatId, groupId, msgId) {
+  await applyActiveSibling(chatId, groupId, msgId);
   await renderCurrentChat();
 }
 
@@ -1025,7 +1222,7 @@ async function renderCurrentChat() {
   const me = personas.find((p) => p.id === ui.personaId);
   const chName = ch?.name || "Polyglot";
   const meName = me?.name || "You";
-  renderBranchbar(rows, chain, pathIds, { leafId, latestId, hidden });
+  renderBranchbar(rows, { leafId, latestId, hidden });
   $("#chat").innerHTML = "";
   if (!rows.length) {
     if (ch?.first_mes) {
@@ -1039,7 +1236,7 @@ async function renderCurrentChat() {
     }
     return;
   }
-  const items = groupRows(chain, pathIds);
+  const items = groupRows(chain, rows, pathIds);
   items.forEach((it, ii) => {
     const isLast = ii === items.length - 1;
     if (it.kind === "user") {
@@ -1062,10 +1259,10 @@ async function renderCurrentChat() {
           await copyText(it.msg.content);
         }),
         actionButton("⑂ Branch", "Rewind to here — your next message starts a new branch", () =>
-          setActiveLeaf(ui.chatId, it.msg.id)),
+          branchFrom(it.msg.id)),
         actionButton("🗑 Delete", "Delete message", async () => {
           if (!window.confirm("Delete this message?")) return;
-          await deleteMessage(it.msg.id);
+          await deleteMessageAndFix(ui.chatId, it.msg.id);
           await renderCurrentChat();
         })
       );
@@ -1128,10 +1325,10 @@ async function renderCurrentChat() {
         await copyText(active.content);
       }),
       actionButton("⑂ Branch", "Rewind to here — your next message starts a new branch", () =>
-        setActiveLeaf(ui.chatId, active.id)),
+        branchFrom(active.id)),
       actionButton("🗑 Delete", "Delete message", async () => {
         if (!window.confirm("Delete this message?")) return;
-        await deleteMessage(active.id);
+        await deleteMessageAndFix(ui.chatId, active.id);
         await renderCurrentChat();
       })
     );
@@ -1874,7 +2071,8 @@ async function generateAssistant(chatId, pastRows, { groupId = null, titleHint =
       parent_id: pastRows.length ? pastRows[pastRows.length - 1].id : null,
       swipe_group_id: groupId || `g${Date.now()}`, swipe_active: 1, timestamp: Date.now()
     });
-    if (groupId) await setActiveSibling(chatId, groupId, id);
+    if (groupId) await applyActiveSibling(chatId, groupId, id);
+    else await setLeaf(chatId, id);
     await touchChatById(chatId, titleHint);
     triggerHaptic(25);
     await refreshLibrary();
@@ -1895,7 +2093,8 @@ async function generateAssistant(chatId, pastRows, { groupId = null, titleHint =
       reasoning_content: reasoning, swipe_group_id: gid,
       swipe_active: 1, timestamp: Date.now()
     });
-    if (groupId) await setActiveSibling(chatId, groupId, id);
+    if (groupId) await applyActiveSibling(chatId, groupId, id);
+    else await setLeaf(chatId, id);
     await runStagePostpass(chatId, content || "");
     await touchChatById(chatId, titleHint);
     triggerHaptic(25);
@@ -1928,7 +2127,12 @@ async function handleSend() {
   const chatId = await ensureChat();
   const { chain } = await getChatChain(chatId);
   const parent = chain.length ? chain[chain.length - 1].id : null;
-  await saveMessage({ chat_id: chatId, role: "user", content: text, parent_id: parent, timestamp: Date.now() });
+  const userId = await saveMessage({
+    chat_id: chatId, role: "user", content: text, parent_id: parent, timestamp: Date.now()
+  });
+  // Move the leaf onto the new message: from here the chat lives on this
+  // branch, the transcript follows it and the model sees it in context.
+  await setLeaf(chatId, userId);
   await runStagePrepass(chatId, text);
   // Paint instantly (includes the new user message), then generate below it.
   await renderCurrentChat();
@@ -1945,9 +2149,12 @@ async function handleRetry(item) {
   const sibs = item.kind === "group" ? item.msgs : [item.msg];
   const anchorId = (item.kind === "group" ? item.active?.id : item.msg.id) ?? sibs[0].id;
   const first = sibs[0];
-  const pos = chain.findIndex((m) => m.id === anchorId);
-  const history = pos === -1 ? chain : chain.slice(0, pos);
   const groupId = item.kind === "group" ? item.groupId : `g${Date.now()}`;
+  // Anchor on the variant that is actually on the path, otherwise the new
+  // reply would hang off the wrong parent.
+  const onPath = chain.find((m) => m.swipe_group_id === groupId) || chain.find((m) => m.id === anchorId);
+  const pos = onPath ? chain.findIndex((m) => m.id === onPath.id) : -1;
+  const history = pos === -1 ? chain : chain.slice(0, pos);
   if (item.kind === "solo") {
     await saveMessage({ ...first, swipe_group_id: groupId });
   }
@@ -1962,7 +2169,13 @@ async function handleRetryFromUser(userMsg) {
   const { chain } = await getChatChain(chatId);
   const pos = chain.findIndex((m) => m.id === userMsg.id);
   const history = pos === -1 ? chain : chain.slice(0, pos + 1);
-  await generateAssistant(chatId, history, {});
+  // Reuse the swipe group of the reply we are replacing so both versions
+  // stay one slot with two variants instead of forking a stray branch.
+  const next = pos >= 0 ? chain[pos + 1] : null;
+  const groupId = next && next.role === "assistant" && next.swipe_group_id != null
+    ? next.swipe_group_id
+    : `g${Date.now()}`;
+  await generateAssistant(chatId, history, { groupId });
 }
 
 async function handleContinue() {
@@ -2028,10 +2241,11 @@ async function handleImpersonate() {
   triggerHaptic(10);
   if (!presetModel(preset)) {
     const text = "*leans forward, offline echo as you.* \"No model set — open ⚙ and add a preset.\"";
-    await saveMessage({
+    const id = await saveMessage({
       chat_id: chatId, role: "user", content: text,
       parent_id: rows.length ? rows[rows.length - 1].id : null, timestamp: Date.now()
     });
+    await setLeaf(chatId, id);
     await touchChatById(chatId);
     await renderCurrentChat();
     await refreshLibrary();
@@ -2049,10 +2263,11 @@ async function handleImpersonate() {
   try {
     const { content } = await runStream(preset, provider, ctx.built.messages, shell, aborter.signal);
     if (!content) throw new Error("E_UI_SEND: empty impersonation from provider.");
-    await saveMessage({
+    const id = await saveMessage({
       chat_id: chatId, role: "user", content,
       parent_id: rows.length ? rows[rows.length - 1].id : null, timestamp: Date.now()
     });
+    await setLeaf(chatId, id);
     await touchChatById(chatId);
     triggerHaptic(25);
   } catch (e) {
@@ -3949,10 +4164,20 @@ async function executeSupervisorAction(a) {
     const all = await listChats();
     const chat = all.find((c) => c.id === Number(act.chat_id));
     if (!chat) throw new Error("E_SUPERVISOR: chat not found.");
-    const msg = { chat_id: chat.id, role: act.role, content: String(act.content), timestamp: Date.now() };
+    // Parent onto the live leaf so the appended line continues the branch
+    // the chat is on instead of floating in the tree.
+    const rows = await listMessages(chat.id);
+    const leaf = (chat.active_leaf_id != null && rows.some((r) => r.id === chat.active_leaf_id))
+      ? chat.active_leaf_id
+      : (rows.length ? rows[rows.length - 1].id : null);
+    const msg = {
+      chat_id: chat.id, role: act.role, content: String(act.content),
+      parent_id: leaf, timestamp: Date.now()
+    };
     if (act.name) msg.name = String(act.name).slice(0, 80);
     const id = await saveMessage(msg);
-    try { await touchChat(chat); } catch { /* timestamp optional */ }
+    await touchChatById(chat.id);
+    await setLeaf(chat.id, id);
     return "appended " + act.role + " message #" + id + " to chat #" + chat.id;
   }
   if (act.action === "delete_message") {

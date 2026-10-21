@@ -169,39 +169,54 @@ export function childrenMap(rows) {
   return kids;
 }
 
-// Compact tree layout: depth (root = 0) + lane (DFS pre-order row) per id.
+// Tidy tree layout over an explicit parent map. Items are {id, parent}.
+// Leaves take sequential lanes; a parent sits at the mean of its children,
+// so a long straight chain stays in ONE column instead of stretching a
+// column per message. Returns {depth, lane, maxDepth} keyed by item id.
 // Pure geometry for the SVG branch graph in app.js.
-export function treeLayout(rows) {
-  const sorted = sortRows(rows);
-  const byId = new Map(sorted.map((m) => [m.id, m]));
-  const pmap = parentMap(sorted);
-  const kids = childrenMap(sorted);
-  const depth = new Map();
-  const getDepth = (id) => {
-    if (depth.has(id)) return depth.get(id);
-    const seen = new Set();
-    let d = 0;
-    let cur = id;
-    while (pmap.get(cur) != null && !seen.has(cur)) {
-      seen.add(cur);
-      cur = pmap.get(cur);
-      d++;
-      if (!byId.has(cur)) break;
+export function tidyLayout(items) {
+  const list = [...(items || [])];
+  const byId = new Map(list.map((n) => [n.id, n]));
+  const kids = new Map();
+  const roots = [];
+  for (const n of list) {
+    const p = n.parent != null && byId.has(n.parent) && n.parent !== n.id ? n.parent : null;
+    if (p == null) {
+      roots.push(n);
+      continue;
     }
-    depth.set(id, d);
-    return d;
+    if (!kids.has(p)) kids.set(p, []);
+    kids.get(p).push(n);
+  }
+  const depth = new Map();
+  const lane = new Map();
+  let next = 0;
+  const visit = (n, path) => {
+    if (depth.has(n.id)) return;
+    if (path.has(n.id)) { depth.set(n.id, 0); lane.set(n.id, next++); return; }
+    path.add(n.id);
+    let d = 0;
+    for (const k of (kids.get(n.id) || [])) {
+      visit(k, path);
+      d = Math.max(d, (depth.get(k.id) ?? 0) + 1);
+    }
+    const ks = kids.get(n.id) || [];
+    depth.set(n.id, d);
+    if (!ks.length) {
+      lane.set(n.id, next++);
+    } else {
+      let sum = 0;
+      for (const k of ks) sum += lane.get(k.id) ?? 0;
+      lane.set(n.id, sum / ks.length);
+    }
+    path.delete(n.id);
   };
-  const nodes = [];
-  let lane = 0;
-  const visit = (id) => {
-    const m = byId.get(id);
-    if (!m) return;
-    nodes.push({ id, role: m.role, depth: getDepth(id), lane: lane++ });
-    for (const k of (kids.get(id) || [])) visit(k.id);
-  };
-  for (const r of (kids.get(null) || kids.get(undefined) || [])) visit(r.id);
-  if (!nodes.length) sorted.forEach((m) => nodes.push({ id: m.id, role: m.role, depth: 0, lane: lane++ }));
-  return { nodes, maxDepth: nodes.reduce((a, n) => Math.max(a, n.depth), 0) };
+  const path = new Set();
+  for (const r of roots) visit(r, path);
+  for (const n of list) if (!depth.has(n.id)) visit(n, path);
+  let maxDepth = 0;
+  for (const v of depth.values()) maxDepth = Math.max(maxDepth, v);
+  return { depth, lane, maxDepth };
 }
 
 // Agentic-format normalizer for strict gateways (Nemotron/Step/Kimi NIM
