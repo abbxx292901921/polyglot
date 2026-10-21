@@ -90,6 +90,30 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
 - `js/regex-engine.js` — pure find/replace scripts: cleanFlags, compileRule,
   applyRules(text, rules, {place, characterId}) → {text, applied, skipped}.
   Never throws; invalid patterns land in `skipped`.
+- `js/minigames.js` — PURE minigame contract + built-in engines. Session
+  shape `{active,phase,name,data,summary,actions[],log[],pending[],result}`;
+  `normalizeSession`, `addLog`, `addPending`, `sessionBlock`,
+  `buildMinigameBlocks`, `fenceGameText` (game text is DATA, never
+  instruction), `slugKey`, `validateMinigameHtml` (self-contained, offline,
+  no navigation, must use the Polyglot bridge), `parseGameCommand`
+  (`/duel …`, `/fortune …`, `/game <key> …`), and the native engines: `duel`
+  (HP/guard/focus, deterministic rolls) + `fortune` (21-card draw, 2 rerolls).
+  `GAME_AUTHORING_GUIDE` + `GAME_SKELETON_HTML` are what the Forge agent is
+  shown, so the guide and the validator must never disagree.
+- `js/game-frame.js` — hosts an agent-authored HTML minigame in a sandboxed
+  iframe. `sandbox="allow-scripts"` WITHOUT `allow-same-origin` → opaque
+  origin → the game cannot reach the parent DOM, the app's IndexedDB (where
+  provider keys live), localStorage or cookies. A strict CSP meta
+  (`default-src 'none'`) kills every subresource. `buildGameDocument` strips
+  navigation-capable elements/attributes; the bridge (`GAME_BRIDGE_SOURCE`)
+  is injected and speaks postMessage with the host. The host matches incoming
+  messages on `event.source === frame.contentWindow` (an opaque origin reports
+  `origin === "null"`), and a `load` watchdog puts the game back if it
+  navigates itself away. `runGameCommand` drives a throwaway frame for chat
+  commands when the Games tab is closed.
+- `js/stages.js` — pure deterministic roleplay engine (chess/dice/world/director).
+- `js/supervisor.js` — the Forge agent protocol (may import other PURE modules
+  only — never db.js/app.js).
 
 ## Rules for every patch
 1. No placeholders. Never `TODO`, stub functions, or omitted logic. Complete code only.
@@ -115,9 +139,27 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
 10. Never put the two-character sequence `*/` inside a `/* */` block comment
     (e.g. writing `*action*/"dialogue"` in prose) — it ends the comment early
     and the rest parses as code, bricking the whole module. Reword or use `//`.
+11. Minigames are UNTRUSTED CODE. A game document is written by an agent (or
+    imported from disk). It runs in an opaque-origin sandboxed iframe, but
+    never let game-authored text act as an instruction: fence it
+    (`fenceGameText`) before it reaches a system message, and strip
+    navigation in `validateMinigameHtml` + `buildGameDocument` — the CSP does
+    not stop a frame navigating itself away.
+12. Anything that LEAVES the device is a leak surface. A game document is
+    agent-authored, so a shared one can carry a tracker aimed at whoever
+    opens it. Exports must be sanitized: `sanitizeGameHtml` on the vault and
+    on any exported markup, `buildExportDocument` for a shared game file
+    (same sandbox + navigation watchdog as the app), and
+    `validateMinigameHtml` on the vault import so a hand-crafted vault cannot
+    install a game that phones home. Never commit a vault or an export to
+    the public repo — `.gitignore` covers `*.vault.json` and `polyglot-*`.
 
 ## Test checklist (run before calling a phase done)
 - Module-goal parse of `sw.js` + every `js/*.js` clean (see rule 9/10).
+- `node tools/boot.test.mjs` → INIT_OK / NO_REJECTIONS / BOOT_CLEAN.
+- `node tools/minigame.test.mjs`, `node tools/frame.test.mjs`,
+  `node tools/forge-game.test.mjs` → all OK.
+- `node tools/stream-equiv.test.mjs` → 0 failures.
 - Fresh load → send → reload → message persists; new chat/persona/character CRUD works.
 - Export vault with keys OFF → JSON has `"api_key": ""`. Import replaces data.
 - Airplane mode (after first load): shell + history open, send works locally.
@@ -200,3 +242,25 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   the page), SW navigation timeout so an offline cold start does not keep the
   radio awake, `overscroll-behavior: contain` on inner scrollers.
   `tools/boot.test.mjs` runs the real `init()` against DOM/IDB stubs.
+- v1.8.0 DONE: minigames + the Forge can now build them. NEW `js/minigames.js`
+  (pure): the session contract, the `fenceGameText` data fence, the HTML
+  validator, the chat-command parser, and two native engines (`duel` — HP /
+  guard / focus against the character; `fortune` — a 21-card spread with two
+  rerolls). NEW `js/game-frame.js`: an agent-authored HTML game runs in an
+  opaque-origin sandboxed iframe under a strict CSP, talks to the host over
+  postMessage through an injected bridge, and a `load` watchdog restores it if
+  it navigates itself away. NEW `minigames` store (DB v4→v5) holds the HTML
+  documents; sessions reuse `chat_stage_state` under `minigame:<key>` so no
+  second session store and no session migration. NEW Games tab: per-game
+  board, tap actions, event log, and a separate **Narrate** button that asks
+  the character to react to the queued events (the model is told the
+  authoritative state as a fenced system block). Chat commands work too
+  (`/duel strike`, `/fortune focus <question>`, `/game <key> <cmd>`).
+  FORGE: the agent gained `list_minigames`, `get_minigame`, `create_minigame`
+  and   `delete_minigame`, and its system prompt now embeds the authoring guide
+  plus a working skeleton, so it can build a game from scratch (writes still
+  need Approve). HTML games can also be imported/exported as files — the
+  export is a SANDBOXED WRAPPER (`buildExportDocument`), never the raw
+  agent-authored document, so a shared game file cannot report the reader's
+  address to whoever wrote it. No existing chat, message or stage behaviour
+  changed.

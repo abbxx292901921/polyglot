@@ -4,7 +4,7 @@
    - API calls (cross-origin or /chat/completions, /v1/, /messages): never cached.
 */
 
-const CACHE = "polyglot-v1.7.1";
+const CACHE = "polyglot-v1.8.0";
 const ASSETS = [
   "./",
   "./index.html",
@@ -22,6 +22,8 @@ const ASSETS = [
   "./js/regex-engine.js",
   "./js/stages.js",
   "./js/supervisor.js",
+  "./js/minigames.js",
+  "./js/game-frame.js",
   "./icons/icon.svg",
   "./icons/icon-180.png",
   "./icons/icon-192.png",

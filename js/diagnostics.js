@@ -37,7 +37,10 @@ export const CODES = {
   E_SUPERVISOR: "Supervisor router action proposed/applied/rejected; schema errors are rejected, never fatal.",
   E_MODES_FETCH: "Thinking-modes fetch for a model: live docs schema, surveyed catalog fallback, or none.",
   E_REASONING: "Thinking knob applied/skipped at send time; invalid values fall back, never fatal.",
-  E_AGENCY: "Agentic message normalization at send time (strict user/assistant alternation)."
+  E_AGENCY: "Agentic message normalization at send time (strict user/assistant alternation).",
+  E_GAME_CONTRACT: "Minigame HTML validation: self-contained, offline, uses the Polyglot bridge.",
+  E_GAME_FRAME: "Sandboxed minigame frame: start, command round trip, or a game-side error.",
+  E_GAME_STATE: "Minigame session load/save/move; never fatal to the send path."
 };
 
 export function log(level, code, msg) {

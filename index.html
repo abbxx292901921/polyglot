@@ -20,7 +20,7 @@
     <header class="topbar">
       <button id="btn-left" class="iconbtn" aria-label="Open library">&#9776;</button>
       <h1>Polyglot</h1>
-      <span id="ver" class="ver">v1.7.1</span>
+      <span id="ver" class="ver">v1.8.0</span>
       <div class="spacer"></div>
       <button id="btn-right" class="iconbtn" aria-label="Open settings">&#9881;</button>
     </header>
@@ -38,6 +38,7 @@
       <button data-view="books" role="tab" type="button">Books</button>
       <button data-view="regex" role="tab" type="button">Regex</button>
       <button data-view="stages" role="tab" type="button">Stages</button>
+      <button data-view="games" role="tab" type="button">Games</button>
       <button data-view="forge" role="tab" type="button">Forge</button>
     </nav>
 
@@ -186,6 +187,20 @@
           <div id="stage-list" class="list"></div>
           <h3>Live preview</h3>
           <div id="stage-preview"></div>
+        </div>
+      </div>
+      <div id="view-games" class="view" hidden>
+        <div class="wrap">
+          <h2>Games</h2>
+          <p id="game-chat-label" class="status" role="status"></p>
+          <p class="status">Minigames run inside this chat. The game owns the rules and the model is told the authoritative state, so it narrates the outcome instead of inventing numbers. Ask the Forge agent to build you one.</p>
+          <div class="toolbar">
+            <label class="btn secondary" for="file-game-import" title="Import a minigame HTML file">Import HTML</label>
+            <input id="file-game-import" type="file" accept=".html,.htm,text/html" hidden>
+            <button id="btn-game-export" class="btn secondary" type="button">Export HTML</button>
+            <button id="btn-game-new" class="btn secondary" type="button">New via Forge</button>
+          </div>
+          <div id="game-list" class="list"></div>
         </div>
       </div>
       <div id="view-forge" class="view" hidden>

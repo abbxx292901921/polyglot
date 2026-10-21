@@ -3,6 +3,30 @@ import { applyRules, compileRule, cleanFlags } from "./regex-engine.js";
 import { STAGE_KEYS, STAGE_META, normalizeToggles, defaultStageToggles, parseDirector, parseDice, normalizeWorld, applyWorldCommand, formatWorldSheet, normalizeChess, parseChessTriggers, renderBoardText, toFEN, startChessGame, playChessTurn, forfeitChess, buildStageBlocks } from "./stages.js";
 import { SUPERVISOR_ACTIONS, parseSupervisorReply, validateAction, normalizeAction, describeAction, buildSupervisorPrompt, localDraftCharacter, localPolishCharacter, isReadAction, isControlAction } from "./supervisor.js";
 import {
+  MINIGAME_KEYS,
+  MINIGAME_META,
+  FORTUNE_BY_ID,
+  gameSessionKey,
+  isGameSessionKey,
+  gameKeyOf,
+  normalizeSession,
+  addLog,
+  addLogLines,
+  addPending,
+  buildMinigameBlocks,
+  fenceGameText,
+  slugKey,
+  validateMinigameHtml,
+  parseGameCommand,
+  normalizeDuel,
+  normalizeFortune,
+  startNativeGame,
+  nativeActions,
+  nativeSummary,
+  applyNativeAction
+} from "./minigames.js";
+import { createGameFrame, runGameCommand, buildExportDocument } from "./game-frame.js";
+import {
   openDB,
   getRev,
   listCharacters,
@@ -37,6 +61,10 @@ import {
   saveStageState,
   listStageStates,
   seedStagesIfEmpty,
+  listMinigames,
+  getMinigame,
+  saveMinigame,
+  deleteMinigame,
   exportVaultToJSON,
   importVaultFromJSON,
   seedIfEmpty
@@ -2113,7 +2141,19 @@ async function buildContext(pastRows, extraUserText = "") {
         chessState: stateMap.chess || {},
         chessNote: ""
       });
-      stageBlocks = (sysBlocks || []).map((b) => (b && b.content) || "").filter(Boolean);
+      const stageTexts = (sysBlocks || []).map((b) => (b && b.content) || "").filter(Boolean);
+      // Phase 7: minigame sessions live in the same stage-state store, so this
+      // read already has the authoritative game state. It becomes a system
+      // block, which the token budget never trims. The name comes from the
+      // session itself, so no extra read is needed on the send path.
+      const mgEntries = [];
+      for (const k of Object.keys(stateMap)) {
+        if (!isGameSessionKey(k)) continue;
+        const gk = gameKeyOf(k);
+        const sess = normalizeSession(stateMap[k]);
+        mgEntries.push({ key: gk, session: sess, name: sess.name || gk });
+      }
+      stageBlocks = [...stageTexts, ...buildMinigameBlocks(mgEntries)];
     }
   } catch (e) {
     try { logWarn("E_STAGE_STATE", "stage inject skipped: " + (e?.message || e)); } catch { /* noop */ }
@@ -2367,6 +2407,10 @@ async function handleSend() {
   await runStagePrepass(chatId, text);
   // Paint instantly (includes the new user message), then generate below it.
   await renderCurrentChat();
+  // Minigame commands (/duel strike, /fortune focus ...) resolve before the
+  // context is built, so the model sees the resulting game state as truth.
+  // This runs after the paint so a slow game cannot freeze the composer.
+  await runMinigamePrepass(chatId, text);
   const { chain: full } = await getChatChain(chatId);
   await generateAssistant(chatId, full, { titleHint: text });
 }
@@ -3249,7 +3293,7 @@ function showView(name) {
   const bb = $("#branchbar");
   if (bb && !inChat) bb.hidden = true;
   $("#views").style.display = inChat ? "none" : "";
-  for (const v of ["home", "chars", "detail", "presets", "books", "regex", "stages", "forge"]) {
+  for (const v of ["home", "chars", "detail", "presets", "books", "regex", "stages", "games", "forge"]) {
     const el = $(`#view-${v}`);
     if (el) el.hidden = name !== v;
   }
@@ -3262,6 +3306,12 @@ function showView(name) {
   if (name === "books" && !fresh) renderBooksView();
   if (name === "regex" && !fresh) renderRegexView();
   if (name === "stages" && !fresh) renderStagesView();
+  if (name === "games") {
+    // The games panel keeps its sandboxed frames alive across tab switches,
+    // so it is refreshed in place rather than rebuilt.
+    if (gamesPanelBuilt) refreshGamesPanel();
+    else renderGamesView();
+  }
   if (name === "forge") renderForgeView();
   if (name === "chat") {
     if (!fresh) renderCurrentChat();
@@ -4365,6 +4415,43 @@ async function executeForgeRead(a) {
       }))
     };
   }
+  if (a.action === "list_minigames") {
+    const lib = await gameLibrary().catch(() => []);
+    return lib.map((g) => ({
+      key: g.key,
+      name: g.name,
+      desc: String(g.desc || "").slice(0, 160),
+      kind: g.kind,
+      author: g.author || ""
+    }));
+  }
+  if (a.action === "get_minigame") {
+    const lib = await gameLibrary().catch(() => []);
+    const want = String(a.key || a.name || "").trim().toLowerCase();
+    const g = lib.find((x) => x.key === want || String(x.name || "").trim().toLowerCase() === want);
+    if (!g) throw new Error("E_SUPERVISOR: minigame not found.");
+    if (g.kind !== "html") {
+      return {
+        key: g.key,
+        name: g.name,
+        desc: g.desc,
+        kind: g.kind,
+        html: null,
+        note: "This one is a built-in native game. It has no html document to read or edit."
+      };
+    }
+    const html = String(g.html || "");
+    return {
+      key: g.key,
+      name: g.name,
+      desc: g.desc,
+      kind: g.kind,
+      author: g.author || "",
+      bytes: html.length,
+      truncated: html.length > 40000,
+      html: html.slice(0, 40000)
+    };
+  }
   throw new Error("E_SUPERVISOR: not a read action.");
 }
 
@@ -4600,6 +4687,43 @@ async function executeSupervisorAction(a) {
     try { bumpRegexCache(); } catch { /* cache optional */ }
     return "deleted regex rule #" + act.rule_id;
   }
+  if (act.action === "create_minigame") {
+    const html = String(act.html || "");
+    const v = validateMinigameHtml(html);
+    if (!v.ok) throw new Error(v.error);
+    const key = slugKey(act.key || act.name, "game");
+    if (MINIGAME_KEYS.includes(key)) {
+      throw new Error("E_GAME_CONTRACT: '" + key + "' is a built-in game. Pick another key.");
+    }
+    const existing = await getMinigame(key);
+    if (existing && act.overwrite !== 1 && act.overwrite !== true) {
+      throw new Error("E_GAME_CONTRACT: a minigame called '" + key + "' already exists. Use a different key, or send overwrite:true to replace it.");
+    }
+    const id = await saveMinigame({
+      key,
+      name: String(act.name || key).slice(0, 80),
+      desc: String(act.desc || "").slice(0, 400),
+      html,
+      author: "forge"
+    });
+    gamesEpoch++;
+    gameNameCache.delete(key);
+    await renderGamesView().catch(() => {});
+    return (existing ? "replaced minigame " : "created minigame ") + key + " (#" + id + ")";
+  }
+  if (act.action === "delete_minigame") {
+    const want = String(act.key || act.name || "").trim().toLowerCase();
+    const lib = await gameLibrary().catch(() => []);
+    const found = lib.find((x) => x.key === want || String(x.name || "").trim().toLowerCase() === want);
+    const g = found && found.kind === "html" ? found : await getMinigame(want);
+    if (!g || g.id == null) throw new Error("E_SUPERVISOR: minigame not found.");
+    await deleteMinigame(g.id);
+    gamesEpoch++;
+    gameNameCache.delete(want);
+    gameScenes.delete(sceneKey(want));
+    await renderGamesView().catch(() => {});
+    return "deleted minigame " + (g.key || want);
+  }
   if (act.action === "export_file") {
     const day = new Date().toISOString().slice(0, 10);
     const slug = (s) => String(s ?? "export").replace(/[^\w-]+/g, "_").slice(0, 60);
@@ -4761,11 +4885,17 @@ async function handleForgeRun() {
       return;
     }
     const provider = await getActiveProvider().catch(() => null);
-    const [personas, presets, providers, lorebooks] = await Promise.all([
+    const [personas, presets, providers, lorebooks, games] = await Promise.all([
       listPersonas().catch(() => []), listPresets().catch(() => []),
-      listProviders().catch(() => []), listLorebooks().catch(() => [])
+      listProviders().catch(() => []), listLorebooks().catch(() => []),
+      listMinigames().catch(() => [])
     ]);
-    const sys = buildSupervisorPrompt({ characters: chars, chats, personas, presets, providers, lorebooks });
+    const sys = buildSupervisorPrompt({
+      characters: chars, chats, personas, presets, providers, lorebooks,
+      minigames: (games || []).map((g) => ({
+        key: g.key, name: g.name, desc: g.desc, author: g.author
+      }))
+    });
     forgeTranscript = [];
     forgeFinal = "";
     forgeCancel = false;
@@ -4890,7 +5020,888 @@ function refreshViews() {
   else if (view === "books") renderBooksView();
   else if (view === "regex") renderRegexView();
   else if (view === "stages") renderStagesView();
+  else if (view === "games") refreshGamesPanel();
   else if (view === "forge") renderForgeView();
+}
+
+// ---------- Phase 7: minigames ----------
+// A minigame session lives in the existing chat_stage_state store under the
+// key "minigame:<key>", so sessions need no new store and no migration.
+// Native games (duel, fortune) run their rules here in app.js; HTML games run
+// their own rules inside a sandboxed iframe and report their state back over
+// postMessage. Both fill the same session contract, so storage, prompt
+// injection, the event log and the Narrate button are written once.
+//
+// Contract, in one place:
+//   session = {active, phase, data, summary, actions[], log[], pending[], result}
+//   data    = the game's own state blob (native: the duel/fortune state)
+//   summary = short factual line injected into the model as truth
+//   log[]   = display lines, one per event
+//   pending = events not yet narrated by the character
+
+const liveGameFrames = new Map();
+const gameQueues = new Map();
+// The last narration per chat and game, shown inline on the card.
+const gameScenes = new Map();
+// The persona and character the games address. Read once per panel build so
+// the frame can be mounted without awaiting anything.
+let gameWho = "You";
+let gameChar = "";
+
+function sceneKey(key) {
+  return String(ui.chatId ?? "none") + "|" + String(key);
+}
+// Bumped whenever a game session or the game library changes. The games view
+// keys its freshness off this instead of the global revision counter, so an
+// unrelated write elsewhere never reloads a running game.
+let gamesEpoch = 0;
+// True once the games panel has been built at least once. After that the
+// panel is refreshed in place, so tabbing away and back never reloads a
+// running sandboxed game.
+let gamesPanelBuilt = false;
+
+// Serialize work per game so two rapid messages from a game cannot interleave
+// their session writes.
+function queueGame(key, fn) {
+  const prev = gameQueues.get(key) || Promise.resolve();
+  const next = prev.then(fn, fn).catch(() => {});
+  gameQueues.set(key, next);
+  return next;
+}
+
+function gameTheme() {
+  const custom = currentThemeVars();
+  if (custom) return custom;
+  const name = localStorage.getItem("polyglot.theme") || "polyglot";
+  return THEMES[name] || THEMES.polyglot;
+}
+
+async function currentCharacterName() {
+  const chars = await getCharacters().catch(() => []);
+  const ch = chars.find((c) => c.id === ui.characterId);
+  return ch?.name || "your opponent";
+}
+
+async function currentPersonaName() {
+  const personas = await listPersonas().catch(() => []);
+  const p = personas.find((x) => x.id === ui.personaId);
+  return p?.name || "You";
+}
+
+// Every game the app can run: the built-in native engines plus every HTML
+// document stored locally.
+async function gameLibrary() {
+  const stored = await listMinigames().catch(() => []);
+  const out = [];
+  for (const key of MINIGAME_KEYS) {
+    const meta = MINIGAME_META[key] || {};
+    out.push({ key, name: meta.name || key, desc: meta.desc || "", kind: "native", html: "", author: "builtin" });
+  }
+  for (const g of (stored || [])) {
+    const key = String(g.key || "").toLowerCase();
+    if (!key) continue;
+    // A native engine owns its key; a stored document with the same slug is
+    // ignored so the built-in keeps working.
+    if (MINIGAME_KEYS.includes(key)) continue;
+    out.push({
+      key,
+      name: g.name || key,
+      desc: g.desc || "",
+      kind: "html",
+      html: g.html || "",
+      author: g.author || "user",
+      id: g.id
+    });
+  }
+  return out;
+}
+
+// Display names are resolved once and cached, so building a prompt never has
+// to read the whole game library (each row can carry a large HTML document).
+const gameNameCache = new Map();
+async function resolveGameName(key) {
+  if (MINIGAME_META[key]) return MINIGAME_META[key].name;
+  if (gameNameCache.has(key)) return gameNameCache.get(key);
+  const lib = await gameLibrary().catch(() => []);
+  const g = lib.find((x) => x.key === key);
+  const name = (g && g.name) || key;
+  gameNameCache.set(key, name);
+  return name;
+}
+
+async function loadGameSession(key) {
+  if (ui.chatId == null) return null;
+  const row = await getStageState(ui.chatId, gameSessionKey(key)).catch(() => null);
+  if (!row) return null;
+  return normalizeSession(row.state);
+}
+
+async function saveGameSession(key, session) {
+  if (ui.chatId == null) return null;
+  const s = normalizeSession(session);
+  s.updated_at = Date.now();
+  if (!s.name) s.name = await resolveGameName(key);
+  gamesEpoch++;
+  return saveStageState(ui.chatId, gameSessionKey(key), s, {}, { silent: true });
+}
+
+async function listGameSessions() {
+  if (ui.chatId == null) return [];
+  const rows = await listStageStates(ui.chatId).catch(() => []);
+  const out = [];
+  for (const r of (rows || [])) {
+    if (!r || !isGameSessionKey(r.stage_key)) continue;
+    out.push({ key: gameKeyOf(r.stage_key), session: normalizeSession(r.state) });
+  }
+  return out;
+}
+
+function destroyGameFrames() {
+  for (const rec of liveGameFrames.values()) {
+    try { rec.destroy(); } catch { /* noop */ }
+  }
+  liveGameFrames.clear();
+}
+
+// ---------- Games panel ----------
+
+function gameLogNode(session) {
+  const log = document.createElement("div");
+  log.className = "gamelog";
+  const lines = session?.log || [];
+  if (!lines.length) {
+    const e = document.createElement("div");
+    e.className = "l-sys";
+    e.textContent = "No moves yet.";
+    log.append(e);
+    return log;
+  }
+  for (const l of lines) {
+    const d = document.createElement("div");
+    d.className = "l-" + (l.side || "sys");
+    d.textContent = l.text;
+    log.append(d);
+  }
+  return log;
+}
+
+function gameStatRow(who, side, isFoe) {
+  const row = document.createElement("div");
+  row.className = "gamestat";
+  const w = document.createElement("span");
+  w.className = "who";
+  w.textContent = who;
+  const bar = document.createElement("span");
+  bar.className = "hpbar";
+  const fill = document.createElement("span");
+  const ratio = side.maxHp > 0 ? side.hp / side.maxHp : 0;
+  fill.className = "hpfill" + (isFoe ? " foe" : "") + (ratio <= 0.3 ? " low" : "");
+  fill.style.width = Math.max(0, Math.min(100, ratio * 100)) + "%";
+  bar.append(fill);
+  const hp = document.createElement("span");
+  hp.textContent = side.hp + "/" + side.maxHp;
+  const pips = document.createElement("span");
+  pips.className = "pips";
+  for (let i = 0; i < side.maxFocus; i++) {
+    const p = document.createElement("span");
+    p.className = "pip" + (i < side.focus ? " on" : "");
+    pips.append(p);
+  }
+  row.append(w, bar, hp, pips);
+  return row;
+}
+
+function duelBoard(state) {
+  const wrap = document.createElement("div");
+  const s = normalizeDuel(state);
+  wrap.append(gameStatRow("You", s.you, false));
+  wrap.append(gameStatRow(s.foe.name, s.foe, true));
+  const note = document.createElement("div");
+  note.className = "gamestat";
+  note.textContent = "Round " + s.round + (s.result ? " — " + s.result : "");
+  wrap.append(note);
+  return wrap;
+}
+
+function fortuneBoard(state) {
+  const wrap = document.createElement("div");
+  const s = normalizeFortune(state);
+  if (s.focus) {
+    const q = document.createElement("div");
+    q.className = "gamestat";
+    q.textContent = "Question: " + s.focus;
+    wrap.append(q);
+  }
+  const spread = document.createElement("div");
+  spread.className = "spread";
+  for (const c of s.spread) {
+    const card = FORTUNE_BY_ID[c.id];
+    if (!card) continue;
+    const face = document.createElement("div");
+    face.className = "cardface" + (c.reversed ? " rev" : "");
+    const pos = document.createElement("div");
+    pos.className = "cpos";
+    pos.textContent = c.pos;
+    const nm = document.createElement("div");
+    nm.className = "cname";
+    nm.textContent = card.name;
+    if (c.reversed) {
+      const m = document.createElement("span");
+      m.className = "revmark";
+      m.textContent = " (reversed)";
+      nm.append(m);
+    }
+    const omen = document.createElement("div");
+    omen.className = "comen";
+    omen.textContent = c.reversed ? card.shadow : card.omen;
+    face.append(pos, nm, omen);
+    spread.append(face);
+  }
+  wrap.append(spread);
+  return wrap;
+}
+
+function gameActionsNode(g, session) {
+  const row = document.createElement("div");
+  row.className = "gamebtns";
+  const active = !!(session && session.active);
+  if (!active) {
+    const start = document.createElement("button");
+    start.className = "btn";
+    start.type = "button";
+    start.textContent = "Start";
+    start.addEventListener("click", () => { startGame(g.key); });
+    row.append(start);
+  } else {
+    const actions = g.kind === "html"
+      ? (session.actions || [])
+      : nativeActions(g.key, session.data);
+    for (const a of actions) {
+      const b = document.createElement("button");
+      b.className = "btn secondary";
+      b.type = "button";
+      b.textContent = a.label || a.id;
+      b.addEventListener("click", () => {
+        const p = g.kind === "html" ? sendGameCommand(g.key, a.id) : playNativeGame(g.key, a.id, "");
+        p.catch((e) => { try { logErr("E_GAME_STATE", e?.message || String(e)); } catch { /* noop */ } });
+      });
+      row.append(b);
+    }
+    if (session.pending && session.pending.length) {
+      const n = document.createElement("button");
+      n.className = "btn";
+      n.type = "button";
+      n.textContent = "Narrate (" + session.pending.length + ")";
+      n.addEventListener("click", () => {
+        narrateGameEvents(g.key).catch((e) => { try { logErr("E_GAME_STATE", e?.message || String(e)); } catch { /* noop */ } });
+      });
+      row.append(n);
+    }
+    const close = document.createElement("button");
+    close.className = "btn secondary";
+    close.type = "button";
+    close.textContent = "Close";
+    close.addEventListener("click", () => { closeGame(g.key); });
+    row.append(close);
+  }
+  if (g.kind === "html") {
+    const ex = document.createElement("button");
+    ex.className = "btn secondary";
+    ex.type = "button";
+    ex.textContent = "Export";
+    ex.addEventListener("click", () => { exportMinigame(g.key); });
+    row.append(ex);
+    const del = document.createElement("button");
+    del.className = "btn secondary";
+    del.type = "button";
+    del.textContent = "Delete";
+    del.addEventListener("click", () => { removeMinigameGame(g.key); });
+    row.append(del);
+  }
+  return row;
+}
+
+function gameCard(g, session) {
+  const card = document.createElement("div");
+  card.className = "card wide game-card";
+  card.dataset.gameKey = g.key;
+
+  const head = document.createElement("div");
+  head.className = "ghead";
+  const nm = document.createElement("span");
+  nm.className = "gname";
+  nm.textContent = g.name;
+  const kind = document.createElement("span");
+  kind.className = "gkind";
+  kind.textContent = g.kind === "html" ? ("HTML · " + (g.author || "user")) : "Built-in";
+  head.append(nm, kind);
+  card.append(head);
+
+  const desc = document.createElement("div");
+  desc.className = "gdesc";
+  desc.textContent = g.desc || "";
+  card.append(desc);
+
+  const active = !!(session && session.active);
+  if (g.kind === "native") {
+    if (g.key === "duel") card.append(duelBoard(session?.data || {}));
+    else if (g.key === "fortune") card.append(fortuneBoard(session?.data || {}));
+  } else if (active) {
+    const state = document.createElement("div");
+    state.className = "gamestate";
+    state.textContent = session.summary || "";
+    card.append(state);
+    mountHtmlGame(card, g, session);
+  }
+
+  card.append(gameActionsNode(g, session));
+
+  const scene = gameScenes.get(sceneKey(g.key));
+  if (scene) {
+    const s = document.createElement("div");
+    s.className = "gscene";
+    s.textContent = scene;
+    card.append(s);
+  }
+
+  card.append(gameLogNode(session));
+  return card;
+}
+
+export async function renderGamesView() {
+  const box = $("#game-list");
+  if (!box) return;
+  gamesPanelBuilt = true;
+  destroyGameFrames();
+  box.innerHTML = "";
+  const label = $("#game-chat-label");
+  // Read the names before the cards are built: the frame has to be attached
+  // synchronously, so it cannot wait on a read.
+  gameWho = await currentPersonaName();
+  gameChar = await currentCharacterName();
+  const lib = await gameLibrary();
+  const sessions = await listGameSessions();
+  const byKey = {};
+  for (const s of sessions) byKey[s.key] = s.session;
+
+  if (label) {
+    try {
+      const all = await listChats();
+      const cur = all.find((c) => c.id === ui.chatId);
+      label.textContent = cur
+        ? ("Chat: " + (cur.title || ("#" + cur.id)) + " — games are saved to this chat.")
+        : "No chat selected. Open a chat to play a game.";
+    } catch {
+      label.textContent = "";
+    }
+  }
+
+  if (!lib.length) {
+    const empty = document.createElement("div");
+    empty.className = "status";
+    empty.textContent = "No minigames yet. Ask the Forge agent to build one, or import an HTML file.";
+    box.append(empty);
+    return;
+  }
+  for (const g of lib) {
+    box.append(gameCard(g, byKey[g.key] || null));
+  }
+}
+
+// Update one card in place. HTML games keep their frame alive; native games
+// are cheap to rebuild. A card whose session started or stopped has to be
+// rebuilt, because the frame appears and disappears with the session.
+async function refreshGameCard(key, libIn) {
+  const box = $("#game-list");
+  if (!box) return;
+  const lib = libIn || (await gameLibrary());
+  const g = lib.find((x) => x.key === key);
+  if (!g) {
+    if (view === "games") await renderGamesView();
+    return;
+  }
+  const session = await loadGameSession(key);
+  let old = null;
+  for (const el of Array.from(box.children)) {
+    if (el.dataset && el.dataset.gameKey === key) { old = el; break; }
+  }
+  if (!old) {
+    // The panel was never built. Building it in the background would mount a
+    // frame nobody is looking at, so leave it to the next view entry.
+    if (view === "games") await renderGamesView();
+    return;
+  }
+  const wantsFrame = g.kind === "html" && !!(session && session.active);
+  const hasFrame = !!old.querySelector("iframe.gameframe");
+  if (wantsFrame !== hasFrame) {
+    const fresh = gameCard(g, session);
+    old.replaceWith(fresh);
+    return;
+  }
+  if (g.kind === "html") {
+    const logNode = old.querySelector(".gamelog");
+    if (logNode) logNode.replaceWith(gameLogNode(session));
+    const actNode = old.querySelector(".gamebtns");
+    if (actNode) actNode.replaceWith(gameActionsNode(g, session));
+    const stateNode = old.querySelector(".gamestate");
+    if (stateNode) stateNode.textContent = session?.summary || "";
+    const scene = gameScenes.get(sceneKey(key));
+    let sceneNode = old.querySelector(".gscene");
+    if (scene && !sceneNode) {
+      sceneNode = document.createElement("div");
+      sceneNode.className = "gscene";
+      const logAnchor = old.querySelector(".gamelog");
+      old.insertBefore(sceneNode, logAnchor);
+    }
+    if (scene && sceneNode) sceneNode.textContent = scene;
+    return;
+  }
+  const fresh = gameCard(g, session);
+  old.replaceWith(fresh);
+}
+
+// Update every card without tearing the panel down. Keeps a running game
+// alive across an unrelated write anywhere else in the app.
+async function refreshGamesPanel() {
+  const box = $("#game-list");
+  if (!box) return;
+  const lib = await gameLibrary();
+  for (const g of lib) {
+    await refreshGameCard(g.key, lib);
+  }
+}
+
+// ---------- Native game play ----------
+
+async function startGame(key) {
+  if (ui.chatId == null) {
+    window.alert("Open a chat first — a game belongs to a chat.");
+    return;
+  }
+  const lib = await gameLibrary();
+  const g = lib.find((x) => x.key === key);
+  if (!g) return;
+  if (g.kind === "html") {
+    await saveGameSession(key, normalizeSession({
+      active: 1, phase: "playing", data: {}, summary: "", actions: [], log: [], pending: [], result: ""
+    }));
+    await renderGamesView();
+    return;
+  }
+  await openNativeSession(key, "", "");
+  await renderGamesView();
+}
+
+async function closeGame(key) {
+  const session = await loadGameSession(key);
+  if (!session) return;
+  await saveGameSession(key, normalizeSession({
+    active: 0, phase: "idle", data: {}, summary: "", actions: [], log: [], pending: [], result: ""
+  }));
+  gameScenes.delete(sceneKey(key));
+  await renderGamesView();
+}
+
+// Opens a native game. Fortune's opening action IS the draw (or the focus
+// that draws), so it has to be applied against the fresh state rather than
+// after it — otherwise "/fortune focus who betrayed the council" would deal
+// the cards before it knew the question.
+async function openNativeSession(key, act, args) {
+  if (key === "fortune") {
+    const res = applyNativeAction("fortune", null, act || "draw", args, {});
+    if (!res) return null;
+    if (res.state.phase === "idle" && !res.state.spread.length) {
+      // The opening action was rejected (a focus with no question). Keep the
+      // message so the panel can show why nothing happened.
+      await saveGameSession(key, normalizeSession({ active: 0, phase: "idle", log: res.log }));
+      return null;
+    }
+    let s = normalizeSession({
+      active: 1,
+      phase: res.state.phase,
+      data: res.state,
+      summary: res.summary,
+      actions: res.actions,
+      result: res.result || "",
+      log: [],
+      pending: []
+    });
+    s = addLogLines(s, res.log);
+    for (const ev of (res.events || [])) s = addPending(s, ev);
+    await saveGameSession(key, s);
+    return s;
+  }
+  const started = startNativeGame(key, null, { foeName: await currentCharacterName() });
+  if (!started) return null;
+  const s = normalizeSession({
+    active: 1,
+    phase: started.phase,
+    data: started,
+    summary: nativeSummary(key, started),
+    actions: nativeActions(key, started),
+    log: [],
+    pending: [],
+    result: started.result || ""
+  });
+  await saveGameSession(key, s);
+  return s;
+}
+
+async function playNativeGame(key, action, args) {
+  if (ui.chatId == null) return;
+  const act = String(action || "").trim().toLowerCase();
+  let session = await loadGameSession(key);
+  const active = !!(session && session.active);
+
+  // Asking for the status never opens a game.
+  if (!active && act === "status") {
+    const s = addLog(normalizeSession({ active: 0, phase: "idle" }), "sys", nativeSummary(key, session?.data || {}));
+    await saveGameSession(key, s);
+    await refreshGameCard(key);
+    return;
+  }
+
+  if (!active) {
+    const opened = await openNativeSession(key, act, args);
+    if (!opened) {
+      await refreshGameCard(key);
+      return;
+    }
+    session = opened;
+    // Duel opens with an empty board, so the first move still has to be
+    // played. Fortune has already consumed its opening action.
+    if (key !== "duel" || !act) {
+      await refreshGameCard(key);
+      return;
+    }
+  }
+
+  if (act === "status") {
+    const s = addLog(session, "sys", nativeSummary(key, session.data));
+    await saveGameSession(key, s);
+    await refreshGameCard(key);
+    return;
+  }
+
+  const res = applyNativeAction(key, session.data, act, args, {});
+  if (!res) return;
+  let s2 = normalizeSession({
+    ...session,
+    phase: res.state?.phase || session.phase,
+    data: res.state || session.data,
+    summary: res.summary,
+    actions: res.actions,
+    result: res.result || session.result
+  });
+  s2 = addLogLines(s2, res.log);
+  for (const ev of (res.events || [])) s2 = addPending(s2, ev);
+  await saveGameSession(key, s2);
+  await refreshGameCard(key);
+}
+
+// ---------- HTML game host ----------
+
+// The frame is created and attached synchronously. Awaiting anything before
+// the attach would open a window where the card looks like it has no frame
+// and a refresh could replace the card out from under it.
+function mountHtmlGame(card, g, session) {
+  const rec = createGameFrame({
+    html: g.html,
+    theme: gameTheme(),
+    ctx: {
+      key: g.key,
+      name: g.name,
+      state: (session && session.data) || null,
+      theme: gameTheme(),
+      who: gameWho,
+      charName: gameChar
+    },
+    onEvent: (msg) => { handleGameMessage(g, msg); }
+  });
+  liveGameFrames.set(g.key, rec);
+  card.append(rec.frame);
+}
+
+async function handleGameMessage(g, msg) {
+  if (!msg || typeof msg !== "object") return;
+  await queueGame(g.key, async () => {
+    const session = (await loadGameSession(g.key)) || normalizeSession();
+    if (msg.kind === "state") {
+      let s = normalizeSession({ ...session, active: 1, phase: "playing" });
+      if (msg.state && typeof msg.state === "object") {
+        let size = 0;
+        try { size = JSON.stringify(msg.state).length; } catch { size = Infinity; }
+        if (size <= 100000) {
+          s.data = msg.state;
+        } else {
+          // A state that cannot be cloned (circular) or that is simply huge
+          // would break the write, so it is dropped loudly instead of
+          // silently. The session keeps its previous state.
+          try { logErr("E_GAME_FRAME", "game state dropped: " + (size === Infinity ? "not serialisable" : size + " chars")); } catch { /* noop */ }
+        }
+      }
+      s.summary = String(msg.summary || "").slice(0, 1200);
+      s = addLogLines(s, msg.log);
+      await saveGameSession(g.key, s);
+    } else if (msg.kind === "log") {
+      const s = addLog(session, "sys", msg.line);
+      await saveGameSession(g.key, s);
+    } else if (msg.kind === "actions") {
+      const list = Array.isArray(msg.actions) ? msg.actions : [];
+      const s = normalizeSession({ ...session, actions: list });
+      await saveGameSession(g.key, s);
+    } else if (msg.kind === "move") {
+      let s = addPending(session, String(msg.label || msg.action || "The player made a move."));
+      await saveGameSession(g.key, s);
+    } else if (msg.kind === "end") {
+      const s = normalizeSession({
+        ...session,
+        phase: "over",
+        result: String(msg.result || "The game ended.").slice(0, 200)
+      });
+      await saveGameSession(g.key, s);
+    } else if (msg.kind === "error") {
+      logErr("E_GAME_FRAME", String(msg.message || "game error").slice(0, 300));
+      refreshDiag();
+      return;
+    } else {
+      return;
+    }
+    await refreshGameCard(g.key);
+  });
+}
+
+async function sendGameCommand(key, action) {
+  const rec = liveGameFrames.get(key);
+  const text = String(action || "");
+  if (rec && !rec.destroyed) {
+    if (!rec.post("command", { text })) {
+      logErr("E_GAME_FRAME", "the game frame is not attached; command dropped.");
+      refreshDiag();
+    }
+    return;
+  }
+  // No live frame (the Games tab is closed): run the command against a
+  // throwaway frame that is handed the persisted state first.
+  const lib = await gameLibrary();
+  const g = lib.find((x) => x.key === key);
+  if (!g) return;
+  const session = await loadGameSession(key);
+  const res = await runGameCommand({
+    html: g.html,
+    theme: gameTheme(),
+    ctx: {
+      key,
+      name: g.name,
+      state: (session && session.data) || null,
+      theme: gameTheme(),
+      who: gameWho || await currentPersonaName(),
+      charName: gameChar || await currentCharacterName()
+    },
+    text,
+    timeoutMs: 2500,
+    // The throwaway frame still has to persist what the game reported.
+    onEvent: (msg) => { handleGameMessage(g, msg); }
+  });
+  if (!res.ok) {
+    logErr("E_GAME_FRAME", res.error);
+    refreshDiag();
+    return;
+  }
+  await refreshGameCard(key);
+}
+
+// ---------- Narration ----------
+
+async function narrateGameEvents(key) {
+  if (generating()) return;
+  const session = await loadGameSession(key);
+  if (!session || !session.pending.length) return;
+  const narrated = session.pending.slice();
+  const chatId = await ensureChat();
+  const { chain } = await getChatChain(chatId);
+  const { preset, provider, chName, built } = await buildContext(chain);
+  const lib = await gameLibrary();
+  const g = lib.find((x) => x.key === key);
+  const label = (g && g.name) || key;
+  // The pending lines come from the game, so they are fenced as data: the
+  // model must narrate them, never obey them.
+  const events = fenceGameText(narrated.join("\n"));
+  built.messages.push({
+    role: "system",
+    content: "[Minigame event: " + label + " — narrate what just happened in character as " + chName
+      + ". Be vivid, stay in the scene, and do not recite the numbers as game statistics.]\n"
+      + (events || "(the game moved)")
+  });
+  const shell = paintShell("assistant", chName);
+  document.body.classList.add("generating");
+  aborter = new AbortController();
+  try {
+    const { content, reasoning } = await runStream(preset, provider, built.messages, shell, aborter.signal);
+    const text = content || reasoning || "";
+    if (!text) throw new Error("E_UI_SEND: empty narration from provider.");
+    const id = await saveMessage({
+      chat_id: chatId,
+      role: "assistant",
+      content: text,
+      parent_id: chain.length ? chain[chain.length - 1].id : null,
+      swipe_group_id: "g" + Date.now(),
+      swipe_active: 1,
+      timestamp: Date.now()
+    });
+    await setLeaf(chatId, id);
+    await touchChatById(chatId);
+    triggerHaptic(25);
+    gameScenes.set(sceneKey(key), text);
+    // Clear only the lines that were narrated, under the game queue, so a
+    // move made while the model was writing is not rolled back.
+    await queueGame(key, async () => {
+      const cur = (await loadGameSession(key)) || normalizeSession();
+      const next = normalizeSession(cur);
+      next.pending = cur.pending.filter((p) => !narrated.includes(p));
+      await saveGameSession(key, next);
+    });
+  } catch (e) {
+    if (e?.name === "AbortError") {
+      shell.div.remove();
+      paintError("Stopped.");
+    } else {
+      logErr("E_UI_SEND", e.message);
+      shell.div.remove();
+      paintError("Narration failed: " + e.message);
+    }
+  } finally {
+    aborter = null;
+    document.body.classList.remove("generating");
+    refreshDiag();
+    if (ui.chatId === chatId) await renderCurrentChat();
+    await refreshLibrary();
+    await refreshGameCard(key);
+  }
+}
+
+// ---------- Chat commands ----------
+// "/duel strike", "/fortune focus who betrayed me", "/game mygame attack".
+// Runs before the model sees the context, so the game state is authoritative
+// by the time the reply is written.
+async function runMinigamePrepass(chatId, userText) {
+  try {
+    const cmd = parseGameCommand(userText);
+    if (!cmd) return;
+    if (cmd.generic) {
+      if (!cmd.key || !cmd.action) return;
+      const lib = await gameLibrary();
+      const g = lib.find((x) => x.key === cmd.key);
+      if (!g) return;
+      if (g.kind === "native") {
+        // A built-in game has its rules here, not in a frame.
+        await playNativeGame(g.key, cmd.action, cmd.args);
+        return;
+      }
+      const session = await loadGameSession(cmd.key);
+      if (!session || !session.active) {
+        // A command can open an HTML game as well as play it.
+        await saveGameSession(cmd.key, normalizeSession({
+          active: 1, phase: "playing", data: {}, summary: "", actions: [], log: [], pending: [], result: ""
+        }));
+      }
+      await sendGameCommand(cmd.key, cmd.action + (cmd.args ? " " + cmd.args : ""));
+      return;
+    }
+    await playNativeGame(cmd.key, cmd.action, cmd.args);
+  } catch (e) {
+    try { logWarn("E_GAME_STATE", "minigame command skipped: " + (e?.message || e)); } catch { /* noop */ }
+  }
+}
+
+// ---------- HTML minigame files ----------
+
+function readFileText(file) {
+  return new Promise((resolve, reject) => {
+    try {
+      const fr = new FileReader();
+      fr.onload = () => resolve(String(fr.result || ""));
+      fr.onerror = () => reject(new Error("E_UI_IMPORT: could not read the file."));
+      fr.readAsText(file);
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+async function exportMinigame(key) {
+  try {
+    const g = (await gameLibrary()).find((x) => x.key === key);
+    if (!g || g.kind !== "html") {
+      window.alert("Only HTML minigames can be exported as a file.");
+      return;
+    }
+    // The exported file is a sandboxed wrapper around the game, not the raw
+    // agent-authored document. A shared file must not be able to report the
+    // reader's address to whoever wrote the game.
+    const doc = buildExportDocument(g.html, gameTheme());
+    const blob = new Blob([doc], { type: "text/html" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "polyglot-minigame-" + g.key + ".html";
+    document.body.append(a);
+    a.click();
+    a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    logInfo("E_GAME_CONTRACT", "exported minigame " + g.key);
+  } catch (e) {
+    logErr("E_UI_EXPORT", e?.message || String(e));
+  }
+  refreshDiag();
+}
+
+async function removeMinigameGame(key) {
+  try {
+    const lib = await gameLibrary();
+    const g = lib.find((x) => x.key === key);
+    if (!g || g.kind !== "html") return;
+    if (!window.confirm("Delete the minigame \"" + g.name + "\"? This cannot be undone.")) return;
+    await deleteMinigame(g.id);
+    gamesEpoch++;
+    gameScenes.delete(sceneKey(key));
+    logInfo("E_GAME_CONTRACT", "deleted minigame " + key);
+    await renderGamesView();
+  } catch (e) {
+    logErr("E_GAME_STATE", e?.message || String(e));
+  }
+  refreshDiag();
+}
+
+async function importMinigameFile(file) {
+  try {
+    const html = await readFileText(file);
+    const v = validateMinigameHtml(html);
+    if (!v.ok) {
+      logErr("E_GAME_CONTRACT", v.error);
+      window.alert(v.error);
+      refreshDiag();
+      return;
+    }
+    const base = String(file.name || "game").replace(/\.html?$/i, "");
+    const key = slugKey(base, "game");
+    if (MINIGAME_KEYS.includes(key)) {
+      throw new Error("E_GAME_CONTRACT: '" + key + "' is a built-in game. Rename the file.");
+    }
+    await saveMinigame({
+      key,
+      name: base.slice(0, 80) || key,
+      desc: "Imported from " + String(file.name || "").slice(0, 80),
+      html,
+      author: "import"
+    });
+    gamesEpoch++;
+    gameNameCache.delete(key);
+    logInfo("E_GAME_CONTRACT", "imported minigame " + key);
+    await renderGamesView();
+  } catch (e) {
+    logErr("E_UI_IMPORT", e?.message || String(e));
+    refreshDiag();
+  }
 }
 
 // ---------- Phase 4: theme presets + *action* and "dialogue" colors ----------
@@ -5512,8 +6523,32 @@ async function init() {
     refreshDiag();
   });
 
-  $("#btn-diag-copy").addEventListener("click", copyDiagReport);
-  $("#btn-diag-export").addEventListener("click", () => {
+  // ---------- Phase 7: minigames ----------
+  $("#file-game-import")?.addEventListener("change", async (e) => {
+    const file = e.target?.files?.[0];
+    if (e.target) e.target.value = "";
+    if (!file) return;
+    await importMinigameFile(file);
+  });
+  $("#btn-game-export")?.addEventListener("click", async () => {
+    const lib = await gameLibrary().catch(() => []);
+    const first = lib.find((g) => g.kind === "html");
+    if (!first) {
+      window.alert("No HTML minigame to export yet. Build one with the Forge agent first.");
+      return;
+    }
+    await exportMinigame(first.key);
+  });
+  $("#btn-game-new")?.addEventListener("click", () => {
+    const ta = $("#forge-input");
+    if (ta) {
+      ta.value = "Build me a minigame I can play in this chat: ";
+      ta.focus();
+    }
+    showView("forge");
+  });
+
+  $("#btn-diag-copy").addEventListener("click", copyDiagReport);  $("#btn-diag-export").addEventListener("click", () => {
     try {
       const blob = new Blob([diagReport(APP_VERSION)], { type: "text/plain" });
       const a = document.createElement("a");
@@ -5540,7 +6575,7 @@ async function init() {
   trackKeyboard();
   registerSW();
   await getRegexRules();
-  showView(["home", "chars", "chat", "presets", "books", "detail", "regex", "stages", "forge"].includes(view) ? view : "home");
+  showView(["home", "chars", "chat", "presets", "books", "detail", "regex", "stages", "games", "forge"].includes(view) ? view : "home");
   if (bootError) {
     const msg = bootError && bootError.message ? bootError.message : String(bootError);
     const ch = document.getElementById("chat");

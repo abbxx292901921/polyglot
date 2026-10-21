@@ -1,4 +1,5 @@
 import { DB_NAME, DB_VERSION } from "./config.js";
+import { sanitizeGameHtml, validateMinigameHtml } from "./minigames.js";
 
 // Polyglot storage — vanilla IndexedDB, zero dependencies.
 // 10 stores: characters, personas, chats, messages (compound chat_time),
@@ -74,6 +75,13 @@ export function openDB() {
         s.createIndex("chat_id", "chat_id", { unique: false });
         s.createIndex("chat_stage", ["chat_id", "stage_key"], { unique: true });
       }
+      // Minigames are HTML documents authored by the Forge agent (or imported
+      // from disk). The key is unique so a game can be looked up by slug.
+      if (!db.objectStoreNames.contains("minigames")) {
+        const s = db.createObjectStore("minigames", { keyPath: "id", autoIncrement: true });
+        s.createIndex("key", "key", { unique: true });
+        s.createIndex("author", "author", { unique: false });
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -99,8 +107,11 @@ async function getById(name, id) {
   return reqToPromise(st.get(id));
 }
 
-async function putRec(name, rec) {
-  rev++;
+async function putRec(name, rec, opts = {}) {
+  // A silent write does not bump the revision counter. Used for minigame
+  // sessions, which are not part of any view's data and would otherwise
+  // invalidate every other view's render signature on every move.
+  if (!opts.silent) rev++;
   const db = await openDB();
   const tx = db.transaction(name, "readwrite");
   const req = tx.objectStore(name).put(rec);
@@ -358,7 +369,7 @@ export async function getStageState(chatId, stageKey) {
   }
 }
 
-export async function saveStageState(chatId, stageKey, state, settings) {
+export async function saveStageState(chatId, stageKey, state, settings, opts = {}) {
   const prev = await getStageState(chatId, stageKey);
   const rec = {
     chat_id: chatId,
@@ -368,7 +379,21 @@ export async function saveStageState(chatId, stageKey, state, settings) {
     updated_at: Date.now()
   };
   if (prev?.id != null) rec.id = prev.id;
-  return putRec("chat_stage_state", rec);
+  try {
+    return await putRec("chat_stage_state", rec, opts);
+  } catch (e) {
+    // Two writes for a key that had no row yet can both read "no previous
+    // row" and both insert, which the unique compound index rejects. The
+    // second one retries against the row the first one created.
+    if (e && (e.name === "ConstraintError" || /constraint/i.test(String(e.message || "")))) {
+      const now = await getStageState(chatId, stageKey);
+      if (now?.id != null) {
+        rec.id = now.id;
+        return putRec("chat_stage_state", rec, opts);
+      }
+    }
+    throw e;
+  }
 }
 
 export async function listStageStates(chatId) {
@@ -403,9 +428,53 @@ export async function seedStagesIfEmpty() {
   }
 }
 
+// ---------- Minigames (HTML documents) ----------
+// A minigame is one self-contained HTML document. The app renders it in a
+// sandboxed iframe; the game owns its own state and reports it back.
+export async function listMinigames() {
+  try {
+    return await getAll("minigames");
+  } catch {
+    return [];
+  }
+}
+
+export async function getMinigame(key) {
+  try {
+    const db = await openDB();
+    const tx = db.transaction("minigames", "readonly");
+    const idx = tx.objectStore("minigames").index("key");
+    const row = await reqToPromise(idx.get(String(key || "")));
+    return row || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveMinigame(rec) {
+  const key = String(rec?.key || "").trim().toLowerCase();
+  if (!key) throw new Error("E_GAME_CONTRACT: a minigame needs a key.");
+  const prev = await getMinigame(key);
+  const row = {
+    key,
+    name: String(rec.name || key).slice(0, 80),
+    desc: String(rec.desc || "").slice(0, 400),
+    html: String(rec.html || ""),
+    author: String(rec.author || "user").slice(0, 24),
+    created_at: prev?.created_at ?? Date.now(),
+    updated_at: Date.now()
+  };
+  if (prev?.id != null) row.id = prev.id;
+  return putRec("minigames", row);
+}
+
+export async function deleteMinigame(id) {
+  return delRec("minigames", id);
+}
+
 // ---------- Vault backup ----------
 export async function exportVaultToJSON({ includeKeys = false } = {}) {
-  const [characters, personas, chats, messages, lorebooks, presets, providers, regex_rules, stages, chat_stage_state] = await Promise.all([
+  const [characters, personas, chats, messages, lorebooks, presets, providers, regex_rules, stages, chat_stage_state, minigames] = await Promise.all([
     getAll("characters"),
     getAll("personas"),
     getAll("chats"),
@@ -415,7 +484,8 @@ export async function exportVaultToJSON({ includeKeys = false } = {}) {
     getAll("providers").catch(() => []),
     getAll("regex_rules").catch(() => []),
     getAll("stages").catch(() => []),
-    getAll("chat_stage_state").catch(() => [])
+    getAll("chat_stage_state").catch(() => []),
+    getAll("minigames").catch(() => [])
   ]);
   const safePresets = presets.map((p) => {
     if (includeKeys || !p.connection) return p;
@@ -425,11 +495,18 @@ export async function exportVaultToJSON({ includeKeys = false } = {}) {
     if (includeKeys) return p;
     return { ...p, api_key: "" };
   });
+  // A vault backup is the thing people share. A minigame document was written
+  // by an agent, so its markup is stripped of anything that could report the
+  // reader's address to whoever wrote it.
+  const safeMinigames = minigames.map((g) => ({
+    ...g,
+    html: sanitizeGameHtml(g.html || "")
+  }));
   return {
     app: "Polyglot",
-    version: 3,
+    version: 5,
     exported_at: new Date().toISOString(),
-    tables: { characters, personas, chats, messages, lorebooks, presets: safePresets, providers: safeProviders, regex_rules, stages, chat_stage_state }
+    tables: { characters, personas, chats, messages, lorebooks, presets: safePresets, providers: safeProviders, regex_rules, stages, chat_stage_state, minigames: safeMinigames }
   };
 }
 
@@ -437,18 +514,44 @@ export async function importVaultFromJSON(data, { merge = false } = {}) {
   if (!data || typeof data !== "object" || !data.tables) {
     throw new Error("E_VAULT_SHAPE: not a Polyglot vault file (missing tables).");
   }
-  // regex_rules + providers + stages are optional so older vaults still import.
-  const names = ["characters", "personas", "chats", "messages", "lorebooks", "presets", "providers", "regex_rules", "stages", "chat_stage_state"];
+  // regex_rules + providers + stages + minigames are optional so older vaults
+  // still import.
+  const names = ["characters", "personas", "chats", "messages", "lorebooks", "presets", "providers", "regex_rules", "stages", "chat_stage_state", "minigames"];
   for (const n of names) {
     if (data.tables[n] !== undefined && !Array.isArray(data.tables[n])) {
       throw new Error(`E_VAULT_TABLE: vault table "${n}" is corrupt (expected array).`);
+    }
+  }
+  // Validate the minigame documents BEFORE anything is written. A vault is
+  // the one file people share, so a hand-crafted or agent-written one must
+  // not be able to install a game that phones home or navigates away.
+  if (Array.isArray(data.tables.minigames)) {
+    for (const r of data.tables.minigames) {
+      const v = validateMinigameHtml(r?.html || "");
+      if (!v.ok) {
+        throw new Error(`E_VAULT_TABLE: vault table "minigames" has an invalid game ("${r?.key || "?"}"): ${v.error}`);
+      }
     }
   }
   if (!merge) {
     for (const n of names) await clearStore(n);
   }
   for (const n of names) {
-    const rows = data.tables[n] || [];
+    let rows = data.tables[n] || [];
+    if (n === "minigames") {
+      // The key index is unique, so duplicate keys in a hand-edited vault
+      // would abort the import half way through. Last one wins.
+      const seen = new Map();
+      for (const r of rows) {
+        const k = String(r && r.key || "").toLowerCase();
+        if (!k) continue;
+        if (typeof r.html === "string" && r.html.length > 200000) {
+          throw new Error("E_VAULT_TABLE: minigame " + k + " is too large to import.");
+        }
+        seen.set(k, r);
+      }
+      rows = Array.from(seen.values());
+    }
     for (const r of rows) await putRec(n, r);
   }
   return true;

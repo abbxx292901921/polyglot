@@ -3,6 +3,21 @@
 backups/
 .vault.json
 
+# Exported minigames: agent-authored documents. They are not source, and a
+# shared one must never be able to report the reader's address to whoever
+# wrote it. Export them from the app, share them as files, not as repo content.
+polyglot-*.html
+polyglot-*.json
+polyglot-*.txt
+minigame-*.html
+
+# Local scratch
+*.log
+scratch/
+tmp/
+.env
+.env.*
+
 # OS / editor noise
 .DS_Store
 Thumbs.db

@@ -36,6 +36,7 @@ function mkEl(tag = "div") {
     appendChild(c) { this.children.push(c); c.parent = this; return c; },
     append(...c) { c.forEach((x) => this.children.push(x)); },
     remove() {},
+    replaceWith() {},
     contains() { return false; },
     focus() {},
     click() {},
@@ -144,7 +145,7 @@ function makeStore(name) {
 makeStore._n = 0;
 
 const objectStoreNames = ["characters", "personas", "chats", "messages", "lorebooks",
-  "presets", "providers", "regex_rules", "stages", "chat_stage_state"];
+  "presets", "providers", "regex_rules", "stages", "chat_stage_state", "minigames"];
 
 globalThis.indexedDB = {
   open() {
@@ -196,6 +197,13 @@ if (typeof mod.renderRich === "function") {
   const html = mod.renderRich(sample);
   if (!html.includes("<strong>world</strong>")) throw new Error("renderRich broken");
   console.log("RENDER_OK");
+}
+
+// Exercise the minigames panel against the stub DOM: the library, the
+// session list, the card builder and the log all have to survive a build.
+if (typeof mod.renderGamesView === "function") {
+  await mod.renderGamesView();
+  console.log("GAMES_OK");
 }
 
 await new Promise((r) => setTimeout(r, 250));

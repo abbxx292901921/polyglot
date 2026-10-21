@@ -1,9 +1,12 @@
 // Polyglot Forge agent — pure tool-call protocol, zero dependencies.
-// No DOM, no IndexedDB, no imports: node-testable. Never throws; bad JSON
+// No DOM, no IndexedDB: node-testable. It may import from other PURE modules
+// (minigames.js) but never from db.js or app.js. Never throws; bad JSON
 // lands in skipped. The LLM never writes anything directly: reads run live
 // in the loop, writes become Approve/Reject proposals, app.js executes the
 // approved ones via db.js helpers. API keys and avatar bytes never enter the
 // prompt; vault export via the agent always strips keys.
+
+import { GAME_AUTHORING_GUIDE, GAME_SKELETON_HTML, validateMinigameHtml, MINIGAME_MAX_HTML } from "./minigames.js";
 
 export const STAGE_KEYS = ["director", "world", "dice", "chess"];
 
@@ -22,7 +25,9 @@ export const READ_ACTIONS = [
   "get_persona",
   "list_regex",
   "get_world",
-  "list_stage_states"
+  "list_stage_states",
+  "list_minigames",
+  "get_minigame"
 ];
 
 // Writes are proposals only: nothing is applied until the user taps Approve.
@@ -45,6 +50,8 @@ export const WRITE_ACTIONS = [
   "delete_regex_rule",
   "add_stage",
   "set_world",
+  "create_minigame",
+  "delete_minigame",
   "export_file"
 ];
 
@@ -275,6 +282,33 @@ export function validateAction(a) {
     if (toId(a.rule_id) == null) return "E_SUPERVISOR: delete_regex_rule needs rule_id.";
     return null;
   }
+  if (a.action === "list_minigames") {
+    return null;
+  }
+  if (a.action === "get_minigame") {
+    if (!safeStr(a.key, 60) && !safeStr(a.name, 60)) {
+      return "E_SUPERVISOR: get_minigame needs a key.";
+    }
+    return null;
+  }
+  if (a.action === "create_minigame") {
+    if (!safeStr(a.key, 60)) return "E_SUPERVISOR: create_minigame needs a key (a short slug).";
+    if (!safeStr(a.name, 120)) return "E_SUPERVISOR: create_minigame needs a name.";
+    const html = typeof a.html === "string" ? a.html : "";
+    if (!html.trim()) return "E_SUPERVISOR: create_minigame needs the html document.";
+    if (html.length > MINIGAME_MAX_HTML) {
+      return "E_SUPERVISOR: create_minigame html is " + html.length + " chars, the limit is " + MINIGAME_MAX_HTML + ".";
+    }
+    const v = validateMinigameHtml(html);
+    if (!v.ok) return v.error.replace(/^E_GAME_CONTRACT:\s*/, "E_SUPERVISOR: ");
+    return null;
+  }
+  if (a.action === "delete_minigame") {
+    if (!safeStr(a.key, 60) && !safeStr(a.name, 60)) {
+      return "E_SUPERVISOR: delete_minigame needs a key.";
+    }
+    return null;
+  }
   if (a.action === "export_file") {
     if (!["vault", "chat", "character", "preset", "lorebook", "regex"].includes(a.kind)) {
       return "E_SUPERVISOR: export_file kind must be vault|chat|character|preset|lorebook|regex.";
@@ -357,6 +391,12 @@ export function describeAction(a, characters) {
     const scope = a.chat_id != null ? ("chat #" + a.chat_id) : (a.character_id != null ? findName(a.character_id) : "current chat");
     return "Attach stage " + (a.stage_key || "?") + " to " + scope;
   }
+  if (a.action === "create_minigame") {
+    return "Create minigame " + (a.name || a.key || "?") + " (" + Math.round(String(a.html || "").length / 100) / 10 + "k chars)";
+  }
+  if (a.action === "delete_minigame") {
+    return "DELETE minigame " + (a.key || a.name || "?");
+  }
   if (a.action === "set_world") {
     const bits = [];
     if (a.location) bits.push("location=" + String(a.location).slice(0, 40));
@@ -368,7 +408,7 @@ export function describeAction(a, characters) {
 
 // System prompt for the Forge agent loop. Lists the protocol, schemas, and a
 // compact snapshot of the library. Keys and avatar bytes are never included.
-export function buildSupervisorPrompt({ characters, chats, personas, presets, providers, lorebooks }) {
+export function buildSupervisorPrompt({ characters, chats, personas, presets, providers, lorebooks, minigames }) {
   const chars = (Array.isArray(characters) ? characters : []).slice(0, 60).map((c) => ({
     id: c.id,
     name: c.name || "",
@@ -388,12 +428,18 @@ export function buildSupervisorPrompt({ characters, chats, personas, presets, pr
     id: p.id,
     name: p.name || ""
   }));
+  const gameList = (Array.isArray(minigames) ? minigames : []).slice(0, 20).map((g) => ({
+    key: g.key || "",
+    name: g.name || "",
+    desc: String(g.desc || "").slice(0, 120),
+    author: g.author || "user"
+  }));
   return [
     "You are the Polyglot Forge agent. You work in steps: reply with exactly ONE fenced ```tool JSON object per step.",
     "Reads run immediately and you get an Observation back. Writes are PROPOSALS ONLY: they are recorded for user approval, never applied during the run. Never assume a write was applied; refer to new things by name, not by guessed ids.",
     "Prefer reading before writing. Keep text fields short. Finish with done {\"summary\"} or, for questions, answer {\"text\"}.",
     "Control: {\"action\":\"done\",\"summary\":\"...\"} | {\"action\":\"answer\",\"text\":\"...\"}",
-    "Reads: list_characters {query?} | get_character {character_id|name} | list_chats {character_id?,query?} | read_chat {chat_id,limit?<=20} | list_lorebooks {character_id?} | get_lorebook {lorebook_id|name} | list_presets | get_preset {preset_id|name} | list_providers | list_personas | get_persona {persona_id|name} | list_regex {character_id?} | get_world {chat_id?} | list_stage_states {chat_id?}",
+    "Reads: list_characters {query?} | get_character {character_id|name} | list_chats {character_id?,query?} | read_chat {chat_id,limit?<=20} | list_lorebooks {character_id?} | get_lorebook {lorebook_id|name} | list_presets | get_preset {preset_id|name} | list_providers | list_personas | get_persona {persona_id|name} | list_regex {character_id?} | get_world {chat_id?} | list_stage_states {chat_id?} | list_minigames | get_minigame {key}",
     "Character writes: {\"action\":\"create_character\",\"name\",\"description\",\"personality\",\"scenario\",\"first_mes\",\"mes_example\",\"system_prompt\"} | polish_character {character_id|name + fields} | write_scenario {character_id|name,\"scenario\",\"first_mes\"?} | delete_character {character_id|name}",
     "Chat writes: create_chat {character_id|name,title?} | delete_chat {chat_id} | append_message {chat_id,role:user|assistant,name?,content} | delete_message {message_id}",
     "Library writes: create_lorebook {name,character_id|name?,description?} | add_lore_entry {lorebook_id|name,keys?[],content,enabled?} | delete_lorebook {lorebook_id|name} | save_persona {persona_id|name,description?} | delete_persona {persona_id|name}",
@@ -405,6 +451,19 @@ export function buildSupervisorPrompt({ characters, chats, personas, presets, pr
     "Providers: " + (Array.isArray(providers) ? providers.length : 0)
     + ". Lorebooks: " + (Array.isArray(lorebooks) ? lorebooks.length : 0)
     + ". Stage keys: director, world, dice, chess."
+    + ". Minigames: " + JSON.stringify(gameList).slice(0, 1200),
+    "",
+    "MINIGAME WRITES: you can build a brand new playable game. This is the one thing you can create from scratch.",
+    "  {\"action\":\"create_minigame\",\"key\":\"<slug>\",\"name\":\"<Title>\",\"desc\":\"<one line>\",\"html\":\"<the full document>\"}",
+    "  {\"action\":\"delete_minigame\",\"key\":\"<slug>\"}",
+    "  The html field must be a SINGLE self-contained HTML document as one JSON string.",
+    "  Read an existing one first with get_minigame {key} if you want to extend or fix it.",
+    "  If a game already has that key, create_minigame is refused unless you add \"overwrite\":true.",
+    "  Do not use the keys 'duel' or 'fortune'; those are built-in games.",
+    GAME_AUTHORING_GUIDE,
+    "",
+    "MINIGAME SKELETON (a working example — copy its shape, replace the rules):",
+    GAME_SKELETON_HTML
   ].join("\n");
 }
 
