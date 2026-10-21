@@ -4,6 +4,7 @@ import { STAGE_KEYS, STAGE_META, normalizeToggles, defaultStageToggles, parseDir
 import { SUPERVISOR_ACTIONS, parseSupervisorReply, validateAction, normalizeAction, describeAction, buildSupervisorPrompt, localDraftCharacter, localPolishCharacter, isReadAction, isControlAction } from "./supervisor.js";
 import {
   openDB,
+  getRev,
   listCharacters,
   saveCharacter,
   deleteCharacter,
@@ -110,6 +111,14 @@ function timeAgo(ts) {
   return `${Math.floor(mo / 12)} yr ago`;
 }
 
+function prefersReducedMotion() {
+  try {
+    return !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  } catch {
+    return false;
+  }
+}
+
 function getToggles() {
   try {
     const t = JSON.parse(localStorage.getItem("polyglot.toggles") || "null");
@@ -117,16 +126,39 @@ function getToggles() {
       return {
         stream: t.stream !== false,
         thought: t.thought !== false,
-        haptic: t.haptic !== false
+        haptic: t.haptic !== false,
+        // Animations default to whatever the OS asks for.
+        motion: typeof t.motion === "boolean" ? t.motion : !prefersReducedMotion()
       };
     }
   } catch { /* fall through to defaults */ }
-  return { stream: true, thought: true, haptic: true };
+  return { stream: true, thought: true, haptic: true, motion: !prefersReducedMotion() };
+}
+
+// "Calm" mode stops the graph's infinite dash/halo animations, which repaint
+// the whole SVG canvas every frame and are the app's one always-on drain.
+function applyMotionClass() {
+  const on = getToggles().motion;
+  document.documentElement.classList.toggle("calm", !on);
 }
 
 function saveToggles(tg) {
   localStorage.setItem("polyglot.toggles", JSON.stringify(tg));
   localStorage.setItem("polyglot.haptic", tg.haptic ? "on" : "off");
+}
+
+// Character rows carry base64 avatars, so re-reading the table is expensive.
+// Cache it against the DB revision: any write bumps the revision, so the
+// cache can never go stale.
+let charsCache = null;
+let charsCacheRev = -1;
+async function getCharacters() {
+  const rev = getRev();
+  if (charsCache && charsCacheRev === rev) return charsCache;
+  const rows = await listCharacters();
+  charsCache = rows;
+  charsCacheRev = rev;
+  return rows;
 }
 
 function escapeHtml(s) {
@@ -141,37 +173,183 @@ function escapeHtml(s) {
 // Escape first (XSS-safe even for hostile card text), then light markdown:
 // **bold**, *action* (muted italic), "dialogue" (bright), `code`, [[choices]],
 // [links](url), bare URLs, <font color="..."> passthrough. Paragraphs preserved.
+//
+// Split in two so the live streamer can reuse the exact same per-paragraph
+// rules: renderParagraphInner() takes ONE already-escaped paragraph and
+// returns its inner HTML; renderParagraph() wraps it in <p>.
+function renderParagraphInner(p) {
+  const codes = [];
+  let h = p.replace(/\n/g, "<br>");
+  h = h.replace(/`([^`\n]+)`/g, (_, code) => {
+    codes.push(code);
+    return `\u0000${codes.length - 1}\u0000`;
+  });
+  h = h.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  h = h.replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em class="action">*$2*</em>');
+  h = h.replace(/(^|[\s(])_([^_\n]+)_(?![a-zA-Z0-9_])/g, "$1<em>$2</em>");
+  h = h.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+  h = h.replace(/\[\[([^\[\]]+)\]\]/g, '<span class="choice">[[$1]]</span>');
+  h = h.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  h = h.replace(/(^|[\s(])((?:https?:\/\/)[^\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+  h = h.replace(/&quot;([^&\n]+)&quot;/g, '<span class="dialogue">&quot;$1&quot;</span>');
+  h = h.replace(/&lt;font\s+color=(?:&quot;([^&]*)&quot;|&#39;([^&]*)&#39;)&gt;/gi, (m, dq, sq) => {
+    const c = dq !== undefined ? dq : sq;
+    return `<font color="${c}">`;
+  });
+  h = h.replace(/&lt;\/font&gt;/gi, "</font>");
+  h = h.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${codes[i]}</code>`);
+  return h;
+}
+
+function renderParagraph(p) {
+  return `<p>${renderParagraphInner(p)}</p>`;
+}
+
 export function renderRich(text) {
-  const paras = escapeHtml(text).split(/\n{2,}/);
-  return paras
-    .map((p) => {
-      const codes = [];
-      let h = p.replace(/\n/g, "<br>");
-      h = h.replace(/`([^`\n]+)`/g, (_, code) => {
-        codes.push(code);
-        return `\u0000${codes.length - 1}\u0000`;
-      });
-      h = h.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-      h = h.replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em class="action">*$2*</em>');
-      h = h.replace(/(^|[\s(])_([^_\n]+)_(?![a-zA-Z0-9_])/g, "$1<em>$2</em>");
-      h = h.replace(/~~([^~]+)~~/g, "<del>$1</del>");
-      h = h.replace(/\[\[([^\[\]]+)\]\]/g, '<span class="choice">[[$1]]</span>');
-      h = h.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-      h = h.replace(/(^|[\s(])((?:https?:\/\/)[^\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
-      h = h.replace(/&quot;([^&\n]+)&quot;/g, '<span class="dialogue">&quot;$1&quot;</span>');
-      h = h.replace(/&lt;font\s+color=(?:&quot;([^&]*)&quot;|&#39;([^&]*)&#39;)&gt;/gi, (m, dq, sq) => {
-        const c = dq !== undefined ? dq : sq;
-        return `<font color="${c}">`;
-      });
-      h = h.replace(/&lt;\/font&gt;/gi, "</font>");
-      h = h.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${codes[i]}</code>`);
-      return `<p>${h}</p>`;
-    })
+  return escapeHtml(text)
+    .split(/\n{2,}/)
+    .map(renderParagraph)
     .join("");
 }
 
+// Live-stream renderer.
+//
+// renderRich() is O(text length), so re-running it for every streamed token
+// is O(n^2) AND re-parses the whole bubble each time — by far the biggest
+// CPU/battery cost while generating on a phone. renderRich() already maps
+// per paragraph, and no markdown rule spans a paragraph boundary, so we
+// commit each FINISHED paragraph to the DOM exactly once and only re-render
+// the trailing partial paragraph. The resulting DOM is identical to
+// innerHTML = renderRich(whole text).
+export function createLiveRenderer(target) {
+  let text = "";        // raw content of the paragraph being written
+  let node = null;      // <p> holding `text` (always the last child)
+  let shown = "";       // inner HTML currently written into `node`
+  let pendingNl = 0;    // trailing newlines inside `text`
+  let sepRun = 0;       // newlines in the separator run we are inside
+  const ready = [];     // finished paragraphs waiting to be painted
+
+  function freshNode() {
+    const n = document.createElement("p");
+    target.appendChild(n);
+    return n;
+  }
+
+  // A run of two or more newlines ends a paragraph — the same separator
+  // renderRich() splits on. The run may still grow afterwards, so the
+  // paragraph is committed as soon as the run reaches two, and any extra
+  // newlines are swallowed as part of that same separator.
+  function commit() {
+    ready.push(renderParagraphInner(escapeHtml(text.slice(0, text.length - pendingNl))));
+    text = "";
+    pendingNl = 0;
+    sepRun = 2;
+  }
+
+  function plain(t) {
+    if (!t) return;
+    if (sepRun > 0) {
+      // The separator just ended: this opens a new paragraph.
+      text = t;
+      sepRun = 0;
+    } else {
+      text += t;
+    }
+    pendingNl = 0;
+  }
+
+  function newline() {
+    if (sepRun > 0) { sepRun++; return; }
+    text += "\n";
+    pendingNl++;
+    if (pendingNl === 2) commit();
+  }
+
+  return {
+    push(chunk) {
+      const s = String(chunk ?? "");
+      let i = 0;
+      while (i < s.length) {
+        const nl = s.indexOf("\n", i);
+        if (nl === -1) { plain(s.slice(i)); break; }
+        plain(s.slice(i, nl));
+        newline();
+        i = nl + 1;
+      }
+    },
+    draw() {
+      while (ready.length) {
+        const html = ready.shift();
+        if (node) {
+          node.innerHTML = html;
+          node = freshNode();
+          shown = "";
+        } else {
+          const n = freshNode();
+          n.innerHTML = html;
+        }
+      }
+      if (!node) node = freshNode();
+      const html = renderParagraphInner(escapeHtml(text));
+      if (html !== shown) {
+        shown = html;
+        node.innerHTML = html;
+      }
+    },
+    reset() {
+      target.innerHTML = "";
+      text = "";
+      node = null;
+      shown = "";
+      pendingNl = 0;
+      sepRun = 0;
+      ready.length = 0;
+    }
+  };
+}
+
+// Coalesce high-frequency work to one call per animation frame. Streaming
+// tokens, viewport events and pointer moves all fire far faster than the
+// screen refreshes, so batching them removes most of the redundant work.
+function frameOnce(fn) {
+  let pending = false;
+  let raf = 0;
+  let timer = 0;
+  const run = () => {
+    if (!pending) return;
+    pending = false;
+    if (raf) { window.cancelAnimationFrame?.(raf); raf = 0; }
+    if (timer) { window.clearTimeout(timer); timer = 0; }
+    fn();
+  };
+  const schedule = () => {
+    if (pending) return;
+    pending = true;
+    if (window.requestAnimationFrame) raf = window.requestAnimationFrame(run);
+    // Safety net: rAF is paused in a backgrounded tab, so a timer still runs.
+    timer = window.setTimeout(run, 120);
+  };
+  schedule.cancel = () => {
+    pending = false;
+    if (raf) { window.cancelAnimationFrame?.(raf); raf = 0; }
+    if (timer) { window.clearTimeout(timer); timer = 0; }
+  };
+  return schedule;
+}
+
 function scrollBottom() {
-  $("#chat").scrollTop = $("#chat").scrollHeight;
+  const c = $("#chat");
+  if (c) c.scrollTop = c.scrollHeight;
+}
+
+// Debounce: search boxes rebuild a whole card list, so a burst of keystrokes
+// should cost one render, not one per character typed.
+function debounce(fn, ms = 200) {
+  let t = 0;
+  return (...args) => {
+    window.clearTimeout(t);
+    t = window.setTimeout(() => fn(...args), ms);
+  };
 }
 
 // ---------- Phase 5: regex scripts ----------
@@ -258,7 +436,7 @@ function clearChatView(emptyText = "No messages yet. Say hello.") {
 
 async function ensureSelection() {
   const [chars, personas, presets, providers, chats] = await Promise.all([
-    listCharacters(),
+    getCharacters(),
     listPersonas(),
     listPresets(),
     listProviders().catch(() => []),
@@ -308,7 +486,7 @@ async function ensureChat() {
   });
   ui.chatId = id;
   persistUI();
-  const chars = await listCharacters();
+  const chars = await getCharacters();
   const ch = chars.find((c) => c.id === ui.characterId);
   if (ch?.first_mes) {
     await saveMessage({ chat_id: id, role: "assistant", content: ch.first_mes, timestamp: Date.now() });
@@ -327,7 +505,7 @@ function charStarters(ch) {
 }
 
 async function createChatWithStarter(charId, idx = 0) {
-  const chars = await listCharacters();
+  const chars = await getCharacters();
   const starters = charStarters(chars.find((c) => c.id === charId));
   const id = await saveChat({
     character_id: charId,
@@ -812,7 +990,7 @@ async function renderGraph() {
   const st = graphState;
   if (!st || ui.chatId == null) return;
   const { rows, pathIds, leafId } = await getChatChain(ui.chatId);
-  const chars = await listCharacters();
+  const chars = await getCharacters();
   const ch = chars.find((c) => c.id === ui.characterId);
   st.chName = ch?.name || "AI";
   st.byId = new Map(rows.map((m) => [m.id, m]));
@@ -873,8 +1051,10 @@ async function renderGraph() {
   g.id = "graph-g";
   // Only the tail of the live path animates: a short dash crawl is enough
   // to read as "this is where you are" without repainting every edge.
+  // WebKit does not composite SVG stroke-dashoffset, so every animated
+  // stroke is a per-frame repaint — keep the count small.
   const liveEdges = edges.filter((e) => e.on);
-  const flowFrom = Math.max(0, liveEdges.length - 18);
+  const flowFrom = Math.max(0, liveEdges.length - 6);
   liveEdges.forEach((e, i) => { e.flow = i >= flowFrom; });
   for (const e of edges) {
     const d = graphEdgePath(e.a, e.b, st.horizontal);
@@ -977,8 +1157,35 @@ function graphWireGestures(view) {
   let pinchD = 0;
   let moved = 0;
   let hoverId = null;
+  let rect = null;
+  let hoverPending = false;
+  let hoverX = 0;
+  let hoverY = 0;
+  let dirty = false;
+  const refreshRect = () => { rect = view.getBoundingClientRect(); };
+  // Gestures fire far faster than the screen refreshes (120Hz on ProMotion).
+  // Batch the transform write and the hover hit-test to one per frame, and
+  // reuse the cached rect instead of forcing a layout on every move.
+  const paint = frameOnce(() => {
+    const st = graphState;
+    if (!st) return;
+    if (dirty) {
+      dirty = false;
+      graphApplyTransform();
+    }
+    if (hoverPending) {
+      hoverPending = false;
+      const hit = graphNearest(st, hoverX, hoverY);
+      const hid = hit ? hit.ids[hit.ids.length - 1] : null;
+      if (hid !== hoverId) {
+        hoverId = hid;
+        graphShowPreview(hid);
+      }
+    }
+  });
   view.addEventListener("pointerdown", (e) => {
     view.setPointerCapture?.(e.pointerId);
+    refreshRect();
     pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
     moved = 0;
     if (pts.size === 2) {
@@ -998,30 +1205,31 @@ function graphWireGestures(view) {
       const [a, b] = [...pts.values()];
       const d = Math.hypot(a.x - b.x, a.y - b.y);
       if (pinchD > 0 && d > 0) {
-        const rect = view.getBoundingClientRect();
+        if (!rect) refreshRect();
         const mx = (a.x + b.x) / 2 - rect.left;
         const my = (a.y + b.y) / 2 - rect.top;
         const k2 = Math.max(0.2, Math.min(4, st.k * d / pinchD));
         st.px = mx - (mx - st.px) * (k2 / st.k);
         st.py = my - (my - st.py) * (k2 / st.k);
         st.k = k2;
-        graphApplyTransform();
+        dirty = true;
       }
       pinchD = d;
+      paint();
       return;
     }
     if (pts.size === 1) {
       st.px += dx;
       st.py += dy;
-      graphApplyTransform();
+      dirty = true;
       // While the finger is still, preview whatever sits under it.
-      if (moved > 6) { hoverId = null; return; }
-      const hit = graphNearest(st, e.clientX, e.clientY);
-      const hid = hit ? hit.ids[hit.ids.length - 1] : null;
-      if (hid !== hoverId) {
-        hoverId = hid;
-        graphShowPreview(hid);
+      if (moved > 6) { hoverId = null; hoverPending = false; }
+      else {
+        hoverX = e.clientX;
+        hoverY = e.clientY;
+        hoverPending = true;
       }
+      paint();
     }
   });
   const up = async (e) => {
@@ -1048,7 +1256,7 @@ function graphWireGestures(view) {
     const st = graphState;
     if (!st) return;
     e.preventDefault();
-    const rect = view.getBoundingClientRect();
+    refreshRect();
     const mx = e.clientX - rect.left;
     const my = e.clientY - rect.top;
     const k2 = Math.max(0.2, Math.min(4, st.k * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
@@ -1200,7 +1408,7 @@ async function renderCurrentChat() {
     }
     const mine = await listChats(ui.characterId);
     if (!mine.length) {
-      const chars = await listCharacters();
+      const chars = await getCharacters();
       const ch = chars.find((c) => c.id === ui.characterId);
       clearBranchbar();
       $("#chat").innerHTML = "";
@@ -1210,6 +1418,7 @@ async function renderCurrentChat() {
         s.body.innerHTML = renderMsg(ch.first_mes);
         s.body.classList.add("msgbody");
       } else clearChatView("No messages yet. Say hello.");
+      markViewFresh("chat");
       return;
     }
     mine.sort((a, b) => b.updated_at - a.updated_at);
@@ -1217,7 +1426,7 @@ async function renderCurrentChat() {
     persistUI();
   }
   const { rows, chain, pathIds, leafId, latestId, hidden } = await getChatChain(ui.chatId);
-  const [chars, personas] = await Promise.all([listCharacters(), listPersonas()]);
+  const [chars, personas] = await Promise.all([getCharacters(), listPersonas()]);
   const ch = chars.find((c) => c.id === ui.characterId);
   const me = personas.find((p) => p.id === ui.personaId);
   const chName = ch?.name || "Polyglot";
@@ -1234,6 +1443,7 @@ async function renderCurrentChat() {
       s.det.remove();
       s.body.innerHTML = renderRich("*ready* This chat is stored on-device.");
     }
+    markViewFresh("chat");
     return;
   }
   const items = groupRows(chain, rows, pathIds);
@@ -1339,13 +1549,19 @@ async function renderCurrentChat() {
     $("#chat").append(div);
   });
   scrollBottom();
+  markViewFresh("chat");
 }
 
 // ---------- Library ----------
+let libraryRev = -1;
 async function refreshLibrary() {
+  // The drawer lists personas, characters and chats. If nothing was written
+  // since the last paint, the DOM is already correct — skip the rebuild.
+  const rev = getRev();
+  if (libraryRev === rev) return;
   const [personas, chars, chats] = await Promise.all([
     listPersonas(),
-    listCharacters(),
+    getCharacters(),
     ui.characterId != null ? listChats(ui.characterId) : Promise.resolve([])
   ]);
 
@@ -1479,6 +1695,7 @@ async function refreshLibrary() {
     hl.append(row);
   }
   refreshViews();
+  libraryRev = rev;
 }
 
 // ---------- Providers + model presets (v1.5 split, mix-and-match) ----------
@@ -1821,7 +2038,7 @@ function diagNote(msg) {
 // ---------- Context + generation core ----------
 async function buildContext(pastRows, extraUserText = "") {
   const [chars, personas, preset, provider] = await Promise.all([
-    listCharacters(),
+    getCharacters(),
     listPersonas(),
     getActivePreset(),
     getActiveProvider()
@@ -1940,16 +2157,29 @@ async function runStream(preset, provider, messages, shell, signal) {
   const tg = getToggles();
   let acc = "";
   let accThink = "";
-  const renderLive = () => {
-    if (tg.stream) shell.body.innerHTML = renderRich(acc);
-    if (accThink && tg.thought) {
+  // Live rendering is incremental (createLiveRenderer) and coalesced to one
+  // paint per frame, so a fast token stream costs one small DOM write per
+  // frame instead of one full markdown re-render per token.
+  const live = tg.stream ? createLiveRenderer(shell.body) : null;
+  if (live) {
+    live.reset();
+    live.draw();
+  }
+  let thinkAt = 0;
+  const paint = frameOnce(() => {
+    if (live) live.draw();
+    // The thought trace is a secondary readout: 10Hz is plenty, and it keeps
+    // estimateTokens() (O(len)) off the per-token path entirely.
+    const now = Date.now();
+    if (accThink && tg.thought && now - thinkAt >= 100) {
+      thinkAt = now;
       shell.det.style.display = "";
       shell.tb.textContent = accThink;
-      const secs = ((Date.now() - t0) / 1000).toFixed(1);
+      const secs = ((now - t0) / 1000).toFixed(1);
       shell.sum.textContent = `💭 Thought Trace (${secs}s • ~${estimateTokens(accThink)} tok) [Tap to view]`;
     }
     scrollBottom();
-  };
+  });
   const { content, reasoning } = await sendChat({
     provider: provider || undefined,
     preset,
@@ -1957,10 +2187,11 @@ async function runStream(preset, provider, messages, shell, signal) {
     samplers: preset?.samplers,
     messages,
     signal,
-    onContent: (t) => { acc += t; renderLive(); },
-    onReasoning: (t) => { accThink += t; renderLive(); },
+    onContent: (t) => { acc += t; live?.push(t); paint(); },
+    onReasoning: (t) => { accThink += t; paint(); },
     onNote: (n) => { try { logWarn("E_REASONING", n); } catch { /* notes never break send */ } }
   });
+  paint.cancel();
   shell.body.innerHTML = renderMsg(content || acc);
   if ((reasoning || accThink) && tg.thought) {
     shell.det.style.display = "";
@@ -2348,7 +2579,7 @@ async function handleExportChat() {
   try {
     if (ui.chatId == null) throw new Error("E_UI_EXPORT: no chat selected.");
     const [chars, chats, rows] = await Promise.all([
-      listCharacters(), listChats(), listMessages(ui.chatId)
+      getCharacters(), listChats(), listMessages(ui.chatId)
     ]);
     const chat = chats.find((c) => c.id === ui.chatId);
     const ch = chars.find((c) => c.id === chat.character_id);
@@ -2380,7 +2611,7 @@ async function handleImportChatFile(file) {
     }
     let charId = null;
     if (data.character?.name) {
-      const chars = await listCharacters();
+      const chars = await getCharacters();
       const hit = chars.find((c) => c.name === data.character.name);
       if (hit) charId = hit.id;
       else {
@@ -2683,7 +2914,7 @@ function openCharEditor(charId = null, prefill = null) {
       $("#ch-example").value = c.mes_example || "";
       $("#ch-sys").value = c.system_prompt || "";
     } else if (charId != null) {
-      const chars = await listCharacters();
+      const chars = await getCharacters();
       const c = chars.find((x) => x.id === charId);
       if (!c) return;
       edAvatar = c.avatar || null;
@@ -2754,7 +2985,7 @@ async function saveCharEditor() {
     let id = edId;
     if (id == null) id = await saveCharacter(rec);
     else {
-      const chars = await listCharacters();
+      const chars = await getCharacters();
       const prev = chars.find((x) => x.id === id) || {};
       await saveCharacter({ ...prev, ...rec, id });
     }
@@ -2884,10 +3115,36 @@ async function handleCardFiles(files) {
 }
 
 // ---------- Shell plumbing ----------
+// Modern Safari/Chrome can size a textarea to its content natively
+// (field-sizing: content) — that removes ALL per-keystroke layout work.
+// Older engines fall back to the measured path below.
+const FIELD_SIZING = (() => {
+  try {
+    return typeof CSS !== "undefined" && !!CSS.supports && CSS.supports("field-sizing", "content");
+  } catch {
+    return false;
+  }
+})();
+
+let autogrowKey = "";
 function autogrow() {
   const ta = $("#input");
+  if (!ta) return;
+  if (FIELD_SIZING) {
+    // The browser owns the height — drop any stale inline height.
+    if (ta.style.height) ta.style.height = "";
+    return;
+  }
+  const key = ta.value.length + ":" + window.innerHeight;
+  if (key === autogrowKey) return;
+  autogrowKey = key;
+  const prev = ta.style.height;
   ta.style.height = "auto";
-  ta.style.height = Math.min(ta.scrollHeight, window.innerHeight * 0.38) + "px";
+  const h = Math.min(ta.scrollHeight, window.innerHeight * 0.38) + "px";
+  // Only write when the height actually moved: the second write is what
+  // forces the extra layout pass.
+  if (h !== prev) ta.style.height = h;
+  else ta.style.height = prev;
 }
 
 function openDrawer(id) {
@@ -2902,13 +3159,20 @@ function closeDrawers() {
 
 function trackKeyboard() {
   if (!window.visualViewport) return;
-  const set = () => {
-    const gap = Math.max(0, window.innerHeight - window.visualViewport.height);
+  let last = -1;
+  const apply = () => {
+    const gap = Math.max(0, Math.round(window.innerHeight - window.visualViewport.height));
+    if (gap === last) return;
+    last = gap;
     document.documentElement.style.setProperty("--kb-offset", `${gap}px`);
   };
+  // iOS fires resize AND scroll continuously while the keyboard animates.
+  // Every write to --kb-offset invalidates style for the whole document, so
+  // batch to one write per frame and skip writes that change nothing.
+  const set = frameOnce(apply);
   window.visualViewport.addEventListener("resize", set);
   window.visualViewport.addEventListener("scroll", set);
-  set();
+  apply();
 }
 
 function registerSW() {
@@ -2956,6 +3220,24 @@ async function copyDiagReport() {
 let view = localStorage.getItem("polyglot.view") || "home";
 let detailCharId = Number(localStorage.getItem("polyglot.detailChar")) || null;
 
+// Per-view render signatures. A view is only rebuilt when the data behind it
+// actually changed, so hopping between tabs no longer re-reads IndexedDB and
+// re-creates the whole DOM (and re-decodes every avatar) on every tap.
+const viewSig = {};
+function viewSignature(name) {
+  const rev = getRev();
+  if (name === "chat") return `${rev}:${ui.chatId}:${ui.characterId}`;
+  if (name === "detail") return `${rev}:${detailCharId}`;
+  return `${rev}`;
+}
+// Mark a view as freshly rendered for the current data.
+function markViewFresh(name) {
+  viewSig[name] = viewSignature(name);
+}
+function viewIsFresh(name) {
+  return viewSig[name] === viewSignature(name);
+}
+
 function showView(name) {
   view = name;
   localStorage.setItem("polyglot.view", name);
@@ -2971,16 +3253,18 @@ function showView(name) {
     const el = $(`#view-${v}`);
     if (el) el.hidden = name !== v;
   }
-  if (name === "home") refreshHome();
-  if (name === "chars") renderCharsView();
-  if (name === "detail") renderDetailView();
-  if (name === "presets") { renderPresetCards(); renderProviderCards(); }
-  if (name === "books") renderBooksView();
-  if (name === "regex") renderRegexView();
-  if (name === "stages") renderStagesView();
+  // The forge panel streams live agent output, so it always re-renders.
+  const fresh = name === "forge" ? false : viewIsFresh(name);
+  if (name === "home" && !fresh) refreshHome();
+  if (name === "chars" && !fresh) renderCharsView();
+  if (name === "detail" && !fresh) renderDetailView();
+  if (name === "presets" && !fresh) { renderPresetCards(); renderProviderCards(); }
+  if (name === "books" && !fresh) renderBooksView();
+  if (name === "regex" && !fresh) renderRegexView();
+  if (name === "stages" && !fresh) renderStagesView();
   if (name === "forge") renderForgeView();
   if (name === "chat") {
-    renderCurrentChat();
+    if (!fresh) renderCurrentChat();
     window.setTimeout(autogrow, 0);
   }
 }
@@ -3008,6 +3292,10 @@ function avatarImg(src, cls = "av") {
   const img = document.createElement("img");
   img.className = cls;
   img.alt = "";
+  // Avatars are base64 blobs; decode them off the critical path and let the
+  // browser skip anything scrolled out of view.
+  img.decoding = "async";
+  img.loading = "lazy";
   if (src) img.src = src;
   else img.style.visibility = "hidden";
   return img;
@@ -3017,11 +3305,12 @@ async function refreshHome() {
   const grid = $("#recent-grid");
   if (!grid) return;
   grid.innerHTML = "";
-  const [chats, chars] = await Promise.all([listChats(), listCharacters()]);
+  const [chats, chars] = await Promise.all([listChats(), getCharacters()]);
   const byChar = new Map(chars.map((c) => [c.id, c]));
   const sorted = [...chats].sort((a, b) => b.updated_at - a.updated_at).slice(0, 8);
   if (!sorted.length) {
     grid.innerHTML = `<div class="card wide">No conversations yet. Create a character, then start chatting — everything stays on-device.</div>`;
+    markViewFresh("home");
     return;
   }
   for (const h of sorted) {
@@ -3057,12 +3346,13 @@ async function refreshHome() {
     });
     grid.append(card);
   }
+  markViewFresh("home");
 }
 
 async function renderCharsView() {
   const q = ($("#chars-search")?.value || "").trim().toLowerCase();
   const sort = $("#chars-sort")?.value || "modified";
-  const chars = await listCharacters();
+  const chars = await getCharacters();
   let list = chars.filter((c) =>
     !q || (c.name || "").toLowerCase().includes(q) ||
     (c.description || "").toLowerCase().includes(q));
@@ -3117,15 +3407,17 @@ async function renderCharsView() {
   };
   paint($("#chars-fav-list"), favs, false);
   paint($("#chars-list"), rest, true);
+  markViewFresh("chars");
 }
 
 async function renderDetailView() {
-  const chars = await listCharacters();
+  const chars = await getCharacters();
   const c = chars.find((x) => x.id === detailCharId) || chars.find((x) => x.id === ui.characterId);
   if (!c) {
     $("#detail-name").textContent = "No character yet";
     $("#detail-sub").textContent = "Create one to start.";
     $("#detail-chat-list").innerHTML = "";
+    markViewFresh("detail");
     return;
   }
   detailCharId = c.id;
@@ -3177,6 +3469,7 @@ async function renderDetailView() {
     row.append(tx, del);
     box.append(row);
   }
+  markViewFresh("detail");
 }
 
 async function renderPresetCards() {
@@ -3280,6 +3573,7 @@ async function renderProviderCards() {
   box.innerHTML = "";
   if (!providers.length) {
     box.innerHTML = `<div class="status">No providers yet — add your Nvidia NIM endpoint above.</div>`;
+    markViewFresh("presets");
     return;
   }
   for (const p of providers) {
@@ -3329,13 +3623,16 @@ async function renderProviderCards() {
     box.append(row);
   }
   updateComboLabels();
+  // Marked here (not in renderPresetCards) so the Presets view is only
+  // considered fresh once BOTH card lists have been painted.
+  markViewFresh("presets");
 }
 
 async function renderBooksView() {
   const sel = $("#books-char-filter");
   const box = $("#book-list");
   if (!sel || !box) return;
-  const chars = await listCharacters();
+  const chars = await getCharacters();
   const cur = sel.value || "all";
   sel.innerHTML = "";
   const all = document.createElement("option");
@@ -3357,6 +3654,7 @@ async function renderBooksView() {
   box.innerHTML = "";
   if (!books.length) {
     box.innerHTML = `<div class="status">No memory books yet. Character card imports auto-create them.</div>`;
+    markViewFresh("books");
     return;
   }
   for (const b of books) {
@@ -3410,6 +3708,7 @@ async function renderBooksView() {
     row.append(tx, icons);
     box.append(row);
   }
+  markViewFresh("books");
 }
 
 // ---------- Memory book editor (rename + entries CRUD) ----------
@@ -3424,7 +3723,7 @@ function setBookStatus(msg) {
 async function fillBookCharSelect(selected = "shared") {
   const sel = $("#bk-char");
   if (!sel) return;
-  const chars = await listCharacters();
+  const chars = await getCharacters();
   sel.innerHTML = "";
   const g = document.createElement("option");
   g.value = "shared";
@@ -3566,7 +3865,7 @@ function setRxStatus(msg) {
 async function fillRxCharSelect(selected = "global") {
   const sel = $("#rx-char");
   if (!sel) return;
-  const chars = await listCharacters();
+  const chars = await getCharacters();
   sel.innerHTML = "";
   const g = document.createElement("option");
   g.value = "global";
@@ -3656,12 +3955,13 @@ async function saveRegexForm() {
 async function renderRegexView() {
   const box = $("#regex-list");
   if (!box) return;
-  const [rules, chars] = await Promise.all([listAllRegexRules(), listCharacters()]);
+  const [rules, chars] = await Promise.all([listAllRegexRules(), getCharacters()]);
   const byChar = new Map(chars.map((c) => [c.id, c.name]));
   box.innerHTML = "";
   const sorted = [...rules].sort((a, b) => (a.id ?? 0) - (b.id ?? 0));
   if (!sorted.length) {
     box.innerHTML = `<div class="status">No rules yet. Example: find <b>Jon\\b</b> → replace <b>John</b>, both, global.</div>`;
+    markViewFresh("regex");
     return;
   }
   for (const r of sorted) {
@@ -3711,6 +4011,7 @@ async function renderRegexView() {
     row.append(tx, icons);
     box.append(row);
   }
+  markViewFresh("regex");
 }
 
 async function runRegexTest() {
@@ -3883,6 +4184,7 @@ async function renderStagesView() {
       } catch { /* preview optional */ }
     }
   }
+  markViewFresh("stages");
 }
 
 let forgeProposals = [];
@@ -3923,7 +4225,7 @@ function downloadForgeFile(name, data) {
 // Read actions run live inside the agent loop (no approval needed — read-only).
 // Never returns api_key fields or avatar bytes; truncates long text.
 async function executeForgeRead(a) {
-  const chars = await listCharacters().catch(() => []);
+  const chars = await getCharacters().catch(() => []);
   const byCharId = (id) => chars.find((c) => c && c.id === Number(id));
   const byCharName = (n) => {
     const t = String(n || "").trim().toLowerCase();
@@ -4070,7 +4372,7 @@ async function executeSupervisorAction(a) {
   const errV = validateAction(a);
   if (errV) throw new Error(errV);
   const act = normalizeAction(a, ui.chatId);
-  const chars = await listCharacters();
+  const chars = await getCharacters();
   const byId = (id) => chars.find((c) => c && c.id === Number(id));
   const byName = (n) => {
     const t = String(n || "").trim().toLowerCase();
@@ -4383,7 +4685,7 @@ async function renderForgeView() {
     }
     return;
   }
-  const chars = await listCharacters().catch(() => []);
+  const chars = await getCharacters().catch(() => []);
   for (let i = 0; i < forgeProposals.length; i++) {
     const a = forgeProposals[i];
     const card = document.createElement("div");
@@ -4436,7 +4738,7 @@ async function handleForgeRun() {
   const btn = $("#btn-forge-run");
   if (btn) btn.disabled = true;
   try {
-    const [chars, chats] = await Promise.all([listCharacters().catch(() => []), listChats().catch(() => [])]);
+    const [chars, chats] = await Promise.all([getCharacters().catch(() => []), listChats().catch(() => [])]);
     const lower = req.toLowerCase();
     // Fast offline paths: no model needed for skeleton drafts and stage toggles.
     if (/^(make|create|new)\b/.test(lower) && !presetModel(await getActivePreset().catch(() => null))) {
@@ -4751,7 +5053,7 @@ async function init() {
   $("#btn-persona-save")?.addEventListener("click", savePersonaEditor);
   $("#btn-new-char").addEventListener("click", () => openCharEditor(null));
   $("#btn-new-chat").addEventListener("click", async () => {
-    const chars = await listCharacters();
+    const chars = await getCharacters();
     const ch = chars.find((c) => c.id === ui.characterId);
     const starters = charStarters(ch);
     if (starters.length > 1) {
@@ -5023,7 +5325,9 @@ async function init() {
   if ($("#tg-stream")) $("#tg-stream").checked = tg0.stream;
   if ($("#tg-thought")) $("#tg-thought").checked = tg0.thought;
   if ($("#tg-haptic")) $("#tg-haptic").checked = tg0.haptic;
+  if ($("#tg-motion")) $("#tg-motion").checked = tg0.motion;
   localStorage.setItem("polyglot.haptic", tg0.haptic ? "on" : "off");
+  applyMotionClass();
 
   document.querySelectorAll("#tabs button").forEach((b) =>
     b.addEventListener("click", () => {
@@ -5042,7 +5346,7 @@ async function init() {
   );
 
   const newChatFor = async (charId) => {
-    const chars = await listCharacters();
+    const chars = await getCharacters();
     const ch = chars.find((c) => c.id === charId);
     const starters = charStarters(ch);
     if (starters.length > 1) {
@@ -5090,9 +5394,11 @@ async function init() {
     await refreshPresets();
     await renderPresetCards();
   });
-  $("#chars-search")?.addEventListener("input", () => renderCharsView());
+  // Search boxes rebuild a whole card list; debounce so a burst of
+  // keystrokes costs one render instead of one per character typed.
+  $("#chars-search")?.addEventListener("input", debounce(() => renderCharsView()));
   $("#chars-sort")?.addEventListener("change", () => renderCharsView());
-  $("#preset-filter")?.addEventListener("input", () => renderPresetCards());
+  $("#preset-filter")?.addEventListener("input", debounce(() => renderPresetCards()));
   $("#books-char-filter")?.addEventListener("change", () => renderBooksView());
   $("#file-preset-import")?.addEventListener("change", async (e) => {
     const f = e.target.files?.[0];
@@ -5111,11 +5417,12 @@ async function init() {
   $("#btn-detail-edit")?.addEventListener("click", () => {
     if (detailCharId != null) openCharEditor(detailCharId);
   });
-  for (const [id, key] of [["#tg-stream", "stream"], ["#tg-thought", "thought"], ["#tg-haptic", "haptic"]]) {
+  for (const [id, key] of [["#tg-stream", "stream"], ["#tg-thought", "thought"], ["#tg-haptic", "haptic"], ["#tg-motion", "motion"]]) {
     $(id)?.addEventListener("change", async (e) => {
       const tg = { ...getToggles(), [key]: e.target.checked };
       saveToggles(tg);
       if (key === "thought") await renderCurrentChat();
+      if (key === "motion") applyMotionClass();
     });
   }
   $("#theme-preset")?.addEventListener("change", (e) => {
@@ -5126,8 +5433,12 @@ async function init() {
     }
     applyTheme(name);
   });
+  // A colour picker fires "input" continuously while dragging. Theme
+  // changes rewrite CSS variables on :root, which invalidates style for the
+  // whole document — so paint at most once per frame.
+  const paintTheme = frameOnce(() => applyTheme("custom", readThemeInputs()));
   for (const id of ["#th-bg", "#th-panel", "#th-ink", "#th-accent", "#th-action", "#th-dialogue"]) {
-    $(id)?.addEventListener("input", () => applyTheme("custom", readThemeInputs()));
+    $(id)?.addEventListener("input", paintTheme);
   }
 
   $("#btn-regex-new")?.addEventListener("click", () => openRegexForm(null));
@@ -5170,7 +5481,7 @@ async function init() {
   });
   $("#btn-forge-polish")?.addEventListener("click", async () => {
     try {
-      const chars = await listCharacters();
+      const chars = await getCharacters();
       const ch = chars.find((c) => c.id === ui.characterId) || chars[0];
       if (!ch) {
         window.alert("No character to polish yet.");

@@ -42,6 +42,11 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   touchChat, exportVaultToJSON({includeKeys}), importVaultFromJSON(data,{merge}),
   seedIfEmpty(defaults). DB v1→v2 upgrade only ADDS regex_rules; old vaults
   without that table still import (table optional).
+  REVISION COUNTER: every write (putRec/delRec/clearStore/setDefaultPersona/
+  deleteChat) bumps `rev`; `getRev()` is the single source of truth for "has
+  the data changed since I last painted?". The UI uses it to cache the
+  character table and to skip redundant view rebuilds. Add a bump to any NEW
+  write path — a missed one shows stale UI.
 - `js/app.js` — UI coordinator. Owns `ui={characterId,chatId,personaId,presetId}` in
   localStorage, drawer rendering, composer, streaming send path, swipe groups
   (`swipe_group_id`/`swipe_active`) + retry/continue/impersonate/edit/delete,
@@ -55,6 +60,14 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   Swipe variants and branches are the same tree shape (two rows, one parent):
   picking a variant re-roots the chain, `groupRows(chain, allRows, pathIds)`
   resolves groups against ALL rows so off-chain variants stay reachable.
+  RENDER RULES (battery): `renderRich` = escapeHtml → split(/\n{2,}/) → one
+  `renderParagraphInner` per paragraph. `createLiveRenderer` streams a reply
+  incrementally: finished paragraphs are committed to the DOM once, only the
+  trailing partial paragraph is re-rendered, and all painting is coalesced to
+  one `requestAnimationFrame` (`frameOnce`). Output is byte-identical to
+  `renderRich` — `tools/stream-equiv.test.mjs` proves it over 96k cases.
+  NEVER re-render a whole bubble per token. `getRev()` + `viewSignature`
+  decide whether a view needs rebuilding at all.
 - `js/prompt-engine.js` — pure context pipeline: resolveMacros, estimateTokens,
   scanLorebook, injectAtDepth, applyTokenBudget, buildMessages (+reasoningStyle
   softener), normalizeAgentic (strict user/assistant alternation, final user).
@@ -163,3 +176,27 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   live tail, radar halo on the current leaf, fork diamonds, zoom-in labels,
   dot-grid backdrop, and hit-testing in graph space (no per-node hit circles).
   No DB migration; existing chats keep working (null leaf = linear chain).
+- v1.7.1 DONE: iOS battery pass — no feature cuts, no DB migration. STREAMING
+  (the big one): the live path used to run `renderRich(acc)` + a full
+  `innerHTML` re-parse of the whole bubble on EVERY token, which is O(n²) in
+  both markdown regexes and DOM parse. Now `createLiveRenderer` commits each
+  finished paragraph to the DOM exactly once and re-renders only the trailing
+  partial paragraph, coalesced to one `requestAnimationFrame` per frame
+  (`frameOnce`); the thought trace moved to 10Hz so `estimateTokens()` (O(len))
+  left the per-token path. Output is byte-identical — proven by
+  `tools/stream-equiv.test.mjs` (96k comparisons, 0 failures) and measured at
+  ~6.4x faster JS-side by `tools/stream-bench.mjs`. INPUT: `trackKeyboard`
+  batches `visualViewport` resize/scroll to one write per frame (each
+  `--kb-offset` write invalidated style for the whole document); the composer
+  uses CSS `field-sizing: content` where supported (zero JS layout per
+  keystroke) with the measured fallback kept for older engines; character and
+  preset search are debounced. GRAPH: `pointermove` is frame-coalesced with a
+  cached rect, the animated dash-flow tail dropped 18 → 6 strokes, and a new
+  Animations toggle (`motion`, defaults to the OS `prefers-reduced-motion`)
+  stops the infinite SVG repaints. RENDERING: `db.js` now exports `getRev()`
+  (bumped by every write) so views re-render only when their data actually
+  changed, and the character table is cached against it. Also: real 180/192/512
+  PNG app icons (iOS cannot use SVG for `apple-touch-icon` and was screenshotting
+  the page), SW navigation timeout so an offline cold start does not keep the
+  radio awake, `overscroll-behavior: contain` on inner scrollers.
+  `tools/boot.test.mjs` runs the real `init()` against DOM/IDB stubs.

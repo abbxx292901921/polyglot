@@ -80,11 +80,22 @@ body {
   flex-direction: column;
   gap: 10px;
   -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
 }
 .empty { color: var(--muted); text-align: center; margin-top: 20vh; }
 .empty small { display: block; margin-top: 6px; }
 
-.msg { max-width: 88%; padding: 10px 12px; border-radius: var(--radius); word-wrap: break-word; }
+/* NOTE: content-visibility was evaluated for .msg and rejected — the bubbles
+   are flex items that shrink-to-fit their content, and the size containment
+   that content-visibility implies collapses off-screen bubbles to zero width.
+   The transcript stays cheap because a chat is only re-rendered when its
+   data actually changed (see the view signature logic in app.js). */
+.msg {
+  max-width: 88%;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  word-wrap: break-word;
+}
 .msg.user { align-self: flex-end; background: var(--bubble-user); }
 .msg.assistant { align-self: flex-start; background: var(--bubble-ai); border: 1px solid var(--line); }
 .msg .who { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
@@ -113,6 +124,9 @@ body {
   flex: 1;
   resize: none;
   max-height: 38vh;
+  /* Where the engine supports it, the browser sizes the field to its
+     content — no per-keystroke layout measurement in JS at all. */
+  field-sizing: content;
   background: var(--panel);
   color: var(--ink);
   border: 1px solid var(--line);
@@ -149,7 +163,7 @@ body.generating #stop { display: block; }
 .drawer header { display: flex; align-items: center; padding: 12px; border-bottom: 1px solid var(--line); }
 .drawer header h2 { font-size: 15px; margin: 0; }
 .drawer header button { margin-left: auto; }
-.drawer .body { padding: 12px; overflow-y: auto; font-size: 14px; color: var(--muted); }
+.drawer .body { padding: 12px; overflow-y: auto; font-size: 14px; color: var(--muted); overscroll-behavior: contain; }
 .sec { margin-bottom: 16px; }
 .sec h3 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); margin: 0 0 8px; display: flex; align-items: center; gap: 8px; }
 .list { display: flex; flex-direction: column; gap: 6px; }
@@ -187,11 +201,11 @@ details.thought .thought-body { padding: 6px 10px 10px; font-size: 13px; color: 
 .sheet header { display: flex; align-items: center; padding: 12px; border-bottom: 1px solid var(--line); }
 .sheet header h2 { font-size: 16px; margin: 0; }
 .sheet header button { margin-left: auto; }
-.sheet .mbody { padding: 12px; overflow-y: auto; }
+.sheet .mbody { padding: 12px; overflow-y: auto; overscroll-behavior: contain; }
 .sheet h3 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); }
 .avrow { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
 .av { width: 56px; height: 56px; border-radius: 50%; object-fit: cover; background: var(--panel); border: 1px solid var(--line); }
-.diag { background: #0a0f1c; border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; font: 11px/1.5 ui-monospace, monospace; color: var(--muted); max-height: 160px; overflow-y: auto; white-space: pre-wrap; }
+.diag { background: #0a0f1c; border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; font: 11px/1.5 ui-monospace, monospace; color: var(--muted); max-height: 160px; overflow-y: auto; white-space: pre-wrap; overscroll-behavior: contain; }
 #btn-imp { flex: 0 0 auto; }
 
 /* Phase 4: top tabs + centered views (Agnai-style, Polyglot theme) */
@@ -224,6 +238,7 @@ details.thought .thought-body { padding: 6px 10px 10px; font-size: 13px; color: 
   flex: 1 1 auto;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
 }
 #views .view[hidden] { display: none; }
 #views .wrap {
@@ -344,6 +359,12 @@ details.thought .thought-body { padding: 6px 10px 10px; font-size: 13px; color: 
   .gn-edge.flow { animation: none; stroke-dasharray: none; }
   .gn-halo { animation: none; }
 }
+/* "Calm" mode (Settings → Animations off) stops the infinite dash crawl and
+   radar spin. WebKit repaints SVG strokes on the CPU, so these are the only
+   always-on drains in the app. */
+html.calm .gn-edge.flow { animation: none; stroke-dasharray: none; }
+html.calm .gn-halo { animation: none; }
+html.calm .graph-sheet { animation: none; }
 
 /* Slim graph entry row above the transcript. */
 .graph-open-row { display: flex; justify-content: flex-end; padding: 6px 12px 0; }

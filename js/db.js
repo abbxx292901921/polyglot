@@ -7,6 +7,14 @@ import { DB_NAME, DB_VERSION } from "./config.js";
 
 let dbp = null;
 
+// Monotonic revision counter. Every write bumps it, so the UI can tell
+// whether a cached render is still current and skip a redundant rebuild
+// (and the DB read behind it) without having to guess at invalidation.
+let rev = 0;
+export function getRev() {
+  return rev;
+}
+
 function reqToPromise(req) {
   return new Promise((resolve, reject) => {
     req.onsuccess = () => resolve(req.result);
@@ -92,6 +100,7 @@ async function getById(name, id) {
 }
 
 async function putRec(name, rec) {
+  rev++;
   const db = await openDB();
   const tx = db.transaction(name, "readwrite");
   const req = tx.objectStore(name).put(rec);
@@ -105,6 +114,7 @@ async function putRec(name, rec) {
 }
 
 async function delRec(name, id) {
+  rev++;
   const db = await openDB();
   const tx = db.transaction(name, "readwrite");
   tx.objectStore(name).delete(id);
@@ -116,6 +126,7 @@ async function delRec(name, id) {
 }
 
 async function clearStore(name) {
+  rev++;
   const db = await openDB();
   const tx = db.transaction(name, "readwrite");
   tx.objectStore(name).clear();
@@ -170,6 +181,7 @@ export function savePersona(p) {
 }
 
 export async function setDefaultPersona(id) {
+  rev++;
   const all = await getAll("personas");
   const db = await openDB();
   const tx = db.transaction("personas", "readwrite");
@@ -204,6 +216,7 @@ export function touchChat(chat) {
 }
 
 export async function deleteChat(id) {
+  rev++;
   const msgs = await getByIndex("messages", "chat_id", id);
   const db = await openDB();
   const tx = db.transaction("messages", "readwrite");

@@ -12,7 +12,7 @@
   <meta name="apple-mobile-web-app-title" content="Polyglot" />
   <link rel="manifest" href="./manifest.json" />
   <link rel="icon" type="image/svg+xml" href="./icons/icon.svg" />
-  <link rel="apple-touch-icon" href="./icons/icon.svg" />
+  <link rel="apple-touch-icon" sizes="180x180" href="./icons/icon-180.png" />
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
@@ -20,7 +20,7 @@
     <header class="topbar">
       <button id="btn-left" class="iconbtn" aria-label="Open library">&#9776;</button>
       <h1>Polyglot</h1>
-      <span id="ver" class="ver">v1.7.0</span>
+      <span id="ver" class="ver">v1.7.1</span>
       <div class="spacer"></div>
       <button id="btn-right" class="iconbtn" aria-label="Open settings">&#9881;</button>
     </header>
@@ -376,6 +376,7 @@
         <label class="checkline"><input type="checkbox" id="tg-stream" checked /> Stream response as generated</label>
         <label class="checkline"><input type="checkbox" id="tg-thought" checked /> Show Thought Trace</label>
         <label class="checkline"><input type="checkbox" id="tg-haptic" checked /> Haptics (Android vibrate)</label>
+        <label class="checkline"><input type="checkbox" id="tg-motion" checked /> Animations (graph dash flow &amp; radar)</label>
       </section>
       <section class="sec">
         <h3>Theme &amp; text colors</h3>

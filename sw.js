@@ -4,7 +4,7 @@
    - API calls (cross-origin or /chat/completions, /v1/, /messages): never cached.
 */
 
-const CACHE = "polyglot-v1.7.0";
+const CACHE = "polyglot-v1.7.1";
 const ASSETS = [
   "./",
   "./index.html",
@@ -22,7 +22,10 @@ const ASSETS = [
   "./js/regex-engine.js",
   "./js/stages.js",
   "./js/supervisor.js",
-  "./icons/icon.svg"
+  "./icons/icon.svg",
+  "./icons/icon-180.png",
+  "./icons/icon-192.png",
+  "./icons/icon-512.png"
 ];
 
 self.addEventListener("install", (event) => {
@@ -55,6 +58,19 @@ function isApiRequest(url) {
   );
 }
 
+// Caps how long a navigation waits on the network. Offline (or a captive
+// portal) a fetch can hang for many seconds while the radio stays awake —
+// fall back to the cached shell instead.
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("E_SW_TIMEOUT: network timeout")), ms);
+    promise.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); }
+    );
+  });
+}
+
 self.addEventListener("fetch", (event) => {
   const req = event.request;
   if (req.method !== "GET") return;
@@ -66,13 +82,17 @@ self.addEventListener("fetch", (event) => {
   // Navigations: network first for instant updates, cache fallback offline.
   if (req.mode === "navigate") {
     event.respondWith(
-      fetch(req)
-        .then((res) => {
+      (async () => {
+        try {
+          const res = await withTimeout(fetch(req), 2500);
           const copy = res.clone();
-          caches.open(CACHE).then((cache) => cache.put("./index.html", copy));
+          caches.open(CACHE).then((cache) => cache.put("./index.html", copy)).catch(() => {});
           return res;
-        })
-        .catch(() => caches.match("./index.html").then((r) => r || caches.match("./")))
+        } catch {
+          const hit = await caches.match("./index.html");
+          return hit || caches.match("./");
+        }
+      })()
     );
     return;
   }
