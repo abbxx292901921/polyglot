@@ -242,6 +242,10 @@ export async function sendChat({ provider, preset, connection, samplers, message
   const { body, notes } = buildPayload(effPreset, messages);
   if (onNote) for (const n of notes) { try { onNote(n); } catch { /* notes never break send */ } }
   const headers = { "Content-Type": "application/json" };
+  // NVIDIA's official clients send Accept based on stream: SSE dispatch
+  // through third-party inference fronts hangs up without it.
+  if (body.stream) headers.Accept = "text/event-stream";
+  else headers.Accept = "application/json";
   if (effConn.api_key) headers.Authorization = "Bearer " + effConn.api_key;
 
   let res;
