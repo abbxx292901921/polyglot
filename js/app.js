@@ -147,6 +147,9 @@ function prefersReducedMotion() {
   }
 }
 
+// How the character-card image appears in the transcript.
+const AVATAR_MODES = ["off", "header", "background", "both"];
+
 function getToggles() {
   try {
     const t = JSON.parse(localStorage.getItem("polyglot.toggles") || "null");
@@ -156,11 +159,12 @@ function getToggles() {
         thought: t.thought !== false,
         haptic: t.haptic !== false,
         // Animations default to whatever the OS asks for.
-        motion: typeof t.motion === "boolean" ? t.motion : !prefersReducedMotion()
+        motion: typeof t.motion === "boolean" ? t.motion : !prefersReducedMotion(),
+        avatar: AVATAR_MODES.includes(t.avatar) ? t.avatar : "header"
       };
     }
   } catch { /* fall through to defaults */ }
-  return { stream: true, thought: true, haptic: true, motion: !prefersReducedMotion() };
+  return { stream: true, thought: true, haptic: true, motion: !prefersReducedMotion(), avatar: "header" };
 }
 
 // "Calm" mode stops the graph's infinite dash/halo animations, which repaint
@@ -173,6 +177,78 @@ function applyMotionClass() {
 function saveToggles(tg) {
   localStorage.setItem("polyglot.toggles", JSON.stringify(tg));
   localStorage.setItem("polyglot.haptic", tg.haptic ? "on" : "off");
+}
+
+// ---------- Chat avatars ----------
+function avatarMode() {
+  const m = getToggles().avatar;
+  return AVATAR_MODES.includes(m) ? m : "header";
+}
+
+function headerAvatarsOn() {
+  const m = avatarMode();
+  return m === "header" || m === "both";
+}
+
+function backgroundAvatarsOn() {
+  const m = avatarMode();
+  return m === "background" || m === "both";
+}
+
+function initialOf(name) {
+  const s = String(name || "").trim();
+  return (s ? s[0] : "?").toUpperCase();
+}
+
+// The message-side avatar. With no card image we fall back to an initial
+// badge so the column stays aligned; the assistant image doubles as a
+// shortcut to the character card.
+function buildMsgAvatar(role, name, src, enabled = headerAvatarsOn()) {
+  if (!enabled) return null;
+  if (src) {
+    const img = avatarImg(src, "msgav");
+    if (role !== "assistant") return img;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "msgavbtn";
+    btn.title = `Open ${name || "character"}'s card`;
+    btn.setAttribute("aria-label", `Open ${name || "character"}'s character card`);
+    btn.append(img);
+    btn.addEventListener("click", () => {
+      if (ui.characterId != null) openDetail(ui.characterId);
+    });
+    return btn;
+  }
+  const av = document.createElement("div");
+  av.className = "msgav initial";
+  av.textContent = initialOf(name);
+  av.setAttribute("aria-hidden", "true");
+  return av;
+}
+
+function avatarBgUrl(src) {
+  const s = String(src || "");
+  // Card art is stored as a data URL. Refuse network URLs so a hand-edited
+  // vault cannot turn the chat backdrop into a tracker.
+  if (!/^(data:image\/|blob:)/i.test(s)) return "";
+  return `url("${s.replace(/["\\\n\r]/g, "")}")`;
+}
+
+let chatBgSrc = null;
+function applyChatBackground(ch) {
+  const layer = $("#chat-bg");
+  if (!layer) return;
+  const src = backgroundAvatarsOn() ? String(ch?.avatar || "") : "";
+  if (src === chatBgSrc) return;
+  chatBgSrc = src;
+  const url = avatarBgUrl(src);
+  if (url) {
+    layer.style.setProperty("--chat-bg-image", url);
+    layer.classList.add("on");
+  } else {
+    layer.style.removeProperty("--chat-bg-image");
+    layer.classList.remove("on");
+  }
 }
 
 // Character rows carry base64 avatars, so re-reading the table is expensive.
@@ -365,9 +441,43 @@ function frameOnce(fn) {
   return schedule;
 }
 
+// Sticky-bottom following for the transcript. While the user sits at (or
+// near) the bottom, the view follows the generation so the newest tokens
+// stay in view. The moment they scroll up to read, we stop dragging the
+// view along at token speed; scrolling back down near the bottom (or
+// tapping the jump pill) re-arms it. Reading stays at the reader's pace.
+let followBottom = true;
+let followScrollWired = false;
+const FOLLOW_SLACK_PX = 96; // finger-jitter tolerance for "at the bottom"
+function chatNearBottom(c) {
+  return c.scrollHeight - c.scrollTop - c.clientHeight <= FOLLOW_SLACK_PX;
+}
+// Snap to the very bottom regardless of follow state (explicit intent).
 function scrollBottom() {
   const c = $("#chat");
   if (c) c.scrollTop = c.scrollHeight;
+}
+// Follow the tail only while the user hasn't scrolled up.
+function followTail() {
+  if (!followBottom) return;
+  const c = $("#chat");
+  if (c) c.scrollTop = c.scrollHeight;
+}
+function syncJumpPill() {
+  const pill = $("#chat-jump");
+  if (pill) pill.hidden = followBottom;
+}
+// Keep the follow flag honest: scroll events fire only when scrollTop
+// actually changes (user scroll or our own snap), never on content growth,
+// so a big token burst can never masquerade as the user scrolling up.
+function wireFollowScroll() {
+  const c = $("#chat");
+  if (!c || followScrollWired) return;
+  followScrollWired = true;
+  c.addEventListener("scroll", () => {
+    followBottom = chatNearBottom(c);
+    syncJumpPill();
+  }, { passive: true });
 }
 
 // Debounce: search boxes rebuild a whole card list, so a burst of keystrokes
@@ -425,11 +535,19 @@ function applyPromptMessages(messages, rules, characterId) {
   return { messages: out, skipped };
 }
 
-function paintShell(role, who) {
+function paintShell(role, who, opts = {}) {
+  const { avatar = null, withAvatar = true } = opts;
   const empty = $("#empty");
   if (empty) empty.remove();
   const div = document.createElement("div");
   div.className = `msg ${role}`;
+  const main = document.createElement("div");
+  main.className = "msgmain";
+  const av = withAvatar ? buildMsgAvatar(role, who, avatar) : null;
+  if (av) {
+    div.append(av);
+    div.classList.add("has-av");
+  }
   const w = document.createElement("div");
   w.className = "who";
   w.textContent = who;
@@ -443,15 +561,20 @@ function paintShell(role, who) {
   det.append(sum, tb);
   det.style.display = "none";
   const body = document.createElement("div");
+  body.className = "msgbody";
   body.innerHTML = renderRich("");
-  div.append(w, det, body);
+  main.append(w, det, body);
+  div.append(main);
   $("#chat").append(div);
+  // A fresh reply (or the opening message) re-arms following.
+  followBottom = true;
   scrollBottom();
+  syncJumpPill();
   return { div, det, sum, tb, body };
 }
 
 function paintError(text) {
-  const s = paintShell("assistant", "Polyglot");
+  const s = paintShell("assistant", "Polyglot", { withAvatar: false });
   s.det.remove();
   s.body.innerHTML = renderRich(text);
   s.body.classList.add("err");
@@ -460,6 +583,9 @@ function paintError(text) {
 
 function clearChatView(emptyText = "No messages yet. Say hello.") {
   $("#chat").innerHTML = `<div class="empty" id="empty">${escapeHtml(emptyText)}</div>`;
+  // An empty transcript has no "parked above the tail" state.
+  followBottom = true;
+  syncJumpPill();
 }
 
 async function ensureSelection() {
@@ -1421,15 +1547,17 @@ function openEditorBubble(div, msg, onSave) {
   });
   const cancel = actionButton("Cancel", "Cancel edit", () => renderCurrentChat());
   row.append(save, cancel);
-  div.append(ta, row);
+  const host = div.querySelector(".msgmain") || div;
+  host.append(ta, row);
   ta.focus();
 }
 
-async function renderCurrentChat() {
+async function renderCurrentChat(opts = {}) {
   await ensureSelection();
   await getRegexRules();
   if (ui.chatId == null) {
     if (ui.characterId == null) {
+      applyChatBackground(null);
       clearBranchbar();
       clearChatView("No characters yet. Tap ☰ to create or import one.");
       return;
@@ -1438,10 +1566,11 @@ async function renderCurrentChat() {
     if (!mine.length) {
       const chars = await getCharacters();
       const ch = chars.find((c) => c.id === ui.characterId);
+      applyChatBackground(ch);
       clearBranchbar();
       $("#chat").innerHTML = "";
       if (ch?.first_mes) {
-        const s = paintShell("assistant", ch.name);
+        const s = paintShell("assistant", ch.name, { avatar: ch.avatar });
         s.det.remove();
         s.body.innerHTML = renderMsg(ch.first_mes);
         s.body.classList.add("msgbody");
@@ -1459,15 +1588,23 @@ async function renderCurrentChat() {
   const me = personas.find((p) => p.id === ui.personaId);
   const chName = ch?.name || "Polyglot";
   const meName = me?.name || "You";
+  const avOn = headerAvatarsOn();
+  const showThought = getToggles().thought;
+  applyChatBackground(ch);
   renderBranchbar(rows, { leafId, latestId, hidden });
+  // keepScroll (a generation just finished): preserve the reader's place if
+  // they scrolled up. A default render means fresh intent (open/send/edit).
+  const keepScroll = !!opts.keepScroll;
+  const chatEl = keepScroll ? $("#chat") : null;
+  const prevDist = chatEl ? chatEl.scrollHeight - chatEl.scrollTop : null;
   $("#chat").innerHTML = "";
   if (!rows.length) {
     if (ch?.first_mes) {
-      const s = paintShell("assistant", chName);
+      const s = paintShell("assistant", chName, { avatar: ch.avatar });
       s.det.remove();
       s.body.innerHTML = renderMsg(ch.first_mes);
     } else {
-      const s = paintShell("assistant", "Polyglot");
+      const s = paintShell("assistant", "Polyglot", { withAvatar: false });
       s.det.remove();
       s.body.innerHTML = renderRich("*ready* This chat is stored on-device.");
     }
@@ -1480,7 +1617,14 @@ async function renderCurrentChat() {
     if (it.kind === "user") {
       const div = document.createElement("div");
       div.className = "msg user";
-      div.innerHTML = `<div class="who">${escapeHtml(meName)}</div>`;
+      const av = buildMsgAvatar("user", meName, me?.avatar, avOn);
+      if (av) {
+        div.append(av);
+        div.classList.add("has-av");
+      }
+      const main = document.createElement("div");
+      main.className = "msgmain";
+      main.innerHTML = `<div class="who">${escapeHtml(meName)}</div>`;
       const body = document.createElement("div");
       body.className = "msgbody";
       body.innerHTML = renderMsg(it.msg.content);
@@ -1504,7 +1648,8 @@ async function renderCurrentChat() {
           await renderCurrentChat();
         })
       );
-      div.append(body, acts);
+      main.append(body, acts);
+      div.append(main);
       $("#chat").append(div);
       return;
     }
@@ -1514,11 +1659,18 @@ async function renderCurrentChat() {
     const idx = sibs.indexOf(active);
     const div = document.createElement("div");
     div.className = "msg assistant";
+    const av = buildMsgAvatar("assistant", chName, ch?.avatar, avOn);
+    if (av) {
+      div.append(av);
+      div.classList.add("has-av");
+    }
+    const main = document.createElement("div");
+    main.className = "msgmain";
     const who = document.createElement("div");
     who.className = "who";
     who.textContent = chName;
-    div.append(who);
-    if (active.reasoning_content && getToggles().thought) {
+    main.append(who);
+    if (active.reasoning_content && showThought) {
       const det = document.createElement("details");
       det.className = "thought";
       const sum = document.createElement("summary");
@@ -1527,12 +1679,12 @@ async function renderCurrentChat() {
       tb.className = "thought-body";
       tb.textContent = active.reasoning_content;
       det.append(sum, tb);
-      div.append(det);
+      main.append(det);
     }
     const body = document.createElement("div");
     body.className = "msgbody";
     body.innerHTML = renderMsg(active.content);
-    div.append(body);
+    main.append(body);
     const acts = document.createElement("div");
     acts.className = "acts";
     if (sibs.length > 1) {
@@ -1573,10 +1725,19 @@ async function renderCurrentChat() {
     if (isLast) {
       acts.append(actionButton("▶| Continue", "Continue this reply", () => handleContinue()));
     }
-    div.append(acts);
+    main.append(acts);
+    div.append(main);
     $("#chat").append(div);
   });
-  scrollBottom();
+  if (prevDist != null && !followBottom) {
+    // Reader is parked above the tail: put content back where they left it.
+    const c = $("#chat");
+    if (c) c.scrollTop = Math.max(0, c.scrollHeight - prevDist);
+  } else {
+    followBottom = true;
+    scrollBottom();
+  }
+  syncJumpPill();
   markViewFresh("chat");
 }
 
@@ -2192,9 +2353,13 @@ async function buildContext(pastRows, extraUserText = "") {
 }
 
 // Streams provider+preset messages into a live shell. Resolves {content, reasoning}.
-async function runStream(preset, provider, messages, shell, signal) {
+// opts.seedText: text that is already on screen (Continue) — the live
+// renderer replays it through the same paragraph rules, so the bubble never
+// blinks empty while the reply grows.
+async function runStream(preset, provider, messages, shell, signal, opts = {}) {
   const t0 = Date.now();
   const tg = getToggles();
+  const seedText = opts.seedText ? String(opts.seedText) : "";
   let acc = "";
   let accThink = "";
   // Live rendering is incremental (createLiveRenderer) and coalesced to one
@@ -2203,7 +2368,10 @@ async function runStream(preset, provider, messages, shell, signal) {
   const live = tg.stream ? createLiveRenderer(shell.body) : null;
   if (live) {
     live.reset();
+    if (seedText) live.push(seedText);
     live.draw();
+  } else if (seedText) {
+    shell.body.innerHTML = renderMsg(seedText);
   }
   let thinkAt = 0;
   const paint = frameOnce(() => {
@@ -2218,7 +2386,7 @@ async function runStream(preset, provider, messages, shell, signal) {
       const secs = ((now - t0) / 1000).toFixed(1);
       shell.sum.textContent = `💭 Thought Trace (${secs}s • ~${estimateTokens(accThink)} tok) [Tap to view]`;
     }
-    scrollBottom();
+    followTail();
   });
   const { content, reasoning } = await sendChat({
     provider: provider || undefined,
@@ -2232,13 +2400,13 @@ async function runStream(preset, provider, messages, shell, signal) {
     onNote: (n) => { try { logWarn("E_REASONING", n); } catch { /* notes never break send */ } }
   });
   paint.cancel();
-  shell.body.innerHTML = renderMsg(content || acc);
+  shell.body.innerHTML = renderMsg(seedText + (content || acc));
   if ((reasoning || accThink) && tg.thought) {
     shell.det.style.display = "";
     shell.tb.textContent = reasoning || accThink;
   }
   shell.det.open = false;
-  scrollBottom();
+  followTail();
   return { content: content || acc, reasoning: reasoning || accThink };
 }
 
@@ -2333,7 +2501,7 @@ async function runStagePostpass(chatId, assistantText) {
 
 // Fresh assistant reply for history rows (+ optional trailing user text already saved).
 async function generateAssistant(chatId, pastRows, { groupId = null, titleHint = "" } = {}) {
-  const { preset, provider, chName, built } = await buildContext(pastRows);
+  const { preset, provider, ch, chName, built } = await buildContext(pastRows);
   if (!presetModel(preset)) {
     const lastUser = [...pastRows].reverse().find((m) => m.role === "user");
     const reply = offlineEcho(lastUser?.content || "", chName);
@@ -2350,7 +2518,7 @@ async function generateAssistant(chatId, pastRows, { groupId = null, titleHint =
     await renderCurrentChat();
     return;
   }
-  const shell = paintShell("assistant", chName);
+  const shell = paintShell("assistant", chName, { avatar: ch?.avatar });
   document.body.classList.add("generating");
   aborter = new AbortController();
   try {
@@ -2382,7 +2550,7 @@ async function generateAssistant(chatId, pastRows, { groupId = null, titleHint =
     aborter = null;
     document.body.classList.remove("generating");
     refreshDiag();
-    if (ui.chatId === chatId) await renderCurrentChat();
+    if (ui.chatId === chatId) await renderCurrentChat({ keepScroll: true });
     await refreshLibrary();
   }
 }
@@ -2466,7 +2634,7 @@ async function handleContinue() {
     return;
   }
   // Append to the last assistant message.
-  const { preset, provider, chName } = await buildContext(rows.slice(0, -1));
+  const { preset, provider, ch, chName } = await buildContext(rows.slice(0, -1));
   if (!presetModel(preset)) {
     const more = " *(nods along, offline echo continues.)*";
     await saveMessage({ ...last, content: last.content + more });
@@ -2475,13 +2643,12 @@ async function handleContinue() {
   }
   // History keeps the partial reply as the final assistant message (no prefill).
   const ctx = await buildContext(rows);
-  const shell = paintShell("assistant", chName);
-  // Seed the shell with the existing partial text.
-  shell.body.innerHTML = renderMsg(last.content);
+  const shell = paintShell("assistant", chName, { avatar: ch?.avatar });
+  // The existing partial reply stays on screen while it continues.
   document.body.classList.add("generating");
   aborter = new AbortController();
   try {
-    const { content, reasoning } = await runStream(preset, provider, ctx.built.messages, shell, aborter.signal);
+    const { content, reasoning } = await runStream(preset, provider, ctx.built.messages, shell, aborter.signal, { seedText: last.content });
     await saveMessage({
       ...last,
       content: last.content + (content || ""),
@@ -2502,7 +2669,7 @@ async function handleContinue() {
     aborter = null;
     document.body.classList.remove("generating");
     refreshDiag();
-    if (ui.chatId === chatId) await renderCurrentChat();
+    if (ui.chatId === chatId) await renderCurrentChat({ keepScroll: true });
     await refreshLibrary();
   }
 }
@@ -2512,7 +2679,7 @@ async function handleImpersonate() {
   const chatId = await ensureChat();
   const { chain } = await getChatChain(chatId);
   const rows = chain;
-  const { preset, provider, meName } = await buildContext(rows);
+  const { preset, provider, me, meName } = await buildContext(rows);
   triggerHaptic(10);
   if (!presetModel(preset)) {
     const text = "*leans forward, offline echo as you.* \"No model set — open ⚙ and add a preset.\"";
@@ -2532,7 +2699,7 @@ async function handleImpersonate() {
     role: "system",
     content: `Now write ${meName}'s next message in first person as ${meName}. Reply ONLY with that message, no narration about the task.`
   });
-  const shell = paintShell("user", meName);
+  const shell = paintShell("user", meName, { avatar: me?.avatar });
   document.body.classList.add("generating");
   aborter = new AbortController();
   try {
@@ -2557,7 +2724,7 @@ async function handleImpersonate() {
     aborter = null;
     document.body.classList.remove("generating");
     refreshDiag();
-    if (ui.chatId === chatId) await renderCurrentChat();
+    if (ui.chatId === chatId) await renderCurrentChat({ keepScroll: true });
     await refreshLibrary();
   }
 }
@@ -3292,7 +3459,9 @@ function showView(name) {
   document.querySelectorAll("#tabs button").forEach((b) =>
     b.classList.toggle("active", b.dataset.view === name || (name === "detail" && b.dataset.view === "chars")));
   const inChat = name === "chat";
-  $("#chat").style.display = inChat ? "" : "none";
+  const chatArea = $("#chat-area");
+  if (chatArea) chatArea.style.display = inChat ? "" : "none";
+  else $("#chat").style.display = inChat ? "" : "none";
   $("#composer").style.display = inChat ? "" : "none";
   const bb = $("#branchbar");
   if (bb && !inChat) bb.hidden = true;
@@ -5717,7 +5886,7 @@ async function narrateGameEvents(key) {
   const narrated = session.pending.slice();
   const chatId = await ensureChat();
   const { chain } = await getChatChain(chatId);
-  const { preset, provider, chName, built } = await buildContext(chain);
+  const { preset, provider, ch, chName, built } = await buildContext(chain);
   const lib = await gameLibrary();
   const g = lib.find((x) => x.key === key);
   const label = (g && g.name) || key;
@@ -5730,7 +5899,7 @@ async function narrateGameEvents(key) {
       + ". Be vivid, stay in the scene, and do not recite the numbers as game statistics.]\n"
       + (events || "(the game moved)")
   });
-  const shell = paintShell("assistant", chName);
+  const shell = paintShell("assistant", chName, { avatar: ch?.avatar });
   document.body.classList.add("generating");
   aborter = new AbortController();
   try {
@@ -5771,7 +5940,7 @@ async function narrateGameEvents(key) {
     aborter = null;
     document.body.classList.remove("generating");
     refreshDiag();
-    if (ui.chatId === chatId) await renderCurrentChat();
+    if (ui.chatId === chatId) await renderCurrentChat({ keepScroll: true });
     await refreshLibrary();
     await refreshGameCard(key);
   }
@@ -5908,6 +6077,13 @@ function currentThemeVars() {
   }
 }
 
+function hexToRgb(hex) {
+  const m = /^#([0-9a-f]{6})$/i.exec(String(hex || ""));
+  if (!m) return { r: 15, g: 20, b: 32 };
+  const n = parseInt(m[1], 16);
+  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
+
 function applyTheme(name, vars = null) {
   const base = THEMES[name] || (name === "custom" ? THEMES.polyglot : THEMES.polyglot);
   const v = vars || base;
@@ -5921,6 +6097,11 @@ function applyTheme(name, vars = null) {
   root.style.setProperty("--accent", v.accent);
   root.style.setProperty("--action", v.action);
   root.style.setProperty("--dialogue", v.dialogue);
+  // Scrim for the chat backdrop follows the theme background so light
+  // themes get a pale wash instead of a dark one.
+  const rgb = hexToRgb(v.bg);
+  root.style.setProperty("--chat-scrim-a", `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.55)`);
+  root.style.setProperty("--chat-scrim-b", `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.82)`);
   const meta = document.querySelector('meta[name="theme-color"]');
   if (meta) meta.setAttribute("content", v.bg);
   localStorage.setItem("polyglot.theme", name);
@@ -6040,6 +6221,13 @@ async function init() {
       const sm = $("#starter-modal");
       if (sm) sm.hidden = true;
     }
+  });
+  wireFollowScroll();
+  $("#chat-jump")?.addEventListener("click", () => {
+    triggerHaptic(10);
+    followBottom = true;
+    scrollBottom();
+    syncJumpPill();
   });
   $("#send").addEventListener("click", handleSend);
   $("#stop").addEventListener("click", () => {
@@ -6332,6 +6520,7 @@ async function init() {
   if ($("#tg-thought")) $("#tg-thought").checked = tg0.thought;
   if ($("#tg-haptic")) $("#tg-haptic").checked = tg0.haptic;
   if ($("#tg-motion")) $("#tg-motion").checked = tg0.motion;
+  if ($("#avatar-mode")) $("#avatar-mode").value = tg0.avatar;
   localStorage.setItem("polyglot.haptic", tg0.haptic ? "on" : "off");
   applyMotionClass();
 
@@ -6431,6 +6620,11 @@ async function init() {
       if (key === "motion") applyMotionClass();
     });
   }
+  $("#avatar-mode")?.addEventListener("change", async (e) => {
+    const mode = AVATAR_MODES.includes(e.target.value) ? e.target.value : "header";
+    saveToggles({ ...getToggles(), avatar: mode });
+    await renderCurrentChat();
+  });
   $("#theme-preset")?.addEventListener("change", (e) => {
     const name = e.target.value;
     if (name === "custom") {

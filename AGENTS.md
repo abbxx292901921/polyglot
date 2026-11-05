@@ -19,17 +19,19 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   chars-list, view-detail/detail-avatar/detail-name/detail-chat-list,
   view-presets/preset-filter/preset-cards, view-books/books-char-filter/
   book-list, view-regex/regex-list/regex-form/rx-pattern/rx-test-in`), drawers,
-  composer. Drawer IDs consumed by app.js:
+  composer. Chat area is `#chat-area` (holds `#chat-bg` behind `#chat`).
+  Drawer IDs consumed by app.js:
   `ver, update-banner, reload-btn, chat, empty, input, send, stop, btn-left,
   btn-right, drawer-left, drawer-right, backdrop, persona-list, char-list,
   chat-list, btn-new-persona, btn-new-char, btn-new-chat, btn-export, chk-keys,
   file-import, vault-status, preset-list + editor tabs [data-ptab/ppane]
-  (conn-*, sam-*, pr-*, tg-stream/tg-thought/tg-haptic), theme-preset,
-  th-bg/panel/ink/accent/action/dialogue`.
+  (conn-*, sam-*, pr-*, tg-stream/tg-thought/tg-haptic/tg-motion), theme-preset,
+  th-bg/panel/ink/accent/action/dialogue, avatar-mode`.
 - `style.css` — CSS vars (`--action` = `*asterisk*` color, `--dialogue` =
   `"quote"` color), 100dvh layout, safe-area, drawers, bubbles
   (`.action` muted italic, `.dialogue` bright), Phase 1 `.row/.list/.sec` UI,
-  Phase 4 `#tabs/.wrap/.cards-grid/.card/.toolbar/.detail-head/.ptabs/.iconrow`.
+  Phase 4 `#tabs/.wrap/.cards-grid/.card/.toolbar/.detail-head/.ptabs/.iconrow`,
+  chat avatars (`.msgav`, `.msgmain`, `#chat-bg` theme scrim).
 - `manifest.json` — name Polyglot, relative `./` start_url/scope (Pages subpath!).
 - `sw.js` — `CACHE` const + `ASSETS` list. Never cache API (cross-origin or
   `/chat|completions|messages|v1/`). Navigations network-first.
@@ -288,3 +290,40 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   actually landed. ADDED: an endless loop in a game is rejected, because it
   freezes the page it runs in and the host cannot interrupt a frame that
   shares the page's thread.
+- v1.9.0 DONE: character-card avatars in the chat transcript. Settings →
+  Chat appearance → Character avatar in chat chooses next-to-message
+  (SillyTavern-style rounded card image beside each bubble, with an initial
+  badge fallback for missing images and for the persona), chat background
+  (the card image blurred and theme-scrimmed behind the transcript), both,
+  or off. `applyChatBackground` reuses the cached character table and refuses
+  non-data/blob URLs so a hand-edited vault cannot turn the backdrop into a
+  tracker; theme presets feed the scrim color. No DB migration; the setting
+  lives in `polyglot.toggles`.
+- v1.9.0 (NIM/Mistral Large 4 fixes, unreleased on top of the above): NVIDIA
+  NIM sends NO CORS headers (integrate.api.nvidia.com AND docs.api.nvidia.com
+  — both verified live), so browser direct calls fail at the network layer;
+  the reverse-proxy toggle is the only browser path, and a 400 there is the
+  proxy or the base URL, never the payload — NIM answers GET /v1/models 200
+  unauthenticated (verified). FIXED: errMsg swallowed Mistral/FastAPI error
+  bodies ({"detail": ...} / validation arrays) — it now surfaces them, so a
+  provider 4xx shows its real reason in diagnostics + the settings status.
+  ADDED: catalog entries for mistral-large-4 (reasoning_effort none|high,
+  max_tokens INCLUDES reasoning → auto-bump to 16384, default high) and
+  generic mistral, used at SEND time too (catalogLookup fallback when the
+  preset caches no fetch). applyThinking: a descriptor-known knob a model
+  does not offer is skipped with E_MODE_INVALID instead of sent to a 400;
+  unknown models get a loud E_MODE_UNVERIFIED note. Note: the docs page for
+  mistralai/mistral-large-4-1t-a52b embeds its OpenAPI JSON in the RSC
+  payload WITHOUT a fenced block, so fetchReasoningModes falls back to the
+  catalog — by design.
+- v1.9.0 (free the view, on top of the above): the streaming paint loop used
+  to force scrollTop to scrollHeight on every frame, dragging the reader
+  along at token speed. Now a `followBottom` flag tracks a passive scroll
+  listener on #chat (scroll events fire only on real scrollTop changes, never
+  on content growth): near the bottom (≤96px slack) the view follows the
+  generation; any scroll above that stops following, and the new floating
+  "↓ Latest" pill inside #chat-area (#chat-jump) snaps back and re-arms it.
+  Generation-completion re-renders pass keepScroll so a parked reader is no
+  longer yanked to the tail. Swipe/send/edit still re-arm following as
+  explicit intent. ADDED: Continue no longer blanks the bubble — runStream
+  takes seedText and replays the partial reply through the live renderer.

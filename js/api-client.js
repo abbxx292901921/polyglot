@@ -188,12 +188,36 @@ export async function fetchReasoningModes({ model, use_proxy, proxy_url, signal 
 
 function errMsg(status, text) {
   let detail = "";
+  const pick = (v) => (typeof v === "string" && v.trim() ? v.trim() : "");
   try {
     const j = JSON.parse(text);
-    detail = j?.error?.message || j?.message || "";
+    if (j && typeof j === "object") {
+      // FastAPI validation shape: detail is an array of {loc, msg}.
+      if (Array.isArray(j.detail)) {
+        detail = j.detail
+          .map((d) => {
+            if (typeof d === "string") return d;
+            const loc = Array.isArray(d?.loc) ? d.loc.filter((p) => p !== "body").join(".") : "";
+            const msg = pick(d?.msg) || pick(d?.message) || "invalid";
+            return loc ? `${loc}: ${msg}` : msg;
+          })
+          .filter(Boolean)
+          .join("; ");
+      } else {
+        detail =
+          pick(j?.error?.message) ||
+          pick(j?.message) ||
+          pick(j?.detail) ||
+          (typeof j?.error === "string" ? pick(j.error) : "") ||
+          pick(j?.code);
+      }
+    } else {
+      detail = pick(String(j));
+    }
   } catch {
-    detail = text.slice(0, 300);
+    detail = String(text || "").slice(0, 300);
   }
+  detail = detail.slice(0, 300);
   return `E_API_FAIL: request failed (${status})${detail ? ": " + detail : ""}`;
 }
 

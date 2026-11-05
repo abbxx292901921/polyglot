@@ -20,7 +20,7 @@
     <header class="topbar">
       <button id="btn-left" class="iconbtn" aria-label="Open library">&#9776;</button>
       <h1>Polyglot</h1>
-      <span id="ver" class="ver">v1.8.1</span>
+      <span id="ver" class="ver">v1.9.0</span>
       <div class="spacer"></div>
       <button id="btn-right" class="iconbtn" aria-label="Open settings">&#9881;</button>
     </header>
@@ -221,12 +221,16 @@
     </section>
 
     <div id="branchbar" hidden></div>
-    <main id="chat" aria-live="polite">
-      <div class="empty" id="empty">
-        Polyglot is ready. Your chats stay on this device.
-        <small>Phase 0 shell: offline UI test. Real AI wiring lands in Phase 2.</small>
-      </div>
-    </main>
+    <div id="chat-area">
+      <div id="chat-bg" aria-hidden="true"></div>
+      <main id="chat" aria-live="polite">
+        <div class="empty" id="empty">
+          Polyglot is ready. Your chats stay on this device.
+          <small>Phase 0 shell: offline UI test. Real AI wiring lands in Phase 2.</small>
+        </div>
+      </main>
+      <button id="chat-jump" type="button" hidden aria-label="Jump to latest">&#8595; Latest</button>
+    </div>
 
     <section id="composer">
       <button id="btn-imp" class="iconbtn" type="button" title="Write your next line as the AI (impersonate)" aria-label="Impersonate">&#127917;</button>
@@ -414,6 +418,18 @@
         </div>
         <p class="status">Preview: *she smiles* "Hello there" and normal chat text.</p>
         <div class="msg assistant"><div class="msgbody"><p><em class="action">*she smiles*</em> <span class="dialogue">"Hello there"</span> normal chat text</p></div></div>
+      </section>
+      <section class="sec">
+        <h3>Chat appearance</h3>
+        <label class="field">Character avatar in chat
+          <select id="avatar-mode">
+            <option value="header">Next to each message</option>
+            <option value="background">As chat background</option>
+            <option value="both">Message + background</option>
+            <option value="off">Off</option>
+          </select>
+        </label>
+        <p class="status">The background uses the character card image, blurred behind the transcript.</p>
       </section>
       <div class="vaultbtns">
         <button id="btn-save-preset" class="btn" type="button">Save preset</button>

@@ -102,6 +102,17 @@ const CATALOG = [
     hint: "reasoning_effort low|medium|high."
   },
   {
+    match: /mistral-large-4|mistral-4-large/i,
+    effort: { values: ["none", "high"], default: "high" },
+    reasoning_in_max_tokens: true,
+    hint: "reasoning_effort none|high (omitted = none). max_tokens INCLUDES reasoning — keep it 4096+ or replies die mid-thought."
+  },
+  {
+    match: /mistral/i,
+    effort: { values: ["none", "high"], default: "high" },
+    hint: "Mistral ChatCompletionRequest: reasoning_effort none|high (only extra knob; enable_thinking is off by default)."
+  },
+  {
     match: /minimax-m2/i,
     strict_roles: true,
     hint: "No published reasoning knob; strict alternating roles."
@@ -287,7 +298,9 @@ export function mergeReasoning(preset = {}, connection = {}, model = "") {
     kwargs: String(preset.reasoning_kwargs || ""),
     agentic: preset.agentic_format || "auto",
     soften: String(preset?.prompts?.reasoning_style || ""),
-    descriptor: validDescriptor(preset.reasoning_modes, model)
+    // Catalog is the offline source of truth when a preset carries no cached
+    // fetch — the UI already resolves this way, the send path must too.
+    descriptor: validDescriptor(preset.reasoning_modes, model) || catalogLookup(model)
   };
 }
 
@@ -300,28 +313,43 @@ export function applyThinking(body, r) {
   const notes = [];
   const d = r?.descriptor;
   if (!r || r.mode === "off") return notes;
+  // Schema decides when we know the model: sending a knob a model does not
+  // offer is a guaranteed 400 on strict gateways. Unknown model (no schema,
+  // no catalog entry): send as before, but say it was not verified.
+  const unverified = (knob) => notes.push(`E_MODE_UNVERIFIED: ${knob} sent without a schema for ${d?.model || "this model"} — if the provider rejects it (400), set Thinking mode to off or Fetch thinking modes first.`);
 
   if (r.mode === "effort") {
-    let v = String(r.value || d?.effort?.default || "medium").toLowerCase();
+    const v = String(r.value || d?.effort?.default || "high").toLowerCase();
     if (d?.effort?.values) {
-      if (!d.effort.values.includes(v)) {
+      let out = v;
+      if (!d.effort.values.includes(out)) {
         const fallback = d.effort.default || d.effort.values[0];
-        notes.push(`E_MODE_INVALID: effort "${v}" is not offered by ${d.model} (has ${d.effort.values.join("|")}) — using "${fallback}".`);
-        v = fallback;
+        notes.push(`E_MODE_INVALID: effort "${out}" is not offered by ${d.model} (has ${d.effort.values.join("|")}) — using "${fallback}".`);
+        out = fallback;
       }
+      body.reasoning_effort = out;
+    } else if (d) {
+      notes.push(`E_MODE_INVALID: ${d.model} documents no reasoning_effort — knob skipped (400 avoided).`);
+    } else {
+      body.reasoning_effort = v;
+      unverified("reasoning_effort");
     }
-    body.reasoning_effort = v;
   } else if (r.mode === "budget") {
     let b = Number(r.budget);
     if (!Number.isFinite(b)) b = d?.budget?.default ?? 2048;
-    if (d?.budget) {
+    if (d && !d.budget) {
+      notes.push(`E_MODE_INVALID: ${d.model} documents no reasoning_budget — knob skipped (400 avoided).`);
+    } else if (d?.budget) {
       const clamped = Math.min(d.budget.max, Math.max(d.budget.min, b));
       if (clamped !== b) {
         notes.push(`E_MODE_INVALID: reasoning_budget ${b} clamped to ${clamped} (${d.model} allows ${d.budget.min}..${d.budget.max}).`);
         b = clamped;
       }
+      body.reasoning_budget = b;
+    } else {
+      body.reasoning_budget = b;
+      unverified("reasoning_budget");
     }
-    body.reasoning_budget = b;
   } else if (r.mode === "kwargs") {
     const modes = d?.kwargsModes;
     const v = String(r.value || "on");
@@ -329,12 +357,23 @@ export function applyThinking(body, r) {
       body.chat_template_kwargs = { ...modes[v] };
     } else {
       const obj = parseKwargsJson(r.kwargs, notes);
-      if (obj) body.chat_template_kwargs = obj;
-      else if (modes) notes.push(`E_MODE_INVALID: kwargs mode "${v}" unknown for ${d.model} (has ${Object.keys(modes).join("|")}).`);
+      if (obj && d && !modes) {
+        notes.push(`E_MODE_INVALID: ${d.model} documents no chat_template_kwargs — knob skipped (400 avoided).`);
+      } else if (obj) {
+        body.chat_template_kwargs = obj;
+        if (!d) unverified("chat_template_kwargs");
+      } else if (modes) {
+        notes.push(`E_MODE_INVALID: kwargs mode "${v}" unknown for ${d.model} (has ${Object.keys(modes).join("|")}).`);
+      }
     }
   } else if (r.mode === "anthropic") {
-    const b = Math.max(1024, Number(r.budget) || 2048);
-    body.thinking = { type: "enabled", budget_tokens: b };
+    if (d) {
+      notes.push(`E_MODE_INVALID: ${d.model} documents no anthropic thinking knob — knob skipped (400 avoided).`);
+    } else {
+      const b = Math.max(1024, Number(r.budget) || 2048);
+      body.thinking = { type: "enabled", budget_tokens: b };
+      unverified("thinking");
+    }
   } else if (r.mode === "custom") {
     const obj = parseKwargsJson(r.kwargs, notes);
     if (obj) Object.assign(body, obj);
