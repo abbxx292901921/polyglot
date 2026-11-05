@@ -327,3 +327,10 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   longer yanked to the tail. Swipe/send/edit still re-arm following as
   explicit intent. ADDED: Continue no longer blanks the bubble — runStream
   takes seedText and replays the partial reply through the live renderer.
+- v1.9.1 DONE: sendChat now sets Accept: text/event-stream on streaming
+  sends (application/json otherwise), mirroring every official NVIDIA
+  client. NIM proxies third-party/new model fronts (mistral-large-4,
+  glm, minimax lineage) that dispatch on it; direct browser calls without
+  it 400 on models whose Playground path works. No other behavior change.
+  Fix lives behind the v1.9.1 cache bump so the SW ships it — v1.9.0
+  clients kept the old api-client.js via cache-first.
