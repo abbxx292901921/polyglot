@@ -59,6 +59,21 @@ export function buildPayload(preset, messages) {
   if (Number(sam.presence_penalty)) body.presence_penalty = Number(sam.presence_penalty);
 
   let msgs = Array.isArray(messages) ? messages : [];
+  // Empty messages are poison on strict chat templates: Mistral Large 4's
+  // template raises "must have non-empty content" for a null/undefined
+  // message, and an empty assistant greeting (a card with no first_mes) is
+  // exactly that. Drop them before any model sees them.
+  const beforeFilter = msgs.length;
+  msgs = msgs.filter((m) => {
+    if (!m || typeof m !== "object") return false;
+    if (Array.isArray(m.tool_calls) && m.tool_calls.length) return true;
+    if (typeof m.content === "string") return m.content.trim().length > 0;
+    if (Array.isArray(m.content)) return m.content.length > 0;
+    return false;
+  });
+  if (msgs.length !== beforeFilter) {
+    notes.push(`E_EMPTY_MSG: dropped ${beforeFilter - msgs.length} empty message${beforeFilter - msgs.length === 1 ? "" : "s"} before send.`);
+  }
   if (agenticWanted(r)) {
     const n = normalizeAgentic(msgs);
     msgs = n.messages;
@@ -66,6 +81,26 @@ export function buildPayload(preset, messages) {
     if (n.merged) bits.push(`merged ${n.merged} same-role message${n.merged === 1 ? "" : "s"}`);
     if (n.nudged) bits.push("appended final user turn");
     if (bits.length) notes.push(`E_AGENCY: agentic format — ${bits.join(", ")}.`);
+  }
+  if (r.descriptor?.system_must_lead) {
+    const systems = msgs.filter((m) => m.role === "system");
+    const rest = msgs.filter((m) => m.role !== "system");
+    const systemText = systems.map((m) => m.content).filter((c) => typeof c === "string" && c.trim()).join("\n\n");
+    const wasLeading = msgs[0]?.role === "system";
+    if (systemText) {
+      msgs = [{ role: "system", content: systemText }, ...rest];
+      if (systems.length > 1) {
+        notes.push(`E_MISTRAL_SHAPE: merged ${systems.length} system messages into one leading system prompt.`);
+      } else if (!wasLeading) {
+        notes.push("E_MISTRAL_SHAPE: moved the system prompt to the front of the conversation.");
+      }
+    } else {
+      msgs = rest;
+    }
+    if (msgs.length && msgs[0].role !== "user" && msgs[0].role !== "system") {
+      msgs = [{ role: "system", content: "Continue the conversation in character." }, ...msgs];
+      notes.push("E_MISTRAL_SHAPE: added a leading system message (this model must start with user or system).");
+    }
   }
   body.messages = msgs;
 
@@ -75,6 +110,25 @@ export function buildPayload(preset, messages) {
 
 export function sanitizePayload(preset, messages) {
   return buildPayload(preset, messages).body;
+}
+
+// Pulls the reply out of a non-streaming OpenAI-style completion. Some
+// gateways ignore stream:true and answer with plain JSON; without this the
+// SSE decoder would paint the raw JSON envelope into the bubble.
+export function extractCompletion(json) {
+  const choice = Array.isArray(json?.choices) ? json.choices[0] : null;
+  const msg = choice?.message || {};
+  let content = typeof msg.content === "string" ? msg.content : "";
+  if (!content && Array.isArray(msg.content)) {
+    content = msg.content
+      .map((p) => (typeof p === "string" ? p : (typeof p?.text === "string" ? p.text : "")))
+      .join("");
+  }
+  if (!content && typeof choice?.text === "string") content = choice.text;
+  let reasoning = typeof msg.reasoning_content === "string" ? msg.reasoning_content : "";
+  if (!reasoning && typeof msg.reasoning === "string") reasoning = msg.reasoning;
+  if (!reasoning && typeof choice?.reasoning_content === "string") reasoning = choice.reasoning_content;
+  return { content, reasoning };
 }
 
 export function resolveEndpoint(connection) {
@@ -221,6 +275,15 @@ function errMsg(status, text) {
   return `E_API_FAIL: request failed (${status})${detail ? ": " + detail : ""}`;
 }
 
+function headersFor(stream, apiKey) {
+  const headers = { "Content-Type": "application/json" };
+  // NVIDIA's official clients send Accept based on stream. SSE dispatch in
+  // third-party inference fronts (and some relays) keys on it.
+  headers.Accept = stream ? "text/event-stream" : "application/json";
+  if (apiKey) headers.Authorization = "Bearer " + apiKey;
+  return headers;
+}
+
 // Streams one completion. Callbacks receive incremental text; resolves the
 // accumulated {content, reasoning}. Throws on HTTP errors or abort.
 // Accepts split shapes: {provider, preset} (v1.5+) or legacy {connection}.
@@ -241,35 +304,89 @@ export async function sendChat({ provider, preset, connection, samplers, message
   const url = resolveEndpoint(effConn);
   const { body, notes } = buildPayload(effPreset, messages);
   if (onNote) for (const n of notes) { try { onNote(n); } catch { /* notes never break send */ } }
-  const headers = { "Content-Type": "application/json" };
-  // NVIDIA's official clients send Accept based on stream: SSE dispatch
-  // through third-party inference fronts hangs up without it.
-  if (body.stream) headers.Accept = "text/event-stream";
-  else headers.Accept = "application/json";
-  if (effConn.api_key) headers.Authorization = "Bearer " + effConn.api_key;
+  if (!Array.isArray(body.messages) || !body.messages.length) {
+    throw new Error("E_EMPTY_CHAT: nothing to send — the conversation has no non-empty messages.");
+  }
+
+  const post = (wire) => fetch(url, {
+    method: "POST",
+    headers: headersFor(wire.stream, effConn.api_key),
+    body: JSON.stringify(wire),
+    signal
+  });
 
   let res;
   try {
-    res = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      signal
-    });
+    res = await post(body);
   } catch (e) {
     if (e?.name === "AbortError") throw e;
     throw new Error(offlineHint(hostOf(url)) + ` (${e?.message || "fetch failed"})`);
   }
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(errMsg(res.status, text));
+
+  // Some models/relays refuse SSE outright. A 400/422 on a streaming send is
+  // retried once without streaming: if the model can answer at all, it
+  // answers in JSON, and if it cannot, the JSON error body is the more
+  // useful one to surface.
+  let streamFailure = "";
+  if (!res.ok && body.stream && (res.status === 400 || res.status === 422)) {
+    streamFailure = errMsg(res.status, await res.text().catch(() => ""));
+    if (onNote) { try { onNote(`E_STREAM_FALLBACK: streaming send was refused (${res.status}) — retrying once with stream:false.`); } catch { /* notes never break send */ } }
+    try {
+      res = await post({ ...body, stream: false });
+    } catch (e) {
+      if (e?.name === "AbortError") throw e;
+      throw new Error(offlineHint(hostOf(url)) + ` (${e?.message || "fetch failed"})`);
+    }
+    if (!res.ok) {
+      const retryFailure = errMsg(res.status, await res.text().catch(() => ""));
+      throw new Error(retryFailure + " | streaming attempt: " + streamFailure.replace(/^E_API_FAIL: /, ""));
+    }
+    body.stream = false;
+    if (onNote) { try { onNote("E_STREAM_FALLBACK: non-streaming retry succeeded."); } catch { /* notes never break send */ } }
+  } else if (!res.ok) {
+    throw new Error(errMsg(res.status, await res.text().catch(() => "")));
   }
+
   let content = "";
   let reasoning = "";
-  await streamSSE(res, {
-    signal,
-    onContent: (t) => { content += t; if (onContent) onContent(t); },
-    onReasoning: (t) => { reasoning += t; if (onReasoning) onReasoning(t); }
-  });
+  const ct = String(res.headers.get("content-type") || "").toLowerCase();
+  if (ct.includes("text/event-stream")) {
+    await streamSSE(res, {
+      signal,
+      onContent: (t) => { content += t; if (onContent) onContent(t); },
+      onReasoning: (t) => { reasoning += t; if (onReasoning) onReasoning(t); }
+    });
+  } else {
+    // Every other content type is read once and sniffed. Normal JSON is the
+    // non-streaming path; an SSE body mislabeled by a proxy is replayed
+    // through the SSE decoder; anything else is a real error, never chat text.
+    const text = await res.text().catch(() => "");
+    let json = null;
+    try {
+      json = JSON.parse(text);
+    } catch { /* not JSON */ }
+    if (json) {
+      const got = extractCompletion(json);
+      content = got.content;
+      reasoning = got.reasoning;
+      if (!content) {
+        const finish = json?.choices?.[0]?.finish_reason;
+        throw new Error(
+          `E_API_FAIL: completion had no reply text${reasoning ? " (reasoning only)" : ""}${finish ? ` (finish_reason: ${finish})` : ""}.`
+        );
+      }
+      if (onContent) onContent(content);
+      if (reasoning && onReasoning) onReasoning(reasoning);
+    } else if (/(^|\n)\s*data:/.test(text)) {
+      const replay = new Response(text, { status: res.status, headers: res.headers });
+      await streamSSE(replay, {
+        signal,
+        onContent: (t) => { content += t; if (onContent) onContent(t); },
+        onReasoning: (t) => { reasoning += t; if (onReasoning) onReasoning(t); }
+      });
+    } else {
+      throw new Error(`E_API_FAIL: expected JSON or SSE (got ${ct || "unknown content-type"}): ${text.slice(0, 200)}`);
+    }
+  }
   return { content, reasoning };
 }

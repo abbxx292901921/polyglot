@@ -105,7 +105,8 @@ const CATALOG = [
     match: /mistral-large-4|mistral-4-large/i,
     effort: { values: ["none", "high"], default: "high" },
     reasoning_in_max_tokens: true,
-    hint: "reasoning_effort none|high (omitted = none). max_tokens INCLUDES reasoning — keep it 4096+ or replies die mid-thought."
+    system_must_lead: true,
+    hint: "reasoning_effort none|high (omitted = none). max_tokens INCLUDES reasoning — keep it 4096+. Strict template: one leading system, no system after an assistant, no empty messages."
   },
   {
     match: /mistral/i,
@@ -275,6 +276,21 @@ export function validDescriptor(desc, model) {
   return desc;
 }
 
+// A cached descriptor fetched before a catalog-only wire flag existed must not
+// silently lose that flag at send time. Catalog defaults first, live values
+// second, and flags the live page cannot know (system_must_lead) retained.
+function mergeDescriptor(cached, model) {
+  const cat = catalogLookup(model);
+  const fetched = validDescriptor(cached, model);
+  if (!cat) return fetched;
+  if (!fetched) return cat;
+  return {
+    ...cat,
+    ...fetched,
+    system_must_lead: fetched.system_must_lead ?? cat.system_must_lead
+  };
+}
+
 export function mergeReasoning(preset = {}, connection = {}, model = "") {
   const c = connection || {};
   const legacyStrategy = preset.reasoning_strategy || c.reasoning_strategy || "";
@@ -300,7 +316,7 @@ export function mergeReasoning(preset = {}, connection = {}, model = "") {
     soften: String(preset?.prompts?.reasoning_style || ""),
     // Catalog is the offline source of truth when a preset carries no cached
     // fetch — the UI already resolves this way, the send path must too.
-    descriptor: validDescriptor(preset.reasoning_modes, model) || catalogLookup(model)
+    descriptor: mergeDescriptor(preset.reasoning_modes, model)
   };
 }
 

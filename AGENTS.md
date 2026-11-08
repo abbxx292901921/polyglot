@@ -168,6 +168,8 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
 - `node tools/minigame.test.mjs`, `node tools/frame.test.mjs`,
   `node tools/forge-game.test.mjs`, `node tools/db-migrate.test.mjs` → all OK.
 - `node tools/stream-equiv.test.mjs` → 0 failures.
+- `node tools/nonstream.test.mjs` → NONSTREAM_OK (JSON replies, the one-shot
+  stream:false retry, the empty-message filter, Mistral's message shape).
 - Fresh load → send → reload → message persists; new chat/persona/character CRUD works.
 - Export vault with keys OFF → JSON has `"api_key": ""`. Import replaces data.
 - Airplane mode (after first load): shell + history open, send works locally.
@@ -334,3 +336,29 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   it 400 on models whose Playground path works. No other behavior change.
   Fix lives behind the v1.9.1 cache bump so the SW ships it — v1.9.0
   clients kept the old api-client.js via cache-first.
+- v1.9.2 DONE: Mistral Large 4 wire compatibility. The model's own schema
+  requires only `model` + `messages`; every sampler key Polyglot sends is
+  valid, `max_tokens` allows 262144, and SSE is advertised. The refusals were
+  in shape/transport, not in the sampler payload:
+  1. Non-streaming JSON replies are parsed (`extractCompletion`). Before, a
+     gateway that ignored `stream:true` had its raw JSON envelope painted as
+     chat text by the SSE decoder.
+  2. A streaming send refused with 400/422 is retried once with
+     `stream:false` (`E_STREAM_FALLBACK`). If both attempts fail, the
+     non-stream error body is surfaced alongside the streaming one. This is
+     also how a streaming-unsupported model announces itself.
+  3. Empty/null messages are dropped before send (`E_EMPTY_MSG`). Mistral 4's
+     published chat template raises "must have non-empty content", so an
+     empty assistant greeting (a card with no `first_mes`) was a guaranteed
+     400. An all-empty conversation is rejected as `E_EMPTY_CHAT`.
+  4. Mistral 4 gets `system_must_lead`: all system messages merge into one
+     leading system (`E_MISTRAL_SHAPE`), and a synthetic leading system is
+     added if the conversation would start with an assistant. The template
+     also forbids system after assistant, which depth-injected author's
+     notes could produce; the handler removes that shape.
+  5. `tools/mistral-probe.mjs` sends the real `buildPayload` body plus the
+     minimum documented shapes to NIM and the relay, varying one thing at a
+     time. It reads `NVIDIA_API_KEY` from the environment and never prints
+     it. `tools/nonstream.test.mjs` covers JSON replies, the retry, the empty
+     filter and the Mistral shape. No DB migration; version/cache v1.9.2 so
+     cache-first clients actually receive the fix.
