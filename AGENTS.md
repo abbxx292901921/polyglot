@@ -54,6 +54,11 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   (`swipe_group_id`/`swipe_active`) + retry/continue/impersonate/edit/delete,
   character editor modal, card import + per-chat export/import, vault
   export/import, diagnostics panel, SW registration.
+  PROVIDER DRAWER: a searchable `/models` picker backed by
+  `js/model-catalog.js`, a metadata line (context, output cap, pricing,
+  modalities, reasoning), and a sampler-capability note. The chosen record is
+  saved on the preset as `model_meta`, so sends keep the same filtering after
+  an offline reload.
   BRANCH MODEL: a chat's `active_leaf_id` names the message the transcript,
   the model context and the graph all agree on. `setLeaf` advances it on
   EVERY append (send/retry/impersonate/continue/variant pick), `setActiveLeaf`
@@ -77,14 +82,23 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
   (leaves take sequential lanes, parents sit at the mean of their children).
 - `js/sse-streamer.js` — SSE decoder (TextDecoder stream) + createThinkSplitter
   for split `<think>` tags; routes reasoning_content + inline thinks to reasoning.
-- `js/api-client.js` — buildPayload (allowlist + ONE validated thinking knob) +
-  sanitizePayload wrapper, resolveEndpoint (proxy-aware), fetchReasoningModes
-  (docs OpenAPI page, key never sent, catalog fallback), sendChat streaming via
-  fetch + streamSSE with onNote surfacing.
+- `js/api-client.js` — buildPayload (allowlist + ONE validated thinking knob +
+  `model_meta` sampler filtering) + sanitizePayload wrapper, resolveEndpoint
+  (proxy-aware), fetchModelCatalog/fetchModels (normalized provider /models),
+  fetchReasoningModes (docs OpenAPI page, key never sent, catalog fallback),
+  sendChat streaming via fetch + streamSSE with onNote surfacing.
 - `js/reasoning-modes.js` — pure thinking-knob resolver: CATALOG (surveyed
   per-model effort/budget/kwargs shapes), parseModesPage (docs OpenAPI),
-  mergeReasoning (new schema + legacy mapping), applyThinking (validated,
-  exactly one knob), modeValues/describeMode for the preset UI.
+  mergeReasoning (new schema + legacy mapping + provider `model_meta`
+  descriptors), applyThinking (validated, exactly one knob), modeValues/
+  describeMode for the preset UI.
+- `js/model-catalog.js` — pure provider `/models` normalizer: OpenRouter-rich
+  objects and plain id lists both become `{id,name,context_length,
+  max_completion_tokens,pricing,input_modalities,output_modalities,
+  supported_parameters,reasoning}`. Exports modelMetaFor, filterModels,
+  reasoningDescriptor (source `"provider"`), capabilitySet/capabilityAllows,
+  formatContext, formatPricePerMillion, formatPricePair. No DOM/fetch/storage;
+  provider fields are untrusted and reduced to plain strings/numbers.
 - `js/png-parser.js` — card ingestion: walkChunks, tEXt/zTXt/iTXt, chara/ccv3
   (V3 wins), parsePNGCard/parseCharacterJSON/normalizeCharacter,
   fileToAvatarDataURL (512px webp→jpeg fallback).
@@ -170,6 +184,9 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
 - `node tools/stream-equiv.test.mjs` → 0 failures.
 - `node tools/nonstream.test.mjs` → NONSTREAM_OK (JSON replies, the one-shot
   stream:false retry, the empty-message filter, Mistral's message shape).
+- `node tools/model-catalog.test.mjs` → MODEL_CATALOG_OK (normalization,
+  search/formatting, provider reasoning descriptors, capability filtering,
+  `fetchModelCatalog`/`fetchModels`).
 - Fresh load → send → reload → message persists; new chat/persona/character CRUD works.
 - Export vault with keys OFF → JSON has `"api_key": ""`. Import replaces data.
 - Airplane mode (after first load): shell + history open, send works locally.
@@ -362,3 +379,28 @@ Deployed as static files to GitHub Pages. No build step, no bundler.
      it. `tools/nonstream.test.mjs` covers JSON replies, the retry, the empty
      filter and the Mistral shape. No DB migration; version/cache v1.9.2 so
      cache-first clients actually receive the fix.
+- v1.9.3 DONE: one-tap OpenRouter preset. `PROVIDER_PRESETS.openrouter` in
+  `config.js` carries only public connection data (base URL, key hint, starter
+  model `openrouter/auto`); the key is still user-entered and stays in the
+  providers store. A new “+ OpenRouter” button in the Presets tab and the
+  settings drawer calls `applyProviderPreset()`, which reuses a provider with
+  the same base URL and a preset with the same model/name instead of
+  overwriting or duplicating them, selects the pair, and opens the provider
+  editor. The provider form's key placeholder now follows the base URL
+  (`sk-or-v1-…` for OpenRouter, `nvapi-…` for NIM). No DB migration and no
+  seed data injected into existing libraries; version/cache v1.9.3.
+- v1.9.4 DONE: searchable provider model picker + capability metadata.
+  NEW `js/model-catalog.js` (pure): normalizes OpenRouter-rich `/models`
+  objects and plain id lists into one tiny record, filters ids/names, formats
+  context/pricing, turns provider reasoning metadata into the existing
+  descriptor shape (`source: "provider"`), and exposes capability checks.
+  `api-client.js` gains `fetchModelCatalog()` (fetchModels still returns ids)
+  and `buildPayload()` now omits sampler keys a model does not advertise when
+  `model_meta.supported_parameters` is a non-empty list, reporting
+  `E_CAP_SKIP`; presets without metadata keep the exact old wire shape.
+  The provider drawer gains a search box, model metadata line (context, output
+  cap, price, modalities, reasoning) and sampler-capability note. The chosen
+  record is saved as `preset.model_meta` (preset import re-normalizes it), and
+  `mergeReasoning` uses it when no fetched `reasoning_modes` exists. No DB
+  migration; version/cache v1.9.4 so cache-first clients receive the new
+  module.

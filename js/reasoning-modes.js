@@ -12,7 +12,12 @@
    2. "catalog": CATALOG below — the same schemas surveyed 2026-10, used when
       the docs fetch is offline/CORS-blocked or the model predates the page.
    Descriptors are plain JSON and are cached on the preset (reasoning_modes),
-   so a fetch once keeps working offline. Pure module: no fetch, no DOM. */
+   so a fetch once keeps working offline. A provider model list (OpenRouter)
+   can also carry reasoning metadata; model-catalog.js turns that into the
+   same descriptor shape (source "provider") for presets that were never
+   fetched. Pure module: no fetch, no DOM. */
+
+import { reasoningDescriptor } from "./model-catalog.js";
 
 // ---------- Built-in catalog (fallback; surveyed from docs.api.nvidia.com) ----------
 const CATALOG = [
@@ -271,28 +276,42 @@ function describeDescriptor(d) {
 export function validDescriptor(desc, model) {
   if (!desc || typeof desc !== "object") return null;
   if (model && desc.model && desc.model !== model) return null;
-  if (desc.source !== "fetched" && desc.source !== "catalog") return null;
+  if (desc.source !== "fetched" && desc.source !== "catalog" && desc.source !== "provider") return null;
   if (!desc.effort && !desc.budget && !desc.kwargsModes && !desc.always_thinks && !desc.strict_roles) return null;
   return desc;
 }
 
+// A descriptor supplied by the provider's own model list. It only applies to
+// the model it was listed for — a preset whose model was edited by hand must
+// not inherit the old model's thinking knobs.
+function metaDescriptor(meta, model) {
+  if (!meta || typeof meta !== "object") return null;
+  const id = String(meta.id || "").trim();
+  if (model && id && id.toLowerCase() !== String(model).trim().toLowerCase()) return null;
+  return validDescriptor(reasoningDescriptor(meta));
+}
+
 // A cached descriptor fetched before a catalog-only wire flag existed must not
-// silently lose that flag at send time. Catalog defaults first, live values
-// second, and flags the live page cannot know (system_must_lead) retained.
-function mergeDescriptor(cached, model) {
+// silently lose that flag at send time. Provider metadata first, built-in
+// catalog second, live/fetched values last, and flags the provider list cannot
+// know (system_must_lead) retained.
+function mergeDescriptor(cached, model, meta) {
+  const provider = metaDescriptor(meta, model);
   const cat = catalogLookup(model);
   const fetched = validDescriptor(cached, model);
-  if (!cat) return fetched;
-  if (!fetched) return cat;
+  const base = provider || cat;
+  if (!base) return fetched;
+  if (!fetched) return base;
   return {
-    ...cat,
+    ...base,
     ...fetched,
-    system_must_lead: fetched.system_must_lead ?? cat.system_must_lead
+    system_must_lead: fetched.system_must_lead ?? base.system_must_lead
   };
 }
 
 export function mergeReasoning(preset = {}, connection = {}, model = "") {
   const c = connection || {};
+  const id = String(model || preset.model || c.model || "");
   const legacyStrategy = preset.reasoning_strategy || c.reasoning_strategy || "";
   let mode = preset.reasoning_mode || "";
   let value = preset.reasoning_value ?? "";
@@ -316,7 +335,7 @@ export function mergeReasoning(preset = {}, connection = {}, model = "") {
     soften: String(preset?.prompts?.reasoning_style || ""),
     // Catalog is the offline source of truth when a preset carries no cached
     // fetch — the UI already resolves this way, the send path must too.
-    descriptor: mergeDescriptor(preset.reasoning_modes, model)
+    descriptor: mergeDescriptor(preset.reasoning_modes, id, preset.model_meta)
   };
 }
 

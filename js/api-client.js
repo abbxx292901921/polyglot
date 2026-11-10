@@ -23,6 +23,7 @@
 import { streamSSE } from "./sse-streamer.js";
 import { normalizeAgentic } from "./prompt-engine.js";
 import { mergeReasoning, agenticWanted, applyThinking, catalogLookup, parseModesPage } from "./reasoning-modes.js";
+import { normalizeModelCatalog, capabilitySet } from "./model-catalog.js";
 
 function pickModel(preset) {
   if (typeof preset?.model === "string" && preset.model.trim()) return preset.model.trim();
@@ -57,6 +58,24 @@ export function buildPayload(preset, messages) {
   if (stops.length) body.stop = stops;
   if (Number(sam.frequency_penalty)) body.frequency_penalty = Number(sam.frequency_penalty);
   if (Number(sam.presence_penalty)) body.presence_penalty = Number(sam.presence_penalty);
+
+  // The provider's own model list is the only reliable statement of which
+  // sampler keys a model accepts. Filtering only happens when the preset
+  // carries a non-empty supported_parameters list, so older presets and
+  // bare-id providers keep their exact previous wire shape.
+  const caps = capabilitySet(preset?.model_meta);
+  if (caps) {
+    const skipped = [];
+    for (const key of ["temperature", "top_p", "max_tokens", "stop", "frequency_penalty", "presence_penalty"]) {
+      if (Object.prototype.hasOwnProperty.call(body, key) && !caps.has(key)) {
+        delete body[key];
+        skipped.push(key);
+      }
+    }
+    if (skipped.length) {
+      notes.push(`E_CAP_SKIP: ${model || "this model"} does not list ${skipped.join(", ")} — omitted from the request.`);
+    }
+  }
 
   let msgs = Array.isArray(messages) ? messages : [];
   // Empty messages are poison on strict chat templates: Mistral Large 4's
@@ -178,9 +197,12 @@ function hostOf(url) {
   }
 }
 
-// GET {base}/models with the provider key. Returns string[] of model ids.
+// GET {base}/models with the provider key. Returns normalized model records
+// (id, name, context, pricing, modalities, supported_parameters, reasoning).
+// The body is untrusted provider data; normalizeModelCatalog reduces every
+// field to plain strings/numbers and drops unknown shapes.
 // Throws coded errors; never logs the key.
-export async function fetchModels({ base_url, api_key, use_proxy, proxy_url, signal } = {}) {
+export async function fetchModelCatalog({ base_url, api_key, use_proxy, proxy_url, signal } = {}) {
   const conn = { base_url, api_key, use_proxy, proxy_url };
   const url = resolveModelsEndpoint(conn);
   const headers = {};
@@ -202,7 +224,12 @@ export async function fetchModels({ base_url, api_key, use_proxy, proxy_url, sig
   } catch {
     throw new Error("E_API_FAIL: /models did not return JSON (proxy may have rewritten it).");
   }
-  return normalizeModelList(json);
+  return normalizeModelCatalog(json);
+}
+
+// Back-compat: callers that only need the id list keep their old return shape.
+export async function fetchModels(opts) {
+  return (await fetchModelCatalog(opts)).map((m) => m.id);
 }
 
 // Resolves a model's thinking knobs from its own OpenAPI page on

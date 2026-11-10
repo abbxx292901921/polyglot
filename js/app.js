@@ -1,4 +1,4 @@
-import { APP_VERSION, DEFAULT_CONNECTION, DEFAULT_PROVIDER, DEFAULT_SAMPLERS, DEFAULT_PROMPTS, THEMES } from "./config.js";
+import { APP_VERSION, DEFAULT_CONNECTION, DEFAULT_PROVIDER, DEFAULT_SAMPLERS, DEFAULT_PROMPTS, PROVIDER_PRESETS, THEMES } from "./config.js";
 import { applyRules, compileRule, cleanFlags } from "./regex-engine.js";
 import { STAGE_KEYS, STAGE_META, normalizeToggles, defaultStageToggles, parseDirector, parseDice, normalizeWorld, applyWorldCommand, formatWorldSheet, normalizeChess, parseChessTriggers, renderBoardText, toFEN, startChessGame, playChessTurn, forfeitChess, buildStageBlocks } from "./stages.js";
 import { SUPERVISOR_ACTIONS, parseSupervisorReply, validateAction, normalizeAction, describeAction, buildSupervisorPrompt, localDraftCharacter, localPolishCharacter, isReadAction, isControlAction } from "./supervisor.js";
@@ -70,8 +70,9 @@ import {
   seedIfEmpty
 } from "./db.js";
 import { buildMessages, estimateTokens, activeChain, parentMap, childrenMap, tidyLayout } from "./prompt-engine.js";
-import { sendChat, fetchModels, fetchReasoningModes } from "./api-client.js";
+import { sendChat, fetchModelCatalog, fetchReasoningModes } from "./api-client.js";
 import { mergeReasoning, modeValues, describeMode, catalogLookup } from "./reasoning-modes.js";
+import { normalizeModelCatalog, modelMetaFor, filterModels, formatContext, formatPricePair, capabilitySet } from "./model-catalog.js";
 import { parsePNGCard, parseCharacterJSON, normalizeCharacter, fileToAvatarDataURL } from "./png-parser.js";
 import {
   err as logErr, warn as logWarn, info as logInfo,
@@ -729,6 +730,14 @@ function presetModel(p) {
 
 function presetReasoning(p) {
   return mergeReasoning(p || {}, p?.connection || {}, presetModel(p));
+}
+
+// The preset editor can show an unsaved model/meta pair while the user is
+// browsing the fetched catalog. Reasoning previews must follow the form, not
+// the last saved preset.
+function formPresetForReasoning(active) {
+  const model = $("#conn-model")?.value.trim() || presetModel(active);
+  return { ...(active || {}), model, model_meta: formModelMeta };
 }
 
 // v1.4 presets embedded connection.*. v1.5 splits providers out so any
@@ -1900,9 +1909,13 @@ function setProviderStatus(msg) {
 
 function readPresetForm() {
   const stops = $("#sam-stop").value.split("\n").map((s) => s.trim()).filter((s) => s.length);
+  const model = $("#conn-model").value.trim();
   return {
     name: $("#conn-label").value.trim() || "Preset",
-    model: $("#conn-model").value.trim(),
+    model,
+    model_meta: formModelMeta && String(formModelMeta.id || "").toLowerCase() === model.toLowerCase()
+      ? formModelMeta
+      : null,
     reasoning_mode: $("#conn-strategy").value || "off",
     reasoning_value: $("#conn-effort").value || "",
     reasoning_budget: Number($("#conn-budget").value) || 2048,
@@ -1938,6 +1951,12 @@ function fillPresetForm(preset) {
   const r = presetReasoning(preset);
   $("#conn-label").value = preset.name || "";
   $("#conn-model").value = presetModel(preset);
+  formModelId = presetModel(preset);
+  formModelMeta = preset.model_meta &&
+    String(preset.model_meta.id || "").toLowerCase() === formModelId.toLowerCase()
+    ? preset.model_meta
+    : null;
+  rememberModelMeta(formModelMeta);
   $("#conn-strategy").value = r.mode || "off";
   $("#conn-budget").value = r.budget ?? 2048;
   $("#conn-kwargs").value = r.kwargs || "";
@@ -1959,6 +1978,7 @@ function fillPresetForm(preset) {
   $("#pr-depth").value = p.authors_note_depth ?? 2;
   $("#pr-prefill-use").checked = !!p.prefill_enabled;
   $("#pr-prefill-text").value = p.prefill_text || "";
+  syncModelPickerSelection(formModelId);
 }
 
 function setReasoningStatus(msg) {
@@ -1993,7 +2013,9 @@ function refreshReasoningUI(preset, keepValue) {
   }
   sel.value = [...sel.options].some((o) => o.value === want) ? want : "";
   if (desc) {
-    setReasoningStatus(`${desc.source === "fetched" ? "Live schema" : "Catalog"} for ${desc.model || model}: ${desc.hint || describeMode(r)}.`);
+    const source = desc.source === "fetched" ? "Live schema" : desc.source === "provider" ? "Provider model list" : "Catalog";
+    const detail = desc.hint || `${describeMode(r)}.`;
+    setReasoningStatus(`${source} for ${desc.model || model}: ${detail}`);
   } else if (mode === "off") {
     setReasoningStatus("Thinking off — no reasoning keys are sent.");
   } else {
@@ -2047,38 +2069,169 @@ function fillProviderForm(prov) {
   $("#prov-name").value = prov.name || "";
   $("#prov-url").value = prov.base_url || "";
   $("#prov-key").value = prov.api_key || "";
+  const keyBox = $("#prov-key");
+  if (keyBox) keyBox.placeholder = keyHintFor(prov);
   $("#prov-proxy-use").checked = !!prov.use_proxy;
   $("#prov-proxy-url").value = prov.proxy_url || "";
 }
 
-function refreshModelDatalist(models) {
+function keyHintFor(prov) {
+  const url = String(prov?.base_url || "").toLowerCase();
+  if (url.includes("openrouter.ai")) return "sk-or-v1-…";
+  if (url.includes("nvidia")) return "nvapi-…";
+  return "API key";
+}
+
+// ---------- Model picker (provider /models metadata) ----------
+// The catalog is untrusted provider data normalized in model-catalog.js.
+// It powers the searchable select, the metadata line, and the sampler note;
+// the preset stores the selected record as model_meta so sends are filtered
+// even on the next offline load.
+let cachedModelCatalog = [];
+let formModelMeta = null;
+let formModelId = "";
+// Metas seen this session (preset loads + catalog fetches) so editing the
+// model field back to a known id restores its limits without a refetch.
+const knownModelMeta = new Map();
+
+function rememberModelMeta(meta) {
+  if (meta && meta.id) knownModelMeta.set(String(meta.id).toLowerCase(), meta);
+}
+
+function rememberedModelMeta(id) {
+  const key = String(id || "").toLowerCase();
+  return key ? knownModelMeta.get(key) || null : null;
+}
+
+function renderModelChoices() {
   const dl = $("#model-choices");
   if (!dl) return;
   dl.innerHTML = "";
-  for (const m of models || []) {
+  for (const m of cachedModelCatalog) {
     const o = document.createElement("option");
-    o.value = m;
+    o.value = m.id;
     dl.append(o);
-  }
-  const sel = $("#prov-models");
-  if (sel) {
-    const cur = sel.value;
-    sel.innerHTML = "";
-    const hint = document.createElement("option");
-    hint.value = "";
-    hint.textContent = (models && models.length) ? `${models.length} models — pick one, then Use in preset` : "Fetch models to list them here";
-    sel.append(hint);
-    for (const m of models || []) {
-      const o = document.createElement("option");
-      o.value = m;
-      o.textContent = m;
-      sel.append(o);
-    }
-    if (cur && models && models.includes(cur)) sel.value = cur;
   }
 }
 
-let cachedModels = [];
+function renderModelMeta(meta) {
+  const box = $("#prov-model-meta");
+  if (!box) return;
+  if (!meta) {
+    box.textContent = "";
+    return;
+  }
+  const bits = [];
+  if (meta.name && meta.name !== meta.id) bits.push(meta.name);
+  if (meta.context_length) bits.push(`${formatContext(meta.context_length)} context`);
+  if (meta.max_completion_tokens) bits.push(`${formatContext(meta.max_completion_tokens)} max out`);
+  const price = formatPricePair(meta.pricing);
+  if (price) bits.push(price);
+  if (meta.input_modalities?.length) bits.push(`in: ${meta.input_modalities.join("+")}`);
+  if (meta.output_modalities?.length) bits.push(`out: ${meta.output_modalities.join("+")}`);
+  if (meta.reasoning?.supported_efforts?.length) {
+    bits.push(`reasoning: ${meta.reasoning.supported_efforts.join("|")}${meta.reasoning.mandatory ? " (mandatory)" : ""}`);
+  }
+  box.textContent = bits.join(" · ");
+}
+
+function renderSamplerCapabilities(meta) {
+  const box = $("#sampler-capabilities");
+  if (!box) return;
+  const caps = capabilitySet(meta);
+  if (!caps) {
+    box.textContent = "Sampler support unknown — every sampler this app sends is included.";
+    return;
+  }
+  const labels = [
+    ["temperature", "Temp"],
+    ["top_p", "Top P"],
+    ["max_tokens", "Max tokens"],
+    ["stop", "Stop"],
+    ["frequency_penalty", "Freq penalty"],
+    ["presence_penalty", "Presence"]
+  ];
+  const supported = labels.filter(([key]) => caps.has(key)).map(([, label]) => label);
+  const skipped = labels.filter(([key]) => !caps.has(key)).map(([, label]) => label);
+  box.textContent = skipped.length
+    ? `Provider sampler list — supported: ${supported.join(", ") || "none"}. Omitted at send: ${skipped.join(", ")}.`
+    : "Provider lists every sampler this app sends.";
+}
+
+function renderSelectedModelMeta() {
+  const selected = $("#prov-models")?.value || "";
+  const selectedMeta = selected ? modelMetaFor(cachedModelCatalog, selected) : null;
+  const formMatch = formModelMeta && String(formModelMeta.id || "").toLowerCase() === formModelId.toLowerCase()
+    ? formModelMeta
+    : null;
+  const meta = selectedMeta || formMatch;
+  renderModelMeta(meta);
+  renderSamplerCapabilities(meta);
+}
+
+function renderModelDatalist(preferred) {
+  const sel = $("#prov-models");
+  if (!sel) return;
+  const query = $("#prov-model-search")?.value || "";
+  const rows = filterModels(cachedModelCatalog, query);
+  const prev = String(preferred ?? sel.value ?? "").trim();
+  sel.innerHTML = "";
+  const hint = document.createElement("option");
+  hint.value = "";
+  const total = cachedModelCatalog.length;
+  hint.textContent = !total
+    ? "Fetch models to list them here"
+    : (rows.length === total
+      ? `${total} models — pick one, then Use in preset`
+      : `${rows.length} of ${total} models match — pick one, then Use in preset`);
+  sel.append(hint);
+  for (const m of rows) {
+    const o = document.createElement("option");
+    o.value = m.id;
+    o.textContent = m.context_length ? `${m.id} · ${formatContext(m.context_length)} ctx` : m.id;
+    sel.append(o);
+  }
+  const want = prev || $("#conn-model")?.value.trim() || "";
+  if (want && rows.some((m) => m.id === want)) sel.value = want;
+  renderSelectedModelMeta();
+}
+
+// Preset loads only move the picker's selection; they never rebuild 400+
+// options. A model hidden by the current search clears the selection so the
+// metadata line falls back to the preset's stored record.
+function syncModelPickerSelection(id) {
+  const sel = $("#prov-models");
+  if (!sel) return;
+  const has = !!id && [...sel.options].some((o) => o.value === id);
+  sel.value = has ? id : "";
+  renderSelectedModelMeta();
+}
+
+function setModelCatalog(catalog, preferred) {
+  cachedModelCatalog = Array.isArray(catalog) ? catalog : [];
+  for (const m of cachedModelCatalog) rememberModelMeta(m);
+  const current = $("#conn-model")?.value.trim() || "";
+  const meta = modelMetaFor(cachedModelCatalog, current);
+  if (meta) {
+    formModelId = current;
+    formModelMeta = meta;
+  }
+  renderModelChoices();
+  renderModelDatalist(preferred || current);
+}
+
+// Keeps the preset's stored model_meta aligned with the model field. An
+// unknown id clears it, so a hand-edited model cannot inherit the previous
+// model's sampler limits.
+function syncFormModelMeta() {
+  const model = $("#conn-model")?.value.trim() || "";
+  if (model === formModelId) return;
+  formModelId = model;
+  formModelMeta = model
+    ? (modelMetaFor(cachedModelCatalog, model) || rememberedModelMeta(model))
+    : null;
+  syncModelPickerSelection(model);
+}
 
 async function refreshPresets() {
   const presets = await listPresets();
@@ -2150,8 +2303,9 @@ async function refreshProviders() {
         persistUI();
         const fresh = await listProviders();
         fillProviderForm(fresh.find((x) => x.id === p.id) || p);
-        cachedModels = [];
-        refreshModelDatalist([]);
+        cachedModelCatalog = [];
+        renderModelChoices();
+        renderModelDatalist();
         await refreshProviders();
         updateComboLabels();
         setProviderStatus("");
@@ -2181,11 +2335,10 @@ async function handleFetchModels() {
   const form = readProviderForm();
   setProviderStatus("Fetching models…");
   try {
-    const models = await fetchModels(form);
-    cachedModels = models;
-    refreshModelDatalist(models);
-    setProviderStatus(models.length ? `Found ${models.length} models.` : "No models returned — check the base URL.");
-    logInfo("E_PROVIDER", `models fetched (${models.length})`);
+    const catalog = await fetchModelCatalog(form);
+    setModelCatalog(catalog);
+    setProviderStatus(catalog.length ? `Found ${catalog.length} models.` : "No models returned — check the base URL.");
+    logInfo("E_PROVIDER", `models fetched (${catalog.length})`);
   } catch (e) {
     logErr("E_PROVIDER", e.message);
     setProviderStatus(`Fetch failed: ${e.message}`);
@@ -2197,15 +2350,81 @@ async function handleTestConnection() {
   const form = readProviderForm();
   setProviderStatus("Testing…");
   try {
-    const models = await fetchModels(form);
-    cachedModels = models;
-    refreshModelDatalist(models);
-    setProviderStatus(models.length ? `OK — ${models.length} models reachable.` : "OK — reachable, but /models was empty.");
+    const catalog = await fetchModelCatalog(form);
+    setModelCatalog(catalog);
+    setProviderStatus(catalog.length ? `OK — ${catalog.length} models reachable.` : "OK — reachable, but /models was empty.");
     logInfo("E_PROVIDER", "connection test ok");
   } catch (e) {
     logErr("E_PROVIDER", e.message);
     setProviderStatus(`Test failed: ${e.message}`);
   }
+  refreshDiag();
+}
+
+// One-tap provider preset: creates (or reuses) the provider and its starter
+// model preset, selects both, and opens the provider editor for the key.
+// Existing data is never overwritten — a provider with the same base URL and
+// a preset with the same model/name are reused as-is.
+async function applyProviderPreset(key) {
+  const def = PROVIDER_PRESETS[key];
+  if (!def) throw new Error(`unknown provider preset: ${key}`);
+  const norm = (v) => String(v || "").trim().replace(/\/+$/, "").toLowerCase();
+  const wantBase = norm(def.base_url);
+  const wantModel = String(def.model || "").trim().toLowerCase();
+  const wantName = String(def.preset_name || def.name || "").trim().toLowerCase();
+
+  const providers = await listProviders();
+  let provider = providers.find((p) => norm(p.base_url) === wantBase) || null;
+  if (!provider) {
+    const id = await saveProvider({
+      name: def.name,
+      base_url: def.base_url,
+      api_key: "",
+      use_proxy: false,
+      proxy_url: ""
+    });
+    provider = { id, name: def.name, base_url: def.base_url, api_key: "" };
+  }
+  ui.providerId = provider.id;
+
+  const presets = await listPresets();
+  let preset = presets.find((p) =>
+    presetModel(p).toLowerCase() === wantModel ||
+    String(p.name || "").trim().toLowerCase() === wantName
+  ) || null;
+  if (!preset) {
+    const id = await savePreset({
+      name: def.preset_name || def.name,
+      model: def.model,
+      reasoning_mode: "off",
+      reasoning_value: "",
+      reasoning_budget: 2048,
+      reasoning_kwargs: "",
+      reasoning_modes: null,
+      agentic_format: "auto",
+      samplers: { ...DEFAULT_SAMPLERS },
+      prompts: { ...DEFAULT_PROMPTS }
+    });
+    preset = { id, name: def.preset_name || def.name, model: def.model };
+  }
+  ui.presetId = preset.id;
+  persistUI();
+
+  cachedModelCatalog = [];
+  await refreshProviders();
+  await refreshPresets();
+  await renderProviderCards();
+  await renderPresetCards();
+  renderModelChoices();
+  renderModelDatalist();
+  openDrawer("drawer-right");
+
+  setProviderStatus(provider.api_key
+    ? `${def.name} selected — existing key kept.`
+    : `${def.name} ready — paste your API key (${def.key_hint || "API key"}), then tap Test.`);
+  setPresetStatus("");
+  updateComboLabels();
+  logInfo("E_PROVIDER", `preset applied: ${def.name} → ${preset.name || preset.model}`);
   refreshDiag();
 }
 
@@ -2910,9 +3129,13 @@ async function handlePresetImportFile(file) {
       void id;
       // Accept v1.5 model presets and legacy v1.4 presets with connection.*.
       const legacy = rest.connection || {};
+      const importedMeta = rest.model_meta && typeof rest.model_meta === "object"
+        ? normalizeModelCatalog([rest.model_meta])[0] || null
+        : null;
       lastId = await savePreset({
         name: String(rest.name || legacy.label || "Imported preset"),
         model: String(rest.model ?? legacy.model ?? ""),
+        model_meta: importedMeta,
         reasoning_strategy: rest.reasoning_strategy || legacy.reasoning_strategy || "none",
         reasoning_effort: rest.reasoning_effort || legacy.reasoning_effort || "medium",
         thinking_budget: rest.thinking_budget ?? legacy.thinking_budget ?? 2048,
@@ -3795,7 +4018,7 @@ async function renderProviderCards() {
   }
   box.innerHTML = "";
   if (!providers.length) {
-    box.innerHTML = `<div class="status">No providers yet — add your Nvidia NIM endpoint above.</div>`;
+    box.innerHTML = `<div class="status">No providers yet — tap + OpenRouter or add your own endpoint above.</div>`;
     markViewFresh("presets");
     return;
   }
@@ -3816,8 +4039,9 @@ async function renderProviderCards() {
       persistUI();
       const fresh = await listProviders();
       fillProviderForm(fresh.find((x) => x.id === p.id) || p);
-      cachedModels = [];
-      refreshModelDatalist([]);
+      cachedModelCatalog = [];
+      renderModelChoices();
+      renderModelDatalist();
       await refreshProviders();
       await renderProviderCards();
       openDrawer("drawer-right");
@@ -6378,6 +6602,17 @@ async function init() {
   });
 
   // ---------- v1.5 wiring: providers (connection) + model presets ----------
+  const applyOpenRouter = async () => {
+    try {
+      await applyProviderPreset("openrouter");
+    } catch (e) {
+      logErr("E_PROVIDER", e.message);
+      setProviderStatus(`OpenRouter preset failed: ${e.message}`);
+      refreshDiag();
+    }
+  };
+  $("#btn-openrouter")?.addEventListener("click", applyOpenRouter);
+  $("#btn-openrouter-drawer")?.addEventListener("click", applyOpenRouter);
   $("#btn-provider-new")?.addEventListener("click", async () => {
     const name = window.prompt("Provider name:", "Nvidia NIM");
     if (!name) return;
@@ -6400,35 +6635,52 @@ async function init() {
   $("#btn-test-conn")?.addEventListener("click", handleTestConnection);
   $("#btn-fetch-modes")?.addEventListener("click", handleFetchModes);
   $("#conn-strategy")?.addEventListener("change", async () => {
-    refreshReasoningUI(await getActivePreset().catch(() => null));
+    refreshReasoningUI(formPresetForReasoning(await getActivePreset().catch(() => null)));
+  });
+  $("#conn-model")?.addEventListener("input", () => {
+    syncFormModelMeta();
   });
   $("#conn-model")?.addEventListener("change", async () => {
-    refreshReasoningUI(await getActivePreset().catch(() => null));
+    syncFormModelMeta();
+    refreshReasoningUI(formPresetForReasoning(await getActivePreset().catch(() => null)));
   });
+  $("#prov-model-search")?.addEventListener("input", debounce(() => renderModelDatalist(), 120));
   $("#btn-use-model")?.addEventListener("click", async () => {
     const pick = $("#prov-models")?.value || "";
     if (!pick) {
       setProviderStatus("Fetch models first, then pick one.");
       return;
     }
+    const meta = modelMetaFor(cachedModelCatalog, pick);
     const box = $("#conn-model");
     if (box) box.value = pick;
+    formModelId = pick;
+    formModelMeta = meta;
+    renderSelectedModelMeta();
     try {
       const active = await getActivePreset();
       if (active) {
-        await savePreset({ ...active, model: pick, id: active.id, updated_at: Date.now() });
+        await savePreset({ ...active, model: pick, model_meta: meta, id: active.id, updated_at: Date.now() });
         await refreshPresets();
       }
     } catch (e) {
       logErr("E_PROVIDER", e.message);
     }
     updateComboLabels();
-    setProviderStatus(`Model set: ${pick}`);
+    setProviderStatus(`Model set: ${pick}${meta ? " — sampler limits saved." : ""}`);
     refreshDiag();
   });
-  $("#prov-models")?.addEventListener("change", (e) => {
+  $("#prov-models")?.addEventListener("change", async (e) => {
     const v = e.target.value || "";
-    if (v && $("#conn-model")) $("#conn-model").value = v;
+    if (!v) {
+      renderSelectedModelMeta();
+      return;
+    }
+    if ($("#conn-model")) $("#conn-model").value = v;
+    formModelId = v;
+    formModelMeta = modelMetaFor(cachedModelCatalog, v);
+    renderSelectedModelMeta();
+    refreshReasoningUI(formPresetForReasoning(await getActivePreset().catch(() => null)));
   });
   $("#btn-save-provider")?.addEventListener("click", async () => {
     try {
@@ -6464,8 +6716,9 @@ async function init() {
     await ensureSelection();
     await refreshProviders();
     await renderProviderCards();
-    cachedModels = [];
-    refreshModelDatalist([]);
+    cachedModelCatalog = [];
+    renderModelChoices();
+    renderModelDatalist();
     setProviderStatus("Deleted.");
   });
 

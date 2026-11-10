@@ -1,8 +1,8 @@
 // Polyglot — single source of truth for version + defaults.
 // Phase 2/3 modules import from here so a preset change is one edit.
-export const APP_VERSION = "v1.9.2";
+export const APP_VERSION = "v1.9.4";
 
-export const CACHE_NAME = "polyglot-v1.9.2";
+export const CACHE_NAME = "polyglot-v1.9.4";
 export const DB_NAME = "PolyglotDB";
 export const DB_VERSION = 5;
 
@@ -49,6 +49,19 @@ export const DEFAULT_PROMPTS = {
   reasoning_style: "", // "" | "brief" | "terse" — prompt-side think softener
   prefill_enabled: false,
   prefill_text: "*"
+};
+
+// One-tap provider presets. A definition carries only public connection
+// details: the API key is always entered by the user and lives in the
+// providers store (never in source, exports, or logs).
+export const PROVIDER_PRESETS = {
+  openrouter: {
+    name: "OpenRouter",
+    base_url: "https://openrouter.ai/api/v1",
+    key_hint: "sk-or-v1-…",
+    preset_name: "OpenRouter (auto)",
+    model: "openrouter/auto"
+  }
 };
 
 // Phase 4: theme presets. Applied as CSS vars on :root via app.js applyTheme().
